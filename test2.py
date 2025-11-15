@@ -23,37 +23,56 @@ while True:
         xml_str = data.decode('utf-8')
         root = ET.fromstring(xml_str)
 
-        solar = root.findtext('solar', default='N/A')
-        electricity = root.findtext('electricity', default='N/A')
-        timestamp = root.findtext('timestamp', default='N/A')
+        # Parsing SOLAR
+        if root.tag == 'solar':
+            timestamp = root.findtext('timestamp', default='N/A')
+            current = root.find('current')
+            if current is not None:
+                generating_w = current.findtext('generating', default='N/A')
+                exporting_w = current.findtext('exporting', default='N/A')
+            else:
+                generating_w = exporting_w = 'N/A'
 
-        if(solar != 'N/A'):
-            generating_w = solar.findtext('generating', default='N/A')
-            exporting_w = solar.findtext('exporting', default='N/A')
-             # Stampa chiara e pulita
+            day = root.find('day')
+            if day is not None:
+                day_generated_wh = day.findtext('generated', default='N/A')
+                day_exported_wh = day.findtext('exported', default='N/A')
+            else:
+                day_generated_wh = day_exported_wh = 'N/A'
+
+            print(f"[SOLAR]")
             print(f"Timestamp: {timestamp}")
             print(f"Potenza generata (W): {generating_w}")
             print(f"Potenza esportata (W): {exporting_w}")
+            print(f"Energia generata oggi (Wh): {day_generated_wh}")
+            print(f"Energia esportata oggi (Wh): {day_exported_wh}")
             print("-" * 50)
 
-        if(electricity != 'N/A'):
-            channels = electricity.findall('chan')
-            
-            chan0_curr = channels[0].findtext('curr', default='N/A') if len(channels) > 0 else 'N/A'
-            chan1_curr = channels[1].findtext('curr', default='N/A') if len(channels) > 1 else 'N/A'
-            chan2_curr = channels[2].findtext('curr', default='N/A') if len(channels) > 2 else 'N/A'
-            chan3_curr = channels[3].findtext('curr', default='N/A') if len(channels) > 3 else 'N/A'
-            chan4_curr = channels[4].findtext('curr', default='N/A') if len(channels) > 4 else 'N/A'
-            chan5_curr = channels[5].findtext('curr', default='N/A') if len(channels) > 5 else 'N/A'
-            
-            print(f"Chan 0: {chan0_curr} W")
-            print(f"Chan 1: {chan1_curr} W")
-            print(f"Chan 2: {chan2_curr} W")
-            print(f"Chan 3: {chan3_curr} W")
-            print(f"Chan 4: {chan4_curr} W")
-            print(f"Chan 5: {chan5_curr} W")
+        # Parsing ELECTRICITY
+        elif root.tag == 'electricity':
+            print(f"[ELECTRICITY]")
+            channels_elem = root.find('channels')
+            if channels_elem is not None:
+                channels = channels_elem.findall('chan')
+                
+                for i in range(6):
+                    if i < len(channels):
+                        curr = channels[i].findtext('curr', default='N/A')
+                        day = channels[i].findtext('day', default='N/A')
+                        print(f"Chan {i}: {curr} W (giorno: {day} Wh)")
+
+            property_elem = root.find('property')
+            if property_elem is not None:
+                current_elem = property_elem.find('current')
+                if current_elem is not None:
+                    watts = current_elem.findtext('watts', default='N/A')
+                    print(f"Potenza totale: {watts} W")
+                
+                day_elem = property_elem.find('day')
+                if day_elem is not None:
+                    wh = day_elem.findtext('wh', default='N/A')
+                    print(f"Energia totale oggi: {wh} Wh")
             print("-" * 50)
-    
 
     except ET.ParseError:
         print("Errore nel parsing XML")
