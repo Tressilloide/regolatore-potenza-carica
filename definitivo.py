@@ -16,6 +16,8 @@ BASE_URL = "http://192.168.1.22"
 
 vmin = 1380
 vmax = 7360
+last_slider_value = None
+last_state = None
 
 # Coda per i dati che arriveranno al frontend via SSE
 data_queue = queue.Queue()
@@ -24,6 +26,8 @@ data_queue = queue.Queue()
 # FUNZIONE set_power
 # ---------------------------------------------------------------------------
 def set_power(value, base_url=BASE_URL, timeout=3):
+    global last_state
+    global last_slider_value
     val_str = str(value)
     if not val_str.isdigit():
         raise ValueError("Valore non valido: usare solo cifre.")
@@ -32,9 +36,55 @@ def set_power(value, base_url=BASE_URL, timeout=3):
 
     try:
         r = requests.get(url, timeout=timeout)
+        last_slider_value = value
+        if last_state is None:
+            last_state = True
         return {"success": r.status_code == 200, "status": r.status_code, "text": r.text}
     except Exception as e:
         return {"success": False, "status": None, "error": str(e)}
+    
+def power_on(base_url=BASE_URL, timeout=3):
+    global last_state
+    """
+    Accende il dispositivo.
+
+    Args:
+        base_url (str): URL base del dispositivo.
+        timeout (float): timeout in secondi per la richiesta HTTP.
+
+    Returns:
+        dict: {"success": bool, "status_code": int | None, "error": str | None}
+    """
+    url = f"{base_url}/index.json?btn=i"
+    
+    try:
+        r = requests.get(url, timeout=timeout)
+        last_state = True
+        return {"success": r.status_code == 200, "status_code": r.status_code, "error": None}
+    except requests.exceptions.RequestException as e:
+        return {"success": False, "status_code": None, "error": str(e)}
+
+def power_off(base_url=BASE_URL, timeout=3):
+    global last_state
+    """
+    Spegne il dispositivo.
+
+    Args:
+        base_url (str): URL base del dispositivo.
+        timeout (float): timeout in secondi per la richiesta HTTP.
+
+    Returns:
+        dict: {"success": bool, "status_code": int | None, "error": str | None}
+    """
+    url = f"{base_url}/index.json?btn=o"
+    
+    try:
+        r = requests.get(url, timeout=timeout)
+        last_state = False
+        return {"success": r.status_code == 200, "status_code": r.status_code, "error": None}
+    except requests.exceptions.RequestException as e:
+        return {"success": False, "status_code": None, "error": str(e)}
+
 
 # ---------------------------------------------------------------------------
 # THREAD PER MULTICAST
@@ -91,8 +141,43 @@ def multicast_thread():
                     + "-"*50
                 )
 
+
+                #LOGICA DI CONTROLLO DELLA POTENZA
+                print(last_slider_value)
+                if generating_w != 'N/A' and last_slider_value is not None:
+                    if float(generating_w) < vmin:
+                        print("stoppo potenza")
+                        result = power_off()
+                        if result["success"]:
+                            print("✓ Dispositivo spento!")
+                    else:
+                        if last_state == False:
+                            print("avvio potenza")
+                            result = power_on()
+                            if result["success"]:
+                                print("✓ Dispositivo acceso!")
+                        if float(exporting_w) > 0:
+                            tmp = last_slider_value + exporting_w
+                            if tmp <= vmax:
+                                set_power(tmp)
+                                print(f"✓ Potenza aggiornata a {tmp} W")
+                            else:
+                                set_power(vmax)
+                                print(f"✓ Potenza aggiornata a {vmax} W (massimo)")
+                        
+                        if float(generating_w) < last_slider_value:
+                            tmp = last_slider_value - (last_slider_value - float(generating_w))
+                            if tmp >= vmin:
+                                set_power(tmp)
+                                print(f"✓ Potenza aggiornata a {tmp} W")
+                            
+                            
+                        
+
+
                 print("RX SOLAR → OK")
                 data_queue.put(msg)
+                
 
             # -------------------------------------------------------
             # ELECTRICITY
@@ -152,6 +237,12 @@ HTML_PAGE = """
             padding: 10px;
         }
         button { padding: 15px; font-size: 18px; }
+        .info {
+            margin: 20px 0;
+            padding: 10px;
+            border: 1px solid #444;
+            background: #f9f9f9;
+        }
     </style>
 </head>
 <body>
@@ -160,9 +251,16 @@ HTML_PAGE = """
     <form action="/start" method="POST">
         <button type="submit">START (set_power vmin)</button>
     </form>
+    <div class="info">
+        <h3>Ultimo Stato</h3>
+        <p><strong>Last Slider Value:</strong> <span id="last-slider-value">{{ last_slider_value }}</span> W</p>
+        <p><strong>Last State:</strong> <span id="last-state">{{ last_state }}</span></p>
+    </div>
 
     <h2>Dati ricevuti</h2>
     <div id="log"></div>
+
+    
 
 <script>
     var evtSource = new EventSource("/stream");
@@ -172,10 +270,25 @@ HTML_PAGE = """
         log.textContent += e.data + "\\n";
         log.scrollTop = log.scrollHeight;
     };
+
+    // Funzione per aggiornare last_slider_value e last_state
+    function updateInfo(lastSliderValue, lastState) {
+        document.getElementById("last-slider-value").innerText = lastSliderValue || "N/A";
+        document.getElementById("last-state").innerText = lastState !== null ? (lastState ? "Acceso" : "Spento") : "N/A";
+    }
+
+    // Funzione per ottenere i valori da un endpoint
+    fetch('/get_status')
+        .then(response => response.json())
+        .then(data => {
+            updateInfo(data.last_slider_value, data.last_state);
+        })
+        .catch(err => console.log("Errore nel recupero dei dati di stato", err));
 </script>
 
 </body>
 </html>
+
 """
 
 # ---------------------------------------------------------------------------
@@ -211,6 +324,13 @@ def stream():
                     mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache",
                              "X-Accel-Buffering": "no"})
+
+@app.route("/get_status")
+def get_status():
+    return {
+        "last_slider_value": last_slider_value,
+        "last_state": last_state
+    }
 
 
 # ---------------------------------------------------------------------------

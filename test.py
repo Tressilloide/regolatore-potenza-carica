@@ -41,27 +41,82 @@ def set_power(value, base_url=BASE_URL, timeout=3):
     except requests.exceptions.RequestException as e:
         return {"success": False, "url": url, "status_code": None, "text": None, "error": str(e)}
 
+def power_on(base_url=BASE_URL, timeout=3):
+    """
+    Accende il dispositivo.
+
+    Args:
+        base_url (str): URL base del dispositivo.
+        timeout (float): timeout in secondi per la richiesta HTTP.
+
+    Returns:
+        dict: {"success": bool, "status_code": int | None, "error": str | None}
+    """
+    url = f"{base_url}/index.json?btn=i"
+    
+    try:
+        r = requests.get(url, timeout=timeout)
+        return {"success": r.status_code == 200, "status_code": r.status_code, "error": None}
+    except requests.exceptions.RequestException as e:
+        return {"success": False, "status_code": None, "error": str(e)}
+
+def power_off(base_url=BASE_URL, timeout=3):
+    """
+    Spegne il dispositivo.
+
+    Args:
+        base_url (str): URL base del dispositivo.
+        timeout (float): timeout in secondi per la richiesta HTTP.
+
+    Returns:
+        dict: {"success": bool, "status_code": int | None, "error": str | None}
+    """
+    url = f"{base_url}/index.json?btn=o"
+    
+    try:
+        r = requests.get(url, timeout=timeout)
+        return {"success": r.status_code == 200, "status_code": r.status_code, "error": None}
+    except requests.exceptions.RequestException as e:
+        return {"success": False, "status_code": None, "error": str(e)}
+
 if __name__ == "__main__":
     vmin = 1380
     vmax = 7360
 
     try: 
         result = set_power(vmin)
+        print("✓ Potenza impostata a", vmin, "W")
     except ValueError as ve:
         print("Errore:", ve)
 
-    valore = input("Inserisci il valore della potenza in Watt: ")
-    try:
-        result = set_power(valore)
+    valore = input("Inserisci il valore della potenza in Watt (o 'on'/'off'): ").strip().lower()
+    
+    if valore == "on":
+        result = power_on()
         if result["success"]:
-            print("✓ Valore inviato correttamente!")
-            print("Risposta del dispositivo:", result["text"])
-        elif result["error"]:
-            print("Errore di comunicazione:", result["error"])
+            print("✓ Dispositivo acceso!")
         else:
-            print("Risposta inaspettata:", result["status_code"], result["text"])
-    except ValueError as ve:
-        print("Errore:", ve)
+            print("✗ Errore:", result["error"] or f"Status code {result['status_code']}")
+    
+    elif valore == "off":
+        result = power_off()
+        if result["success"]:
+            print("✓ Dispositivo spento!")
+        else:
+            print("✗ Errore:", result["error"] or f"Status code {result['status_code']}")
+    
+    else:
+        try:
+            result = set_power(valore)
+            if result["success"]:
+                print("✓ Valore inviato correttamente!")
+                print("Risposta del dispositivo:", result["text"])
+            elif result["error"]:
+                print("Errore di comunicazione:", result["error"])
+            else:
+                print("Risposta inaspettata:", result["status_code"], result["text"])
+        except ValueError as ve:
+            print("Errore:", ve)
 
 
 
