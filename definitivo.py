@@ -36,7 +36,8 @@ def set_power(value, base_url=BASE_URL, timeout=3):
 
     try:
         r = requests.get(url, timeout=timeout)
-        last_slider_value = value
+        # salva come intero per evitare problemi di tipi
+        last_slider_value = int(val_str)
         if last_state is None:
             last_state = True
         return {"success": r.status_code == 200, "status": r.status_code, "text": r.text}
@@ -157,7 +158,12 @@ def multicast_thread():
                             if result["success"]:
                                 print("✓ Dispositivo acceso!")
                         if float(exporting_w) > 0:
-                            tmp = last_slider_value + exporting_w
+                            # converting exporting_w to float and produce integer target
+                            try:
+                                export_f = float(exporting_w)
+                            except (ValueError, TypeError):
+                                export_f = 0.0
+                            tmp = int(round(last_slider_value + export_f))
                             if tmp <= vmax:
                                 set_power(tmp)
                                 print(f"✓ Potenza aggiornata a {tmp} W")
@@ -165,15 +171,19 @@ def multicast_thread():
                                 set_power(vmax)
                                 print(f"✓ Potenza aggiornata a {vmax} W (massimo)")
                         
-                        if float(generating_w) < last_slider_value:
-                            tmp = last_slider_value - (last_slider_value - float(generating_w))
+                        # se generazione scende sotto lo slider, riduco proporzionalmente
+                        try:
+                            gen_f = float(generating_w)
+                        except (ValueError, TypeError):
+                            gen_f = None
+
+                        if gen_f is not None and gen_f < last_slider_value:
+                            # usa valore intero per set_power
+                            tmp = int(round(gen_f))
                             if tmp >= vmin:
                                 set_power(tmp)
                                 print(f"✓ Potenza aggiornata a {tmp} W")
                             
-                            
-                        
-
 
                 print("RX SOLAR → OK")
                 data_queue.put(msg)
