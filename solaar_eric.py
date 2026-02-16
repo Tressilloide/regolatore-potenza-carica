@@ -94,6 +94,7 @@ class EnergyMonitor:
     def __init__(self):
         self.solar_now = 0.0        
         self.total_grid_load = 0.0  
+        self.fases = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
     def parse_packet(self, data):
         try:
@@ -118,6 +119,7 @@ class EnergyMonitor:
                     self.total_grid_load = l1 + l2 + l3
                     self.solar_now = l4 + l5 + l6 
                     self.exporting = self.solar_now - self.total_grid_load
+                    self.fases = [l1, l2, l3, l4, l5, l6]
                     
                     # STAMPA TABELLA GRANDE
                     print("\n" + "="*60)
@@ -138,7 +140,7 @@ class EnergyMonitor:
                     self.solar_now = gen
                     
                     # STAMPA SEMPRE IL PACCHETTO VELOCE
-                    print(f"☀️  SOLARE LIVE: {gen:.0f} W") 
+                    #print(f"☀️  SOLARE LIVE: {gen:.0f} W") 
                     
                     return "TRIGGER"
                 
@@ -164,7 +166,7 @@ def run_logic(monitor, wallbox):
         disponibile = generata - consumocasa
     disponibile += delta 
 
-    print(f"[INFO] potenza disponibile: {disponibile:.0f}W. Consumo casa: {consumocasa:.0f}W. Generata: {generata:.0f}W. Wallbox: {'ON' if wallbox.is_on else 'OFF'} ({wallbox.current_set_power:.0f}W)")
+    print(f"[INFO] potenza generata: {generata:.0f}W. Consumo casa: {consumocasa:.0f}W. Potenza disponibile(con delta rete): {disponibile:.0f}W. Wallbox: {'ON' if wallbox.is_on else 'OFF'} ({wallbox.current_set_power:.0f}W)")
 
     #minimo necessario
     if not wallbox.is_on: # se e spento guardo se c'e' abbastanza potenza per accenderlo
