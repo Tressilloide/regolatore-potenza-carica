@@ -94,7 +94,6 @@ class EnergyMonitor:
     def __init__(self):
         self.solar_now = 0.0        
         self.total_grid_load = 0.0  
-        self.exporting = 0.0
 
     def parse_packet(self, data):
         try:
@@ -126,8 +125,8 @@ class EnergyMonitor:
                     print("-" * 60)
                     print(f" | RETE (Casa+WB) | L1: {l1:5.0f} | L2: {l2:5.0f} | L3: {l3:5.0f} | TOT: {self.total_grid_load:.0f}W")
                     print(f" | SOLARE (Inv)   | L4: {l4:5.0f} | L5: {l5:5.0f} | L6: {l6:5.0f} | TOT: {self.solar_now:.0f}W")
-                    print(f" | ESPORTAZIONE   | {self.exporting:.0f}W")
                     print("="*60)
+                    print(f"")
                     
                     return "TRIGGER"
 
@@ -155,7 +154,6 @@ def run_logic(monitor, wallbox):
     deltacarica = 200
     generata = monitor.solar_now
     consumocasa = monitor.total_grid_load
-    esportazione = monitor.exporting
 
     if consumocasa == 0: #non sono ancora arrivati i dati completi, aspetto
         print("[INFO] Dati casa non ancora disponibili. Attendo...")
@@ -164,9 +162,9 @@ def run_logic(monitor, wallbox):
         disponibile = generata - consumocasa - wallbox.current_set_power
     else:
         disponibile = generata - consumocasa
-    disponibile += delta
+    disponibile += delta 
 
-    print(f"[INFO] potenza disponibile: {disponibile:.0f}W. Esportazione: {esportazione:.0f}W. Consumo casa: {consumocasa:.0f}W. Generata: {generata:.0f}W. Wallbox: {'ON' if wallbox.is_on else 'OFF'} ({wallbox.current_set_power:.0f}W)")
+    print(f"[INFO] potenza disponibile: {disponibile:.0f}W. Consumo casa: {consumocasa:.0f}W. Generata: {generata:.0f}W. Wallbox: {'ON' if wallbox.is_on else 'OFF'} ({wallbox.current_set_power:.0f}W)")
 
     #minimo necessario
     if not wallbox.is_on: # se e spento guardo se c'e' abbastanza potenza per accenderlo
@@ -182,7 +180,6 @@ def run_logic(monitor, wallbox):
             wallbox.turn_off(force=True)
             return
         
-    if wallbox.is_on:
         if disponibile > 0: #aumento
             nuovacarica = wallbox.current_set_power + disponibile
             if nuovacarica > MAX_POWER:
@@ -192,7 +189,7 @@ def run_logic(monitor, wallbox):
             print(f"[INFO] nuova carica a {nuovacarica:.0f}W")
             wallbox.set_power(nuovacarica)
         if disponibile < 0:
-            nuovacarica = wallbox.current_set_power - abs(esportazione)
+            nuovacarica = wallbox.current_set_power - abs(disponibile)
             print(f"[INFO] nuova carica a {nuovacarica:.0f}W")
             if abs(nuovacarica - wallbox.current_set_power) < deltacarica: #non faccio cambiamenti piccoli per non stressare la wallbox
                 return
