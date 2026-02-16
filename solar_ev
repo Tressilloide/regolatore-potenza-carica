@@ -1,0 +1,311 @@
+import socket
+import struct
+import xml.etree.ElementTree as ET
+import time
+import requests
+import logging
+
+# -----------------------------------------------------------
+# CONFIGURAZIONE
+# -----------------------------------------------------------
+MCAST_GRP = '224.192.32.19'
+MCAST_PORT = 22600
+# IMPORTANTE: Se il Raspberry cambia IP, devi aggiornare questo valore
+IFACE = '192.168.1.193' 
+
+WALLBOX_IP = '192.168.1.22'
+WALLBOX_URL = f"http://{WALLBOX_IP}/index.json"
+
+# Limiti di Ricarica (Watt)
+MIN_POWER = 1380  # 6A
+MAX_POWER = 7360  # 32A
+
+# Parametri Logica
+HYSTERESIS_W = 100       # Isteresi
+UPDATE_INTERVAL_S = 10   # Secondi minimi tra due cambi di potenza
+OFF_THRESHOLD_W = 1380   # Sotto questa produzione solare, spegne
+
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(message)s',
+    datefmt='%H:%M:%S'
+)
+
+# -----------------------------------------------------------
+# CLASSI
+# -----------------------------------------------------------
+
+class WallboxController:
+    def __init__(self):
+        self.current_set_power = MIN_POWER
+        self.is_on = False
+        self.last_update_time = 0
+
+    def send_command(self, params):
+        try:
+            logging.debug(f"HTTP -> {params}")
+            response = requests.get(WALLBOX_URL, params=params, timeout=5)
+            if response.status_code == 200:
+                return True
+        except Exception as e:
+            logging.error(f"Err Wallbox: {e}")
+        return False
+
+    def set_power(self, watts):
+        watts = max(MIN_POWER, min(MAX_POWER, int(watts)))
+        
+        # Se non è cambiato nulla e siamo accesi, esci
+        if abs(watts - self.current_set_power) < HYSTERESIS_W and self.is_on:
+            return
+
+        now = time.time()
+        # Rate limiting (protezione anti-spam)
+        if self.last_update_time > 0 and (now - self.last_update_time < UPDATE_INTERVAL_S):
+            return
+
+        logging.info(f">>> CAMBIO POTENZA: {watts}W")
+        if self.send_command({'btn': f'P{watts}'}):
+            self.current_set_power = watts
+            self.last_update_time = now
+
+    def turn_on(self):
+        if not self.is_on:
+            logging.info(">>> COMANDO: ON (btn='i')")
+            # --- CORREZIONE QUI: Usa 'i' come da HTML ---
+            if self.send_command({'btn': 'i'}):
+                self.is_on = True
+                self.last_update_time = time.time()
+
+    def turn_off(self, force=False):
+        now = time.time()
+        
+        # PROTEZIONE: Se force è attivo, controlla il timer
+        # MA: Se il timer è 0 (inizializzazione), permetti sempre
+        if force and self.last_update_time != 0 and (now - self.last_update_time < UPDATE_INTERVAL_S):
+            logging.warning("Comando OFF ignorato per protezione anti-spam (troppo rapido)")
+            return
+
+        if self.is_on or force:
+            logging.info(">>> COMANDO: OFF (btn='o')")
+            if self.send_command({'btn': 'o'}):
+                self.is_on = False
+                self.last_update_time = time.time()
+                
+                # Reset slider visivo post-spegnimento
+                time.sleep(0.5)
+                self.send_command({'btn': f'P{MIN_POWER}'})
+                self.current_set_power = MIN_POWER
+
+    def initialize(self):
+        logging.info("--- INIZIALIZZAZIONE WALLBOX ---")
+        
+        # 1. Reset Slider
+        self.set_power(MIN_POWER)
+        
+        # 2. Pausa tecnica
+        time.sleep(2)
+        
+        # 3. TRUCCO: Resetta il timer a 0 per sbloccare il comando successivo
+        self.last_update_time = 0 
+        
+        # 4. Forza OFF (ora sicuro che verrà eseguito)
+        self.turn_off(force=True)
+        
+        logging.info("--- SISTEMA PRONTO ---")
+
+class EnergyMonitor:
+    def __init__(self):
+        self.solar_generating = 0.0
+        self.solar_exporting = 0.0
+        self.grid_importing = 0.0
+
+    def parse_packet(self, data):
+        try:
+            xml_str = data.decode('utf-8', errors='ignore')
+            root = ET.fromstring(xml_str)
+            
+            # -----------------------------------------------------------
+            # CASO 1: PACCHETTO ELECTRICITY (Calcolo Bilancio)
+            # -----------------------------------------------------------
+            if root.tag == 'electricity':
+                channels = root.find('channels')
+                if channels is not None:
+                    phases = {}
+                    
+                    # Estrai valori dai canali
+                    for chan in channels.findall('chan'):
+                        cid = chan.get('id')
+                        curr_node = chan.find('curr')
+                        if curr_node is not None:
+                            try:
+                                phases[cid] = float(curr_node.text)
+                            except ValueError:
+                                phases[cid] = 0.0
+
+                    # Mapping canali (XML usa id 0-5, tu le chiami 1-6)
+                    # CASA: Canali 0, 1, 2
+                    cons_l1 = phases.get('0', 0.0)
+                    cons_l2 = phases.get('1', 0.0)
+                    cons_l3 = phases.get('2', 0.0)
+                    
+                    # SOLARE: Canali 3, 4, 5
+                    sol_l4 = phases.get('3', 0.0)
+                    sol_l5 = phases.get('4', 0.0)
+                    sol_l6 = phases.get('5', 0.0)
+
+                    # --- FORMULA RICHIESTA ---
+                    total_house = cons_l1 + cons_l2 + cons_l3
+                    total_solar = sol_l4 + sol_l5 + sol_l6
+                    
+                    # Bilancio: Se positivo esporto, se negativo importo
+                    net_balance = total_solar - total_house
+
+                    # Aggiorna le variabili di stato
+                    self.solar_generating = total_solar
+                    
+                    if net_balance > 0:
+                        self.solar_exporting = net_balance
+                        self.grid_importing = 0.0
+                    else:
+                        self.solar_exporting = 0.0
+                        self.grid_importing = abs(net_balance) # Trasforma il negativo in positivo per la logica
+
+                    # --- STAMPA DI DIAGNOSTICA ---
+                    print("-" * 60)
+                    print(f"[CALCOLO BILANCIO] Timestamp: {root.find('timestamp').text if root.find('timestamp') is not None else 'N/A'}")
+                    print(f" >> SOLARE (L4+5+6): {sol_l4:.0f} + {sol_l5:.0f} + {sol_l6:.0f} = {total_solar:.0f} W")
+                    print(f" >> CASA   (L1+2+3): {cons_l1:.0f} + {cons_l2:.0f} + {cons_l3:.0f} = {total_house:.0f} W")
+                    
+                    if net_balance > 0:
+                        print(f" >> RISULTATO: SURPLUS di {net_balance:.0f} W (Export)")
+                    else:
+                        print(f" >> RISULTATO: PRELIEVO di {abs(net_balance):.0f} W (Import)")
+                    print("-" * 60)
+                    
+                    # Ritorniamo "SOLAR" invece di "GRID" perché ora questo pacchetto 
+                    # contiene tutte le info necessarie per guidare la logica (produzione ed export)
+                    return "SOLAR"
+
+            # -----------------------------------------------------------
+            # CASO 2: PACCHETTO SOLAR (Backup)
+            # -----------------------------------------------------------
+            # Nota: Se il pacchetto Electricity arriva spesso, questo potrebbe non servire più,
+            # ma lo lasciamo come fallback o per aggiornamenti parziali.
+            elif root.tag == 'solar':
+                # Opzionale: puoi ignorarlo se ti fidi solo del calcolo sopra
+                pass 
+                
+        except Exception:
+            pass
+        return None
+
+# -----------------------------------------------------------
+# LOGICA DI CONTROLLO
+# -----------------------------------------------------------
+def run_logic(monitor, wallbox):
+    gen = monitor.solar_generating
+    export = monitor.solar_exporting
+    imp = monitor.grid_importing
+    current_charge = wallbox.current_set_power
+
+    # Feedback visivo in console
+    status_msg = f"SOLARE: {gen:.0f}W | EXPORT: {export:.0f}W | IMPORT: {imp:.0f}W"
+    status_msg += f" | CARICA: {current_charge}W" + (" [ON]" if wallbox.is_on else " [OFF]")
+    print(status_msg)
+
+    # -------------------------------------------------------
+    # 1. LOGICA DI STOP (Sicurezza e Minimo Sole)
+    # -------------------------------------------------------
+    if gen < OFF_THRESHOLD_W:
+        # Se c'è poco sole, FORZA lo spegnimento (force=True)
+        # Questo risolve il problema che non premeva OFF
+        wallbox.turn_off(force=True)
+        return
+
+    # -------------------------------------------------------
+    # 2. LOGICA DI AVVIO
+    # -------------------------------------------------------
+    if not wallbox.is_on:
+        if export > MIN_POWER:
+            logging.info(f"Surplus rilevato ({export}W). Avvio ricarica.")
+            wallbox.turn_on()
+            wallbox.set_power(MIN_POWER)
+        return
+
+    # -------------------------------------------------------
+    # 3. LOGICA DI REGOLAZIONE (Mentre è ON)
+    # -------------------------------------------------------
+    if wallbox.is_on:
+        new_power = current_charge
+
+        # A. Calcolo basato sul bilancio di rete (Grid Balance)
+        if export > 100:
+            # C'è surplus -> Aumenta
+            new_power = current_charge + export
+        elif imp > 100:
+            # Stiamo comprando corrente -> Riduci
+            new_power = current_charge - imp
+
+        # B. "Tetto Solare" (LA MODIFICA CHE HAI CHIESTO)
+        # Se la potenza calcolata o attuale è superiore a quanto sta producendo il sole,
+        # taglia immediatamente al valore di produzione.
+        if new_power > gen:
+            logging.info(f"Taglio potenza per calo solare (Gen: {gen}W < Target: {new_power}W)")
+            new_power = gen
+
+        # C. Applica la nuova potenza
+        # Nota: set_power gestisce già internamente i limiti Min(1380)/Max(7360)
+        wallbox.set_power(new_power)
+
+# -----------------------------------------------------------
+# MAIN LOOP
+# -----------------------------------------------------------
+def main():
+    monitor = EnergyMonitor()
+    wallbox = WallboxController()
+
+    # SETUP SOCKET (Come da tuo codice funzionante)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    try:
+        # Bind specifico sull'IP del Raspberry
+        logging.info(f"Binding su {IFACE}:{MCAST_PORT}...")
+        sock.bind((IFACE, MCAST_PORT))
+        
+        # Join Multicast
+        mreq = struct.pack("4s4s", socket.inet_aton(MCAST_GRP), socket.inet_aton(IFACE))
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    except OSError as e:
+        logging.critical(f"ERRORE DI RETE: {e}")
+        logging.critical(f"Verifica che l'IP {IFACE} sia corretto per questo Raspberry!")
+        return
+
+    # Inizializza Wallbox (Reset e Spegni)
+    wallbox.initialize()
+
+    logging.info("--- INIZIO MONITORAGGIO ---")
+    
+    while True:
+        try:
+            # Buffer ampio
+            data, addr = sock.recvfrom(65535)
+            
+            # Analisi pacchetto
+            packet_type = monitor.parse_packet(data)
+
+            # Esegui logica solo quando arrivano dati solari (che pilotano tutto)
+            if packet_type == "SOLAR":
+                run_logic(monitor, wallbox)
+
+        except KeyboardInterrupt:
+            logging.info("Chiusura script.")
+            wallbox.turn_off()
+            break
+        except Exception as e:
+            logging.error(f"Errore loop: {e}")
+            time.sleep(1)
+
+if __name__ == "__main__":
+    main()

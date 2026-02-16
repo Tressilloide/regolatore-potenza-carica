@@ -11,7 +11,7 @@ from flask import Flask, render_template_string, Response, request, redirect, ur
 # ---------------------------------------------------------------------------
 MCAST_GRP = '224.192.32.19'
 MCAST_PORT = 22600
-IFACE = '192.168.1.139'  # Cambia se la tua scheda ha un altro IP
+IFACE = '192.168.1.193'  # Cambia se la tua scheda ha un altro IP
 BASE_URL = "http://192.168.1.22"
 
 vmin = 1380
