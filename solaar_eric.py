@@ -151,10 +151,11 @@ class EnergyMonitor:
 # LOGICA DI CONTROLLO
 # -----------------------------------------------------------
 def run_logic(monitor, wallbox):
-
+    delta = 300
     generata = monitor.solar_now
     consumocasa = monitor.total_grid_load
     esportazione = monitor.exporting
+
     if consumocasa == 0: #non sono ancora arrivati i dati completi, aspetto
         print("[INFO] Dati casa non ancora disponibili. Attendo...")
         return
@@ -162,12 +163,13 @@ def run_logic(monitor, wallbox):
         disponibile = generata - consumocasa - wallbox.current_set_power
     else:
         disponibile = generata - consumocasa
+    disponibile += delta
 
     print(f"[INFO] potenza disponibile: {disponibile:.0f}W. Esportazione: {esportazione:.0f}W. Consumo casa: {consumocasa:.0f}W. Generata: {generata:.0f}W. Wallbox: {'ON' if wallbox.is_on else 'OFF'} ({wallbox.current_set_power:.0f}W)")
 
     #minimo necessario
     if not wallbox.is_on: # se e spento guardo se c'e' abbastanza potenza per accenderlo
-        if disponibile > MIN_POWER and esportazione > 0:
+        if disponibile > MIN_POWER:
             print(f"[DECISIONE] potenza disponibile ({disponibile:.0f}W). Inizia Carica. a {MIN_POWER}W")
             wallbox.turn_on()
             wallbox.set_power(MIN_POWER)
