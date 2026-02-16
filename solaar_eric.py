@@ -151,7 +151,7 @@ class EnergyMonitor:
 # LOGICA DI CONTROLLO
 # -----------------------------------------------------------
 def run_logic(monitor, wallbox):
-    delta = 300
+    delta = 400
     deltacarica = 200
     generata = monitor.solar_now
     consumocasa = monitor.total_grid_load
@@ -189,12 +189,15 @@ def run_logic(monitor, wallbox):
                 nuovacarica = MAX_POWER
             if abs(nuovacarica - wallbox.current_set_power) < deltacarica: #non faccio cambiamenti piccoli per non stressare la wallbox
                 return
+            print(f"[INFO] nuova carica a {nuovacarica:.0f}W")
             wallbox.set_power(nuovacarica)
         if disponibile < 0:
             nuovacarica = wallbox.current_set_power - abs(esportazione)
+            print(f"[INFO] nuova carica a {nuovacarica:.0f}W")
             if abs(nuovacarica - wallbox.current_set_power) < deltacarica: #non faccio cambiamenti piccoli per non stressare la wallbox
                 return
             if nuovacarica >MIN_POWER:
+                
                 wallbox.set_power(nuovacarica)
             else:
                 wallbox.turn_off(force=True)
