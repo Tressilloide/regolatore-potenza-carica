@@ -187,12 +187,12 @@ def run_logic(monitor, wallbox):
             nuovacarica = wallbox.current_set_power + disponibile
             if nuovacarica > MAX_POWER:
                 nuovacarica = MAX_POWER
-            if abs(nuovacarica - wallbox.current_set_power) > deltacarica: #non faccio cambiamenti piccoli per non stressare la wallbox
+            if abs(nuovacarica - wallbox.current_set_power) < deltacarica: #non faccio cambiamenti piccoli per non stressare la wallbox
                 return
             wallbox.set_power(nuovacarica)
         if disponibile < 0:
             nuovacarica = wallbox.current_set_power - abs(esportazione)
-            if abs(nuovacarica - wallbox.current_set_power) > deltacarica: #non faccio cambiamenti piccoli per non stressare la wallbox
+            if abs(nuovacarica - wallbox.current_set_power) < deltacarica: #non faccio cambiamenti piccoli per non stressare la wallbox
                 return
             if nuovacarica >MIN_POWER:
                 wallbox.set_power(nuovacarica)
