@@ -249,45 +249,50 @@ def run_logic(monitor, wallbox):
         return
 
     if wallbox.is_on:
+        # Controlla timer di spegnimento programmato in primo luogo
+        now = time.time()
+        if wallbox.pending_off_until > 0:
+            if now < wallbox.pending_off_until:
+                restante = wallbox.pending_off_until - now
+                print(f"[INFO] Timer spegnimento attivo: {restante:.0f}s restanti...")
+                # Continua a controllare se la generazione si è ripresa
+                if potenza_generata >= potenza_minima:
+                    print("[INFO] Generazione ripristinata durante l'attesa. Annullo spegnimento.")
+                    wallbox.pending_off_until = 0
+                else:
+                    return  # Continua ad aspettare
+            else:
+                # Timer scaduto: re-valuta la situazione
+                wallbox.pending_off_until = 0
+                if potenza_generata < potenza_minima:
+                    print(f"[DECISIONE] Dopo attesa, sole ancora insufficiente ({potenza_generata:.0f}W). Spengo.")
+                    try: 
+                        asyncio.run(invia_notifica(f"⚠️ Attenzione! La potenza generata è insufficiente ({potenza_generata:.0f}W). Spengo il wallbox."))
+                        if wallbox.fase == 1:
+                            asyncio.run(invia_notifica(f"⚠️ Consiglio: mettere l'impianto in modalità monofase per sfruttare meglio la potenza disponibile."))
+                        else:
+                            asyncio.run(invia_notifica(f"⚠️ Consiglio: staccare la macchina"))
+                    except Exception as e:
+                        print(f"[ERRORE] Invio notifica fallito: {e}")
+                    wallbox.turn_off(force=True)
+                    return
+                else:
+                    print(f"[DECISIONE] Dopo attesa, generazione sufficiente. Continuo a {potenza_minima}W.")
+                    wallbox.set_power(potenza_minima)
+                    return
+
+        # Logica normale (senza timer attivo)
         if potenza_carica > potenza_generata or potenza_esportata < 0: #devo diminuire
             nuova_potenza = potenza_carica - abs(potenza_esportata)
             if nuova_potenza < potenza_minima or potenza_generata < potenza_minima:
-                now = time.time()
-                if not wallbox.pending_off_until:#guarso se c'è un timer
-                    print(f"[DECISIONE] Sole insufficiente ({potenza_generata:.0f}W). Messo al minimo per {TIMER_SPEGNIMENTO}s prima di spegnere.")
-                    wallbox.set_power(potenza_minima)
-                    wallbox.pending_off_until = now + TIMER_SPEGNIMENTO
-                else:
-                    if now < wallbox.pending_off_until:#aggiorno timer
-                        restante = wallbox.pending_off_until - now
-                        print(f"[INFO] Attendo {restante:.0f}s prima dello spegnimento...")
-                        return
-                    wallbox.pending_off_until = 0
-                    if potenza_generata < potenza_minima:#dopo 1 min non c'è ancora sole
-                        print(f"[DECISIONE] Dopo attesa, sole ancora insufficiente ({potenza_generata:.0f}W). Spengo.")
-                        try: 
-                            asyncio.run(invia_notifica(f"⚠️ Attenzione! La potenza generata è insufficiente ({potenza_generata:.0f}W). Spengo il wallbox."))
-                            if wallbox.fase == 1:
-                                asyncio.run(invia_notifica(f"⚠️ Consiglio: mettere l'impianto in modalità monofase per sfruttare meglio la potenza disponibile."))
-                            else:
-                                asyncio.run(invia_notifica(f"⚠️ Consiglio: staccare la macchina"))
-                        except Exception as e:
-                            print(f"[ERRORE] Invio notifica fallito: {e}")
-                        wallbox.turn_off(force=True)
-                    else:#è tornato il sole siumm
-                        print(f"[DECISIONE] Dopo attesa, generazione sufficiente. Mantengo acceso a {potenza_minima}W.")
-                        wallbox.set_power(potenza_minima)
+                print(f"[DECISIONE] Sole insufficiente ({potenza_generata:.0f}W). Messo al minimo per {TIMER_SPEGNIMENTO}s prima di spegnere.")
+                wallbox.set_power(potenza_minima)
+                wallbox.pending_off_until = now + TIMER_SPEGNIMENTO
             else:
-                #annullo spegnimento
-                if wallbox.pending_off_until:
-                    wallbox.pending_off_until = 0
                 print(f"[DECISIONE] Diminuisco potenza a {nuova_potenza:.0f}W")
                 wallbox.set_power(nuova_potenza)
 
         else: #posso aumentare
-            if wallbox.pending_off_until:#se c'è un timer lo annullo
-                print("[INFO] Annullamento spegnimento programmato (aumento potenza possibile).")
-                wallbox.pending_off_until = 0
             nuova_potenza = potenza_carica + abs(potenza_esportata)
             if nuova_potenza > potenza_generata:
                 return
