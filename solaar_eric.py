@@ -4,23 +4,29 @@ import xml.etree.ElementTree as ET
 import time
 import requests
 import logging
+import json
 
 # -----------------------------------------------------------
 # CONFIGURAZIONE
 # -----------------------------------------------------------
 MCAST_GRP = '224.192.32.19'
 MCAST_PORT = 22600
-IFACE = '192.168.1.193'  # <-- IP DEL TUO RASPBERRY
+IFACE = '192.168.1.193' 
 
 WALLBOX_IP = '192.168.1.22'
 WALLBOX_URL = f"http://{WALLBOX_IP}/index.json"
 
-# Limiti
-MIN_POWER = 1380  # 6A
-MAX_POWER = 7360  # 32A
 
-# Parametri Logica
-HYSTERESIS_W = 100       
+#parametri fasi
+MONOFASE_MIN_POWER = 1380  #6A
+MONOFASE_MAX_POWER = 7360  #32A
+
+TRIFASE_MIN_POWER = 4140  #6A
+TRIFASE_MAX_POWER = 22000  #32A
+
+POTENZA_PROTEZIONE = 300    
+COOLDOWN_ACCENSIONE = 60   
+POTENZA_PRELEVABILE = 0
 UPDATE_INTERVAL_S = 5    
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s', datefmt='%H:%M:%S')
@@ -30,9 +36,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s', date
 # -----------------------------------------------------------
 class WallboxController:
     def __init__(self):
-        self.current_set_power = MIN_POWER
+        self.current_set_power = 0
         self.is_on = False
         self.last_update_time = 0
+        self.fase = 0
+        self.time_turned_off = 0  
 
     def send_command(self, params):
         try:
@@ -42,9 +50,13 @@ class WallboxController:
             return False
 
     def set_power(self, watts):
-        watts = max(MIN_POWER, min(MAX_POWER, int(watts)))
-        
-        if abs(watts - self.current_set_power) < HYSTERESIS_W and self.is_on:
+        if self.fase == 0:
+            watts = max(MONOFASE_MIN_POWER, min(MONOFASE_MAX_POWER, int(watts)))
+        elif self.fase == 1:
+            watts = max(TRIFASE_MIN_POWER, min(TRIFASE_MAX_POWER, int(watts)))
+
+        if abs(watts - self.current_set_power) < POTENZA_PROTEZIONE and self.is_on:
+            print(f"[INFO] Variazione potenza ({watts}W) inferiore alla soglia di protezione ({POTENZA_PROTEZIONE}W). Nessun cambiamento.")
             return
 
         now = time.time()
@@ -52,18 +64,33 @@ class WallboxController:
             return
 
         print(f"[AZIONE] CAMBIO POTENZA -> {watts} W")
+
         if self.send_command({'btn': f'P{watts}'}):
             self.current_set_power = watts
             self.last_update_time = now
+        
+        
 
     def turn_on(self):
+        
         if not self.is_on:
+            if self.time_turned_off > 0:
+                tempo_trascorso = time.time() - self.time_turned_off
+                if tempo_trascorso < COOLDOWN_ACCENSIONE:  #almeno 1 min
+                    print(f"[INFO] Attesa cooldown: {COOLDOWN_ACCENSIONE - tempo_trascorso:.1f}s prima di accendere")
+                    return
+            
             print("[AZIONE] ACCENSIONE (ON)")
+            self.set_power(MONOFASE_MIN_POWER if self.fase == 0 else TRIFASE_MIN_POWER) 
+
             if self.send_command({'btn': 'i'}):
                 self.is_on = True
                 self.last_update_time = time.time()
+            
+    
 
     def turn_off(self, force=False):
+        
         now = time.time()
         if force and self.last_update_time != 0 and (now - self.last_update_time < UPDATE_INTERVAL_S):
             return
@@ -72,19 +99,57 @@ class WallboxController:
             print("[AZIONE] SPEGNIMENTO (OFF)")
             if self.send_command({'btn': 'o'}):
                 self.is_on = False
+                self.time_turned_off = time.time() 
                 self.last_update_time = time.time()
                 time.sleep(0.5)
-                self.send_command({'btn': f'P{MIN_POWER}'})
-                self.current_set_power = MIN_POWER
+                self.send_command({'btn': f'P{MONOFASE_MIN_POWER if self.fase == 0 else TRIFASE_MIN_POWER}'})
+                self.current_set_power = MONOFASE_MIN_POWER if self.fase == 0 else TRIFASE_MIN_POWER
+            
+            
+        
 
     def initialize(self):
         print("\n=== INIZIALIZZAZIONE SISTEMA ===")
-        print("1. Imposto potenza minima (1380W)...")
-        self.set_power(MIN_POWER)
-        time.sleep(1)
-        print("2. Metto in OFF (Attesa dati)...")
+
+        try:
+            print(f"Richiesta dati a {WALLBOX_URL}...")
+            response = requests.get(WALLBOX_URL, timeout=5)
+
+            if response.status_code == 200:
+                dati = response.json()
+                valore_fase = dati.get("tfase")
+
+                if valore_fase == "1":
+                    modalita = "TRIFASE"
+                    self.fase = 1
+                else:
+                    modalita = "MONOFASE"
+                    self.fase = 0
+                
+                print("\n--------------------------------")
+                print(f"TIPO IMPIANTO: {modalita}")
+                print("--------------------------------")
+                
+            else:
+                print(f"Errore. centralina codice: {response.status_code}")
+
+        except requests.exceptions.RequestException as e:
+            print(f"Errore di connessione: {e}")
+        except json.JSONDecodeError:
+            print("Errore: La risposta del server non è un JSON valido.")
+
+        print("1. Metto in OFF (Attesa dati)...")
         self.last_update_time = 0 
         self.turn_off(force=True)
+        
+        if self.fase == 0:
+            print("1. Imposto potenza minima (1380W)...")
+            self.set_power(MONOFASE_MIN_POWER)
+        elif self.fase == 1:
+            print("1. Imposto potenza minima (4140)...")
+            self.set_power(TRIFASE_MIN_POWER)
+
+        time.sleep(1)
         print("=== PRONTO. IN ATTESA PACCHETTI ===\n")
 
 # -----------------------------------------------------------
@@ -95,14 +160,14 @@ class EnergyMonitor:
         self.solar_now = 0.0        
         self.total_grid_load = 0.0  
         self.fases = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        self.ctrletturefasi = 0
 
     def parse_packet(self, data):
         try:
             xml_str = data.decode('utf-8', errors='ignore')
             root = ET.fromstring(xml_str)
             
-            # --- PACCHETTO FASI (Completo: arriva ogni 60s) ---
-            if root.tag == 'electricity':
+            if root.tag == 'electricity':#fasi
                 channels = root.find('channels')
                 if channels:
                     p = {}
@@ -121,7 +186,6 @@ class EnergyMonitor:
                     self.exporting = self.solar_now - self.total_grid_load
                     self.fases = [l1, l2, l3, l4, l5, l6]
                     
-                    # STAMPA TABELLA GRANDE
                     print("\n" + "="*60)
                     print(f" ⚡ DATO FASI")
                     print("-" * 60)
@@ -129,19 +193,16 @@ class EnergyMonitor:
                     print(f" | SOLARE (Inv)   | L4: {l4:5.0f} | L5: {l5:5.0f} | L6: {l6:5.0f} | TOT: {self.solar_now:.0f}W")
                     print("="*60)
                     print(f"")
+                    self.ctrletturefasi += 1
                     
                     return "TRIGGER"
 
-            # --- PACCHETTO SOLAR (Veloce) ---
-            elif root.tag == 'solar':
+
+            elif root.tag == 'solar':#generata
                 curr = root.find('current')
                 if curr is not None:
                     gen = float(curr.find('generating').text)
                     self.solar_now = gen
-                    
-                    # STAMPA SEMPRE IL PACCHETTO VELOCE
-                    #print(f"☀️  SOLARE LIVE: {gen:.0f} W") 
-                    
                     return "TRIGGER"
                 
         except Exception:
@@ -152,110 +213,45 @@ class EnergyMonitor:
 # LOGICA DI CONTROLLO
 # -----------------------------------------------------------
 def run_logic(monitor, wallbox):
-    delta = 400
-    deltacarica = 200
-    generata = monitor.solar_now
-    consumocasa = monitor.total_grid_load
+    potenza_generata = monitor.solar_now
+    potenza_consumata = monitor.total_grid_load
 
-    if consumocasa == 0: #non sono ancora arrivati i dati completi, aspetto
+    potenza_generata += POTENZA_PRELEVABILE
+    potenza_esportata = potenza_generata - potenza_consumata
+    potenza_carica = wallbox.current_set_power if wallbox.is_on else 0
+
+    potenza_minima = MONOFASE_MIN_POWER if wallbox.fase == 0 else TRIFASE_MIN_POWER
+    potenza_massima = MONOFASE_MAX_POWER if wallbox.fase == 0 else TRIFASE_MAX_POWER
+    
+    if potenza_consumata == 0:
         print("[INFO] Dati casa non ancora disponibili. Attendo...")
         return
-    if(wallbox.is_on):
-        disponibile = generata - consumocasa - wallbox.current_set_power
-    else:
-        disponibile = generata - consumocasa
-    disponibile += delta 
 
-    print(f"[INFO] potenza generata: {generata:.0f}W. Consumo casa: {consumocasa:.0f}W. Potenza disponibile(con delta rete): {disponibile:.0f}W. Wallbox: {'ON' if wallbox.is_on else 'OFF'} ({wallbox.current_set_power:.0f}W)")
-
-    #minimo necessario
-    if not wallbox.is_on: # se e spento guardo se c'e' abbastanza potenza per accenderlo
-        if disponibile > MIN_POWER:
-            print(f"[DECISIONE] potenza disponibile ({disponibile:.0f}W). Inizia Carica. a {MIN_POWER}W")
-            wallbox.turn_on()
-            wallbox.set_power(MIN_POWER)
-        return
-    
-    if wallbox.is_on: # se e acceso guardo se c'e' abbastanza potenza per mantenerlo acceso
-        if generata < MIN_POWER:
-            print(f"[DECISIONE] Sole insufficiente ({generata:.0f}W). Spengo.")
-            wallbox.turn_off(force=True)
-            return
-        
-        if disponibile > 0: #aumento
-            nuovacarica = wallbox.current_set_power + disponibile
-            if nuovacarica > MAX_POWER:
-                nuovacarica = MAX_POWER
-            if abs(nuovacarica - wallbox.current_set_power) < deltacarica: #non faccio cambiamenti piccoli per non stressare la wallbox
-                return
-            print(f"[INFO] nuova carica a {nuovacarica:.0f}W")
-            wallbox.set_power(nuovacarica)
-        if disponibile < 0:
-            nuovacarica = wallbox.current_set_power - abs(disponibile)
-            print(f"[INFO] nuova carica a {nuovacarica:.0f}W")
-            if abs(nuovacarica - wallbox.current_set_power) < deltacarica: #non faccio cambiamenti piccoli per non stressare la wallbox
-                return
-            if nuovacarica >MIN_POWER:
-                
-                wallbox.set_power(nuovacarica)
-            else:
-                wallbox.turn_off(force=True)
-
-                
-
-
-
-
-
-
-    """
-    gen = monitor.solar_now
-    grid_total = monitor.total_grid_load 
-    
-    # Calcolo Consumo Casa Puro
-    wb_power = wallbox.current_set_power if wallbox.is_on else 0.0
-    house_pure = max(0, grid_total - wb_power)
-    
-    # Calcolo Disponibile
-    surplus = gen - house_pure
-    
-    # --- SICUREZZA NUVOLA ---
-    if wallbox.is_on and wb_power > gen:
-        print(f"   !!! ALLARME NUVOLA !!! (Carica {wb_power:.0f} > Sole {gen:.0f})")
-        if gen < MIN_POWER:
-            wallbox.turn_off(force=True)
-        else:
-            wallbox.set_power(gen)
-        return
-
-    # --- STANDARD ---
-    
-    # SPEGNIMENTO
-    if gen < MIN_POWER:
-        if wallbox.is_on: 
-            print("   [DECISIONE] Sole insufficiente. Spengo.")
-        wallbox.turn_off(force=True)
-        return
-
-    # AVVIO
+    print(f"\n[INFO] Potenza Generata (+ prelevabile: {POTENZA_PRELEVABILE}W): {potenza_generata:.0f}W | Potenza Consumata: {potenza_consumata:.0f}W | Potenza Esportata: {potenza_esportata:.0f}W | Wallbox: {'ON' if wallbox.is_on else 'OFF'} ({wallbox.current_set_power:.0f}W)")
     if not wallbox.is_on:
-        if surplus > MIN_POWER:
-            print(f"   [DECISIONE] Surplus ok ({surplus:.0f}W). Inizia Carica.")
-            wallbox.turn_on()
-            wallbox.set_power(MIN_POWER)
+        if potenza_esportata > potenza_minima:
+            print(f"[DECISIONE] Potenza esportata ({potenza_esportata:.0f}W) sufficiente per accendere. Accendo a {potenza_minima}W.")
+            wallbox.turn_on()#accendo al minimo
         return
 
-    # REGOLAZIONE
     if wallbox.is_on:
-        if gen < monitor.solar_now:
-            target = monitor.total_grid_load - monitor.solar_now
-            if target > MIN_POWER:
-                wallbox.set_power(target)
-        if gen > monitor.solar_now:
-            target = monitor.solar_now
-            if target > MIN_POWER:
-                wallbox.set_power(target)
-                """
+        if potenza_carica > potenza_generata or potenza_esportata < 0:#devo diminuire
+            nuova_potenza = potenza_carica - abs(potenza_esportata)
+            if nuova_potenza < potenza_minima or potenza_generata < potenza_minima: #spengo
+                print(f"[DECISIONE] Sole insufficiente ({potenza_generata:.0f}W). Spengo.")
+                wallbox.turn_off(force=True)   
+            else:
+                print(f"[DECISIONE] Diminuisco potenza a {nuova_potenza:.0f}W")
+                wallbox.set_power(nuova_potenza)
+        
+        else: #posso aumentare
+            nuova_potenza = potenza_carica + abs(potenza_esportata)
+            if nuova_potenza > potenza_generata:
+                return
+            if nuova_potenza > potenza_massima:
+                nuova_potenza = potenza_massima
+            print(f"[DECISIONE] Aumento potenza a {nuova_potenza:.0f}W")
+            wallbox.set_power(nuova_potenza)
 
 # -----------------------------------------------------------
 # MAIN
