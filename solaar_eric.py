@@ -5,6 +5,10 @@ import time
 import requests
 import logging
 import json
+import os
+from dotenv import load_dotenv
+import asyncio
+from telegram import Bot
 
 # -----------------------------------------------------------
 # CONFIGURAZIONE
@@ -30,6 +34,9 @@ POTENZA_PRELEVABILE = 0
 UPDATE_INTERVAL_S = 5    
 TIMER_SPEGNIMENTO = 60
 
+load_dotenv()
+API_KEY = os.getenv('API_KEY')
+CHAT_ID = os.getenv('CHAT_ID')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s', datefmt='%H:%M:%S')
 
 # -----------------------------------------------------------
@@ -258,6 +265,14 @@ def run_logic(monitor, wallbox):
                     wallbox.pending_off_until = 0
                     if potenza_generata < potenza_minima:#dopo 1 min non c'è ancora sole
                         print(f"[DECISIONE] Dopo attesa, sole ancora insufficiente ({potenza_generata:.0f}W). Spengo.")
+                        try: 
+                            asyncio.run(invia_notifica(f"⚠️ Attenzione! La potenza generata è insufficiente ({potenza_generata:.0f}W). Spengo il wallbox."))
+                            if wallbox.fase == 1:
+                                asyncio.run(invia_notifica(f"⚠️ Consiglio: mettere l'impianto in modalità monofase per sfruttare meglio la potenza disponibile."))
+                            else:
+                                asyncio.run(invia_notifica(f"⚠️ Consiglio: staccare la macchina"))
+                        except Exception as e:
+                            print(f"[ERRORE] Invio notifica fallito: {e}")
                         wallbox.turn_off(force=True)
                     else:#è tornato il sole siumm
                         print(f"[DECISIONE] Dopo attesa, generazione sufficiente. Mantengo acceso a {potenza_minima}W.")
@@ -281,10 +296,20 @@ def run_logic(monitor, wallbox):
             print(f"[DECISIONE] Aumento potenza a {nuova_potenza:.0f}W")
             wallbox.set_power(nuova_potenza)
 
+async def invia_notifica(messaggio):
+    bot = Bot(token=API_KEY)
+    await bot.send_message(chat_id=CHAT_ID, text=messaggio)
+    print(f"[INFO] Messaggio telegram ('{messaggio}') inviato correttamente!")
+
 # -----------------------------------------------------------
 # MAIN
 # -----------------------------------------------------------
 def main():
+    try: 
+        asyncio.run(invia_notifica(f"SISTEMA AVVIATO. Inizializzazione in corso..."))
+    except Exception as e:
+        print(f"[ERRORE] Invio notifica avvio fallito: {e}")
+    
     monitor = EnergyMonitor()
     wallbox = WallboxController()
 
