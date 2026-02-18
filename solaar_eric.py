@@ -20,6 +20,12 @@ IFACE = '192.168.1.193'
 WALLBOX_IP = '192.168.1.22'
 WALLBOX_URL = f"http://{WALLBOX_IP}/index.json"
 
+ULTIMA_LETTURA_FASI = None
+ULTIMA_LETTURA_SOLARE = None
+
+ULTIME_5_LETTURE_FASI = []
+ULTIME_5_LETTURE_SOLARE = []
+
 
 #parametri fasi
 MONOFASE_MIN_POWER = 1380  #6A
@@ -170,6 +176,7 @@ class EnergyMonitor:
         self.total_grid_load = 0.0  
         self.fases = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         self.ctrletturefasi = 0
+        self.time = None
 
     def parse_packet(self, data):
         try:
@@ -203,7 +210,12 @@ class EnergyMonitor:
                     print("="*60)
                     print(f"")
                     self.ctrletturefasi += 1
-                    
+                    ULTIMA_LETTURA_FASI = time.time() 
+                    self.time = ULTIMA_LETTURA_FASI
+                    ULTIME_5_LETTURE_FASI.append((self.total_grid_load, self.solar_now, self.fases, self.time))
+                    if len(ULTIME_5_LETTURE_FASI) > 5:
+                        ULTIME_5_LETTURE_FASI.pop(0)    
+            
                     return "TRIGGER"
 
 
@@ -212,6 +224,11 @@ class EnergyMonitor:
                 if curr is not None:
                     gen = float(curr.find('generating').text)
                     self.solar_now = gen
+                    ULTIMA_LETTURA_SOLARE = time.time()
+                    self.time = ULTIMA_LETTURA_SOLARE
+                    ULTIME_5_LETTURE_SOLARE.append((gen, self.time))
+                    if len(ULTIME_5_LETTURE_SOLARE) > 5:
+                        ULTIME_5_LETTURE_SOLARE.pop(0)
                     return "TRIGGER"
                 
         except Exception:
