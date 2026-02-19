@@ -40,8 +40,8 @@ WALLBOX_URL = f"http://{CONFIG['WALLBOX_IP']}/index.json"
 SYSTEM_STATE = {
     'ULTIMA_LETTURA_FASI': None,
     'ULTIMA_LETTURA_SOLARE': None,
-    'ULTIME_LETTURE_FASI': [],   # Aumentato il buffer per il grafico
-    'ULTIME_LETTURE_SOLARE': [], # Aumentato il buffer per il grafico
+    'ULTIME_LETTURE_FASI': [],   # Buffer per il grafico
+    'ULTIME_LETTURE_SOLARE': [], # Buffer per il grafico
     'MONITOR_FASI': [0,0,0,0,0,0],
     'WALLBOX_POWER': 0,
     'WALLBOX_STATUS': False,
@@ -78,8 +78,10 @@ HTML_TEMPLATE = """
         button { background: #28a745; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; width: 100%; font-size: 1em; }
         button:hover { background: #218838; }
         .phase-box { display: flex; justify-content: space-between; border-bottom: 1px solid #eee; padding: 5px 0; }
+        .tot-box { display: flex; justify-content: space-between; background-color: #e9ecef; padding: 8px 5px; margin-top: 10px; border-radius: 4px; font-weight: bold; }
         .status-on { color: green; font-weight: bold; }
         .status-off { color: red; font-weight: bold; }
+        .time-ago { font-weight: normal !important; font-style: italic; color: #888 !important; font-size: 0.9em; margin-left: 5px; }
     </style>
 </head>
 <body>
@@ -105,8 +107,8 @@ HTML_TEMPLATE = """
                 <div class="stat">Wallbox: <span id="wb_status">--</span></div>
                 <div class="stat">Potenza WB: <span id="wb_power">0</span> W</div>
                 <div class="stat">Modalità: <span id="wb_mode">--</span></div>
-                <div class="stat" style="font-size: 0.9em; color: #666;">Ultimo Agg. Fasi: <span id="last_fasi">--</span></div>
-                <div class="stat" style="font-size: 0.9em; color: #666;">Ultimo Agg. Solare: <span id="last_solar">--</span></div>
+                <div class="stat" style="font-size: 0.9em; color: #666;">Ultimo Agg. Fasi: <span id="last_fasi">--</span> <span id="sec_fasi" class="time-ago"></span></div>
+                <div class="stat" style="font-size: 0.9em; color: #666;">Ultimo Agg. Solare: <span id="last_solar">--</span> <span id="sec_solar" class="time-ago"></span></div>
             </div>
         </div>
 
@@ -115,15 +117,17 @@ HTML_TEMPLATE = """
             <div class="grid">
                 <div>
                     <h3>Consumo Rete (Grid)</h3>
-                    <div class="phase-box"><span>L1:</span> <span id="l1">0</span> W</div>
-                    <div class="phase-box"><span>L2:</span> <span id="l2">0</span> W</div>
-                    <div class="phase-box"><span>L3:</span> <span id="l3">0</span> W</div>
+                    <div class="phase-box"><span>L1:</span> <span><span id="l1">0</span> W</span></div>
+                    <div class="phase-box"><span>L2:</span> <span><span id="l2">0</span> W</span></div>
+                    <div class="phase-box"><span>L3:</span> <span><span id="l3">0</span> W</span></div>
+                    <div class="tot-box"><span>TOTALE RETE:</span> <span><span id="tot_grid">0</span> W</span></div>
                 </div>
                 <div>
                     <h3>Produzione (Solar)</h3>
-                    <div class="phase-box"><span>L4:</span> <span id="l4">0</span> W</div>
-                    <div class="phase-box"><span>L5:</span> <span id="l5">0</span> W</div>
-                    <div class="phase-box"><span>L6:</span> <span id="l6">0</span> W</div>
+                    <div class="phase-box"><span>L4:</span> <span><span id="l4">0</span> W</span></div>
+                    <div class="phase-box"><span>L5:</span> <span><span id="l5">0</span> W</span></div>
+                    <div class="phase-box"><span>L6:</span> <span><span id="l6">0</span> W</span></div>
+                    <div class="tot-box"><span>TOTALE SOLARE:</span> <span><span id="tot_solar">0</span> W</span></div>
                 </div>
             </div>
         </div>
@@ -144,18 +148,30 @@ HTML_TEMPLATE = """
                     label: 'Consumo Rete (W)',
                     borderColor: 'rgb(255, 99, 132)',
                     data: [],
-                    fill: false
+                    fill: false,
+                    tension: 0.1
                 }, {
                     label: 'Produzione Solare (W)',
                     borderColor: 'rgb(75, 192, 192)',
                     data: [],
                     fill: true,
-                    backgroundColor: 'rgba(75, 192, 192, 0.2)'
+                    backgroundColor: 'rgba(75, 192, 192, 0.2)',
+                    tension: 0.1
+                }, {
+                    label: 'Potenza Wallbox (W)',
+                    borderColor: 'rgb(54, 162, 235)',
+                    data: [],
+                    fill: true,
+                    backgroundColor: 'rgba(54, 162, 235, 0.1)',
+                    tension: 0.1
                 }]
             },
             options: {
                 responsive: true,
-                scales: { x: { display: false } },
+                scales: { 
+                    x: { display: false },
+                    y: { beginAtZero: true }
+                },
                 animation: { duration: 0 }
             }
         });
@@ -171,35 +187,44 @@ HTML_TEMPLATE = """
                 const response = await fetch('/api/data');
                 const data = await response.json();
 
-                // Aggiorna Inputs (solo se non hanno focus per non disturbare la scrittura)
+                // Aggiorna Inputs (solo se non hanno focus)
                 if (document.activeElement.id !== 'prelevabile') 
                     document.getElementById('prelevabile').placeholder = data.config.prelevabile;
                 if (document.activeElement.id !== 'protezione') 
                     document.getElementById('protezione').placeholder = data.config.protezione;
 
-                // Aggiorna Stato
+                // Aggiorna Stato e Calcolo Secondi Trascorsi
                 const wbSpan = document.getElementById('wb_status');
                 wbSpan.innerText = data.status.wb_on ? "ON" : "OFF";
                 wbSpan.className = data.status.wb_on ? "status-on" : "status-off";
                 
                 document.getElementById('wb_power').innerText = data.status.wb_power;
                 document.getElementById('wb_mode').innerText = data.status.fase_mode === 1 ? "Trifase" : "Monofase";
-                document.getElementById('last_fasi').innerText = formatTime(data.status.last_fasi);
-                document.getElementById('last_solar').innerText = formatTime(data.status.last_solar);
+                
+                const serverTime = data.status.server_time;
+                const lastFasi = data.status.last_fasi;
+                const lastSolar = data.status.last_solar;
 
-                // Aggiorna Fasi
+                document.getElementById('last_fasi').innerText = formatTime(lastFasi);
+                document.getElementById('sec_fasi').innerText = lastFasi ? `(${Math.max(0, Math.round(serverTime - lastFasi))}s fa)` : '';
+                
+                document.getElementById('last_solar').innerText = formatTime(lastSolar);
+                document.getElementById('sec_solar').innerText = lastSolar ? `(${Math.max(0, Math.round(serverTime - lastSolar))}s fa)` : '';
+
+                // Aggiorna Fasi e Totali
                 const f = data.status.fasi;
                 for(let i=0; i<6; i++) {
                     document.getElementById('l'+(i+1)).innerText = Math.round(f[i]);
                 }
+                document.getElementById('tot_grid').innerText = Math.round(data.status.grid_total);
+                document.getElementById('tot_solar').innerText = Math.round(data.status.solar_total);
 
                 // Aggiorna Grafico
-                // Usiamo lo storico fasi per l'asse X e Y Grid, e storico solare per Y Solar
-                // Per semplicità allineiamo tutto all'array delle fasi che è il master
                 const history = data.history;
                 chart.data.labels = history.map(h => formatTime(h.time));
                 chart.data.datasets[0].data = history.map(h => h.grid);
                 chart.data.datasets[1].data = history.map(h => h.solar);
+                chart.data.datasets[2].data = history.map(h => h.wb); // Nuova linea Wallbox
                 chart.update();
 
             } catch (e) { console.error("Errore fetch:", e); }
@@ -235,29 +260,37 @@ def index():
 
 @app.route('/api/data')
 def get_data():
-    # Prepara i dati per il grafico dai buffer
     history = []
     # Combina i dati. Assumiamo che la lista fasi sia la principale per il timing
     for item in SYSTEM_STATE['ULTIME_LETTURE_FASI']:
-        # item = (grid_load, solar_now, fases, time)
+        # item = (grid_load, solar_now, fases, time, wb_power)
         history.append({
             'grid': item[0],
             'solar': item[1],
-            'time': item[3]
+            'time': item[3],
+            'wb': item[4] if len(item) > 4 else 0  # Fallback di sicurezza in caso di buffer vecchio
         })
     
+    # Calcolo totale fasi in background
+    fasi = SYSTEM_STATE['MONITOR_FASI']
+    tot_grid = sum(fasi[0:3])
+    tot_solar = sum(fasi[3:6])
+
     return jsonify({
         'config': {
             'prelevabile': CONFIG['POTENZA_PRELEVABILE'],
             'protezione': CONFIG['POTENZA_PROTEZIONE']
         },
         'status': {
+            'server_time': time.time(),
             'wb_on': SYSTEM_STATE['WALLBOX_STATUS'],
-            'wb_power': SYSTEM_STATE['WALLBOX_POWER'],
+            'wb_power': SYSTEM_STATE['WALLBOX_POWER'] if SYSTEM_STATE['WALLBOX_STATUS'] else 0,
             'fase_mode': SYSTEM_STATE['IMPIANTO_FASE'],
             'last_fasi': SYSTEM_STATE['ULTIMA_LETTURA_FASI'],
             'last_solar': SYSTEM_STATE['ULTIMA_LETTURA_SOLARE'],
-            'fasi': SYSTEM_STATE['MONITOR_FASI']
+            'fasi': fasi,
+            'grid_total': tot_grid,
+            'solar_total': tot_solar
         },
         'history': history
     })
@@ -444,8 +477,12 @@ class EnergyMonitor:
                     SYSTEM_STATE['MONITOR_FASI'] = self.fases
                     self.time = SYSTEM_STATE['ULTIMA_LETTURA_FASI']
                     
-                    # Aggiorno la lista per il grafico (teniamo 30 campioni invece di 5 per il grafico web)
-                    SYSTEM_STATE['ULTIME_LETTURE_FASI'].append((self.total_grid_load, self.solar_now, self.fases, self.time))
+                    # Recupero la potenza della wallbox SOLO SE ACCESA, altrimenti 0 per il grafico
+                    wb_status = SYSTEM_STATE.get('WALLBOX_STATUS', False)
+                    wb_power = SYSTEM_STATE.get('WALLBOX_POWER', 0) if wb_status else 0
+                    
+                    # Aggiorno la lista per il grafico aggiungendo wb_power come quinto elemento
+                    SYSTEM_STATE['ULTIME_LETTURE_FASI'].append((self.total_grid_load, self.solar_now, self.fases, self.time, wb_power))
                     if len(SYSTEM_STATE['ULTIME_LETTURE_FASI']) > 30:
                         SYSTEM_STATE['ULTIME_LETTURE_FASI'].pop(0)    
             
