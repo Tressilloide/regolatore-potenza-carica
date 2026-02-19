@@ -45,13 +45,24 @@ SYSTEM_STATE = {
     'MONITOR_FASI': [0,0,0,0,0,0],
     'WALLBOX_POWER': 0,
     'WALLBOX_STATUS': False,
-    'IMPIANTO_FASE': 0 # 0=Mono, 1=Tri
+    'IMPIANTO_FASE': 0, # 0=Mono, 1=Tri
+    'LOGS': [] # Buffer per la console Web
 }
 
 load_dotenv()
 API_KEY = os.getenv('API_KEY')
 CHAT_ID = os.getenv('CHAT_ID')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s', datefmt='%H:%M:%S')
+
+def log_msg(msg):
+    """Salva il log sia su terminale che nel buffer per la Web UI"""
+    t_str = time.strftime("%H:%M:%S")
+    full_msg = f"[{t_str}] {msg}"
+    print(full_msg)
+    SYSTEM_STATE['LOGS'].append(full_msg)
+    # Tieni solo gli ultimi 50 messaggi in memoria per non appesantire
+    if len(SYSTEM_STATE['LOGS']) > 50:
+        SYSTEM_STATE['LOGS'].pop(0)
 
 # -----------------------------------------------------------
 # INTERFACCIA WEB (HTML/JS)
@@ -82,6 +93,19 @@ HTML_TEMPLATE = """
         .status-on { color: green; font-weight: bold; }
         .status-off { color: red; font-weight: bold; }
         .time-ago { font-weight: normal !important; font-style: italic; color: #888 !important; font-size: 0.9em; margin-left: 5px; }
+        
+        /* Stile per la Console */
+        .console-box { 
+            background: #1e1e1e; 
+            color: #00ff00; 
+            font-family: 'Courier New', Courier, monospace; 
+            height: 250px; 
+            overflow-y: scroll; 
+            padding: 15px; 
+            border-radius: 5px; 
+            font-size: 0.9em; 
+            line-height: 1.4;
+        }
     </style>
 </head>
 <body>
@@ -135,6 +159,11 @@ HTML_TEMPLATE = """
         <div class="card">
             <h2>📈 Grafico Real-time</h2>
             <canvas id="energyChart"></canvas>
+        </div>
+
+        <div class="card">
+            <h2>🖥️ Console Live</h2>
+            <div id="console" class="console-box"></div>
         </div>
     </div>
 
@@ -224,8 +253,19 @@ HTML_TEMPLATE = """
                 chart.data.labels = history.map(h => formatTime(h.time));
                 chart.data.datasets[0].data = history.map(h => h.grid);
                 chart.data.datasets[1].data = history.map(h => h.solar);
-                chart.data.datasets[2].data = history.map(h => h.wb); // Nuova linea Wallbox
+                chart.data.datasets[2].data = history.map(h => h.wb);
                 chart.update();
+
+                // Aggiorna Console
+                const consoleDiv = document.getElementById('console');
+                // Controlliamo se l'utente ha scrollato in su, in tal caso non forziamo lo scroll in basso
+                const isScrolledToBottom = consoleDiv.scrollHeight - consoleDiv.clientHeight <= consoleDiv.scrollTop + 5;
+                
+                consoleDiv.innerHTML = data.logs.join('<br>');
+                
+                if (isScrolledToBottom) {
+                    consoleDiv.scrollTop = consoleDiv.scrollHeight;
+                }
 
             } catch (e) { console.error("Errore fetch:", e); }
         }
@@ -263,12 +303,11 @@ def get_data():
     history = []
     # Combina i dati. Assumiamo che la lista fasi sia la principale per il timing
     for item in SYSTEM_STATE['ULTIME_LETTURE_FASI']:
-        # item = (grid_load, solar_now, fases, time, wb_power)
         history.append({
             'grid': item[0],
             'solar': item[1],
             'time': item[3],
-            'wb': item[4] if len(item) > 4 else 0  # Fallback di sicurezza in caso di buffer vecchio
+            'wb': item[4] if len(item) > 4 else 0 
         })
     
     # Calcolo totale fasi in background
@@ -292,7 +331,8 @@ def get_data():
             'grid_total': tot_grid,
             'solar_total': tot_solar
         },
-        'history': history
+        'history': history,
+        'logs': SYSTEM_STATE['LOGS']
     })
 
 @app.route('/api/settings', methods=['POST'])
@@ -302,7 +342,7 @@ def update_settings():
         CONFIG['POTENZA_PRELEVABILE'] = int(data['prelevabile'])
     if 'protezione' in data:
         CONFIG['POTENZA_PROTEZIONE'] = int(data['protezione'])
-    print(f"[WEB] Parametri aggiornati: Prelevabile={CONFIG['POTENZA_PRELEVABILE']}, Protezione={CONFIG['POTENZA_PROTEZIONE']}")
+    log_msg(f"[WEB] Parametri aggiornati: Prelevabile={CONFIG['POTENZA_PRELEVABILE']}, Protezione={CONFIG['POTENZA_PROTEZIONE']}")
     return jsonify({'success': True})
 
 def run_flask():
@@ -340,14 +380,14 @@ class WallboxController:
             watts = max(CONFIG['TRIFASE_MIN_POWER'], min(CONFIG['TRIFASE_MAX_POWER'], int(watts)))
 
         if abs(watts - self.current_set_power) < CONFIG['POTENZA_PROTEZIONE'] and self.is_on:
-            print(f"[INFO] Variazione potenza ({watts}W) inferiore alla soglia di protezione ({CONFIG['POTENZA_PROTEZIONE']}W). Nessun cambiamento.")
+            log_msg(f"[INFO] Variazione potenza ({watts}W) inferiore alla soglia di protezione ({CONFIG['POTENZA_PROTEZIONE']}W). Nessun cambiamento.")
             return
 
         now = time.time()
         if self.last_update_time > 0 and (now - self.last_update_time < CONFIG['UPDATE_INTERVAL_S']):
             return
 
-        print(f"[AZIONE] CAMBIO POTENZA -> {watts} W")
+        log_msg(f"[AZIONE] CAMBIO POTENZA -> {watts} W")
 
         if self.send_command({'btn': f'P{watts}'}):
             self.current_set_power = watts
@@ -360,10 +400,10 @@ class WallboxController:
             if self.time_turned_off > 0:
                 tempo_trascorso = time.time() - self.time_turned_off
                 if tempo_trascorso < CONFIG['COOLDOWN_ACCENSIONE']:
-                    print(f"[INFO] Attesa cooldown: {CONFIG['COOLDOWN_ACCENSIONE'] - tempo_trascorso:.1f}s prima di accendere")
+                    log_msg(f"[INFO] Attesa cooldown: {CONFIG['COOLDOWN_ACCENSIONE'] - tempo_trascorso:.1f}s prima di accendere")
                     return
             
-            print("[AZIONE] ACCENSIONE (ON)")
+            log_msg("[AZIONE] ACCENSIONE (ON)")
             self.set_power(CONFIG['MONOFASE_MIN_POWER'] if self.fase == 0 else CONFIG['TRIFASE_MIN_POWER']) 
 
             if self.send_command({'btn': 'i'}):
@@ -377,7 +417,7 @@ class WallboxController:
             return
 
         if self.is_on or force:
-            print("[AZIONE] SPEGNIMENTO (OFF)")
+            log_msg("[AZIONE] SPEGNIMENTO (OFF)")
             if self.send_command({'btn': 'o'}):
                 self.is_on = False
                 self.time_turned_off = time.time() 
@@ -389,9 +429,9 @@ class WallboxController:
                 self.update_shared_state()
 
     def initialize(self):
-        print("\n=== INIZIALIZZAZIONE SISTEMA ===")
+        log_msg("=== INIZIALIZZAZIONE SISTEMA ===")
         try:
-            print(f"Richiesta dati a {WALLBOX_URL}...")
+            log_msg(f"Richiesta dati a {WALLBOX_URL}...")
             response = requests.get(WALLBOX_URL, timeout=5)
 
             if response.status_code == 200:
@@ -405,31 +445,29 @@ class WallboxController:
                     modalita = "MONOFASE"
                     self.fase = 0
                 
-                print("\n--------------------------------")
-                print(f"TIPO IMPIANTO: {modalita}")
-                print("--------------------------------")
+                log_msg(f"TIPO IMPIANTO: {modalita}")
                 self.update_shared_state()
             else:
-                print(f"Errore. centralina codice: {response.status_code}")
+                log_msg(f"Errore. centralina codice: {response.status_code}")
 
         except requests.exceptions.RequestException as e:
-            print(f"Errore di connessione: {e}")
+            log_msg(f"Errore di connessione: {e}")
         except json.JSONDecodeError:
-            print("Errore: La risposta del server non è un JSON valido.")
+            log_msg("Errore: La risposta del server non è un JSON valido.")
 
-        print("1. Metto in OFF (Attesa dati)...")
+        log_msg("1. Metto in OFF (Attesa dati)...")
         self.last_update_time = 0 
         self.turn_off(force=True)
         
         if self.fase == 0:
-            print("1. Imposto potenza minima (1380W)...")
+            log_msg("1. Imposto potenza minima (1380W)...")
             self.set_power(CONFIG['MONOFASE_MIN_POWER'])
         elif self.fase == 1:
-            print("1. Imposto potenza minima (4140)...")
+            log_msg("1. Imposto potenza minima (4140)...")
             self.set_power(CONFIG['TRIFASE_MIN_POWER'])
 
         time.sleep(1)
-        print("=== PRONTO. IN ATTESA PACCHETTI ===\n")
+        log_msg("=== PRONTO. IN ATTESA PACCHETTI ===")
 
 # -----------------------------------------------------------
 # MONITOR DATI 
@@ -465,12 +503,8 @@ class EnergyMonitor:
                     self.solar_now = l4 + l5 + l6 
                     self.fases = [l1, l2, l3, l4, l5, l6]
                     
-                    print("\n" + "="*60)
-                    print(f" ⚡ DATO FASI")
-                    print("-" * 60)
-                    print(f" | RETE (Casa+WB) | L1: {l1:5.0f} | L2: {l2:5.0f} | L3: {l3:5.0f} | TOT: {self.total_grid_load:.0f}W")
-                    print(f" | SOLARE (Inv)   | L4: {l4:5.0f} | L5: {l5:5.0f} | L6: {l6:5.0f} | TOT: {self.solar_now:.0f}W")
-                    print("="*60)
+                    # Rimuoviamo il print "gigante" per non spammare la nuova console/terminale
+                    # print(f" | RETE | TOT: {self.total_grid_load:.0f}W   ---   | SOLARE | TOT: {self.solar_now:.0f}W")
                     
                     self.ctrletturefasi += 1
                     SYSTEM_STATE['ULTIMA_LETTURA_FASI'] = time.time()
@@ -524,18 +558,18 @@ def run_logic(monitor, wallbox):
     potenza_massima = CONFIG['MONOFASE_MAX_POWER'] if wallbox.fase == 0 else CONFIG['TRIFASE_MAX_POWER']
     
     if potenza_consumata == 0:
-        print("[INFO] Dati casa non ancora disponibili. Attendo...")
         return
 
-    print(f"[INFO] Gen (+Prel {POTENZA_PRELEVABILE}): {potenza_generata:.0f}W | Cons: {potenza_consumata:.0f}W | Exp: {potenza_esportata:.0f}W | WB: {'ON' if wallbox.is_on else 'OFF'}")
+    # Manteniamo questo log per capire sempre il contesto ad ogni ciclo
+    log_msg(f"[INFO] Gen: {potenza_generata:.0f}W | Cons: {potenza_consumata:.0f}W | Exp: {potenza_esportata:.0f}W | WB: {'ON' if wallbox.is_on else 'OFF'}")
     
     if wallbox.pending_off_until and potenza_generata >= potenza_minima:
-        print("[INFO] Generazione ripristinata. Annullamento spegnimento programmato.")
+        log_msg("[INFO] Generazione ripristinata. Annullamento spegnimento programmato.")
         wallbox.pending_off_until = 0
 
     if not wallbox.is_on:
         if potenza_esportata > potenza_minima:
-            print(f"[DECISIONE] Export sufficiente. Accendo a {potenza_minima}W.")
+            log_msg(f"[DECISIONE] Export sufficiente. Accendo a {potenza_minima}W.")
             wallbox.turn_on()
         return
 
@@ -544,16 +578,16 @@ def run_logic(monitor, wallbox):
         if wallbox.pending_off_until > 0:
             if now < wallbox.pending_off_until:
                 restante = wallbox.pending_off_until - now
-                print(f"[INFO] Timer spegnimento: {restante:.0f}s...")
+                log_msg(f"[INFO] Timer spegnimento: {restante:.0f}s...")
                 if potenza_generata >= potenza_minima:
-                    print("[INFO] Generazione ripristinata. Annullo spegnimento.")
+                    log_msg("[INFO] Generazione ripristinata. Annullo spegnimento.")
                     wallbox.pending_off_until = 0
                 else:
                     return 
             else:
                 wallbox.pending_off_until = 0
                 if potenza_generata < potenza_minima:
-                    print(f"[DECISIONE] Sole insufficiente. Spengo.")
+                    log_msg(f"[DECISIONE] Sole insufficiente. Spengo.")
                     try: 
                         asyncio.run(invia_notifica(f"⚠️ Potenza insufficiente ({potenza_generata:.0f}W). Spengo wallbox."))
                         if wallbox.fase == 1:
@@ -564,18 +598,18 @@ def run_logic(monitor, wallbox):
                     wallbox.turn_off(force=True)
                     return
                 else:
-                    print(f"[DECISIONE] Generazione sufficiente. Continuo.")
+                    log_msg(f"[DECISIONE] Generazione sufficiente. Continuo.")
                     wallbox.set_power(potenza_minima)
                     return
 
         if potenza_carica > potenza_generata or potenza_esportata < 0:
             nuova_potenza = potenza_carica - abs(potenza_esportata)
             if nuova_potenza < potenza_minima or potenza_generata < potenza_minima:
-                print(f"[DECISIONE] Sole insufficiente. Minimo per {CONFIG['TIMER_SPEGNIMENTO']}s.")
+                log_msg(f"[DECISIONE] Sole insufficiente. Minimo per {CONFIG['TIMER_SPEGNIMENTO']}s.")
                 wallbox.set_power(potenza_minima)
                 wallbox.pending_off_until = now + CONFIG['TIMER_SPEGNIMENTO']
             else:
-                print(f"[DECISIONE] Diminuisco a {nuova_potenza:.0f}W")
+                log_msg(f"[DECISIONE] Diminuisco a {nuova_potenza:.0f}W")
                 wallbox.set_power(nuova_potenza)
 
         else: 
@@ -584,7 +618,7 @@ def run_logic(monitor, wallbox):
                 return
             if nuova_potenza > potenza_massima:
                 nuova_potenza = potenza_massima
-            print(f"[DECISIONE] Aumento a {nuova_potenza:.0f}W")
+            log_msg(f"[DECISIONE] Aumento a {nuova_potenza:.0f}W")
             wallbox.set_power(nuova_potenza)
 
 async def invia_notifica(messaggio):
@@ -593,7 +627,7 @@ async def invia_notifica(messaggio):
         bot = Bot(token=API_KEY)
         await bot.send_message(chat_id=CHAT_ID, text=messaggio)
     except Exception as e:
-        print(f"[ERRORE TELEGRAM] {e}")
+        log_msg(f"[ERRORE TELEGRAM] {e}")
 
 # -----------------------------------------------------------
 # MAIN
@@ -603,7 +637,7 @@ def main():
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True # Si chiude quando chiudi lo script
     flask_thread.start()
-    print(">>> INTERFACCIA WEB ATTIVA SU http://localhost:5000 <<<")
+    log_msg(">>> INTERFACCIA WEB ATTIVA SU http://localhost:5000 <<<")
 
     try: 
         asyncio.run(invia_notifica(f"SISTEMA AVVIATO."))
@@ -619,7 +653,7 @@ def main():
         sock.bind(('0.0.0.0', CONFIG['MCAST_PORT'])) 
         mreq = struct.pack("4s4s", socket.inet_aton(CONFIG['MCAST_GRP']), socket.inet_aton(CONFIG['IFACE']))
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-        print(f"In ascolto su {CONFIG['IFACE']}:{CONFIG['MCAST_PORT']}...")
+        log_msg(f"In ascolto su {CONFIG['IFACE']}:{CONFIG['MCAST_PORT']}...")
     except OSError as e:
         logging.critical(f"Errore Rete (Bind): {e}")
         return
