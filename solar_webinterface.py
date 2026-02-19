@@ -273,7 +273,7 @@ def update_settings():
     return jsonify({'success': True})
 
 def run_flask():
-    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+    app.run(host='0.0.0.0', port=80, debug=False, use_reloader=False)
 
 # -----------------------------------------------------------
 # GESTORE WALLBOX 
@@ -579,7 +579,7 @@ def main():
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
     try:
-        sock.bind((CONFIG['IFACE'], CONFIG['MCAST_PORT']))
+        sock.bind(('0.0.0.0', CONFIG['MCAST_PORT'])) 
         mreq = struct.pack("4s4s", socket.inet_aton(CONFIG['MCAST_GRP']), socket.inet_aton(CONFIG['IFACE']))
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         print(f"In ascolto su {CONFIG['IFACE']}:{CONFIG['MCAST_PORT']}...")
