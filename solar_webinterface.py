@@ -32,6 +32,9 @@ CONFIG = {
     'MCAST_PORT': 22600,
     'IFACE': '192.168.1.193',
     'WALLBOX_IP': '192.168.1.22'
+    ,
+    'SMOOTHING_ALPHA': 0.25,
+    'MAX_DELTA_PER_SEC': 1500
 }
 
 WALLBOX_URL = f"http://{CONFIG['WALLBOX_IP']}/index.json"
@@ -359,9 +362,15 @@ class WallboxController:
         self.fase = 0
         self.time_turned_off = 0  
         self.pending_off_until = 0
+        # smoothing / rate-limit
+        self.smoothing_alpha = CONFIG.get('SMOOTHING_ALPHA', 0.25)
+        self.max_delta_per_sec = CONFIG.get('MAX_DELTA_PER_SEC', 1500)
+        self.last_power_cmd_time = time.time()
+        self.display_power = 0
 
     def update_shared_state(self):
-        SYSTEM_STATE['WALLBOX_POWER'] = self.current_set_power
+        # publish the smoothed/displayed power to the web UI
+        SYSTEM_STATE['WALLBOX_POWER'] = int(round(self.display_power))
         SYSTEM_STATE['WALLBOX_STATUS'] = self.is_on
         SYSTEM_STATE['IMPIANTO_FASE'] = self.fase
 
@@ -373,33 +382,65 @@ class WallboxController:
             return False
 
     def set_power(self, watts):
-        # Usa i valori da CONFIG invece delle costanti globali
+        # Use CONFIG limits
         if self.fase == 0:
-            watts = max(CONFIG['MONOFASE_MIN_POWER'], min(CONFIG['MONOFASE_MAX_POWER'], int(watts)))
-        elif self.fase == 1:
-            watts = max(CONFIG['TRIFASE_MIN_POWER'], min(CONFIG['TRIFASE_MAX_POWER'], int(watts)))
-
-        if abs(watts - self.current_set_power) < CONFIG['POTENZA_PROTEZIONE'] and self.is_on:
-            log_msg(f"[INFO] Variazione potenza ({watts}W) inferiore alla soglia di protezione ({CONFIG['POTENZA_PROTEZIONE']}W). Nessun cambiamento.")
-            return
+            min_p = CONFIG['MONOFASE_MIN_POWER']
+            max_p = CONFIG['MONOFASE_MAX_POWER']
+        else:
+            min_p = CONFIG['TRIFASE_MIN_POWER']
+            max_p = CONFIG['TRIFASE_MAX_POWER']
+        requested = int(max(min_p, min(max_p, int(watts))))
 
         now = time.time()
+        # Protezione: variazioni troppo piccole non inviate quando è ON
+        if abs(requested - self.current_set_power) < CONFIG['POTENZA_PROTEZIONE'] and self.is_on:
+            log_msg(f"[INFO] Variazione potenza ({requested}W) inferiore alla soglia di protezione ({CONFIG['POTENZA_PROTEZIONE']}W). Nessun cambiamento.")
+            return
+
+        # Rate limiter: limita la variazione massima in base al tempo trascorso
+        elapsed = now - (self.last_power_cmd_time or now)
+        allowed_delta = self.max_delta_per_sec * max(elapsed, 0.01)
+        # limit target change relative to last sent power
+        if requested > self.current_set_power + allowed_delta:
+            limited = int(self.current_set_power + allowed_delta)
+        elif requested < self.current_set_power - allowed_delta:
+            limited = int(self.current_set_power - allowed_delta)
+        else:
+            limited = requested
+
+        # Rispetta UPDATE_INTERVAL_S
         if self.last_update_time > 0 and (now - self.last_update_time < CONFIG['UPDATE_INTERVAL_S']):
             return
 
-        log_msg(f"[AZIONE] CAMBIO POTENZA -> {watts} W")
+        # Applica EMA smoothing sul valore da inviare alla centralina
+        if self.display_power == 0:
+            smoothed = float(limited)
+        else:
+            smoothed = self.smoothing_alpha * float(limited) + (1 - self.smoothing_alpha) * float(self.display_power)
 
-        if self.send_command({'btn': f'P{watts}'}):
-            self.current_set_power = watts
-            self.last_update_time = now
+        send_value = int(round(smoothed))
+        # Se il valore arrotondato è uguale a quello già inviato, niente da fare
+        if send_value == self.current_set_power:
+            # aggiorna display_power comunque per convergere
+            self.display_power = smoothed
             self.update_shared_state()
-            # Aggiorno la lista delle letture anche quando cambia la potenza della wallbox
+            return
+
+        log_msg(f"[AZIONE] CAMBIO POTENZA -> richiesta={requested}W limited={limited}W invio={send_value}W")
+
+        if self.send_command({'btn': f'P{send_value}'}):
+            self.current_set_power = send_value
+            self.last_update_time = now
+            self.last_power_cmd_time = now
+            self.display_power = smoothed
+            self.update_shared_state()
+            # Aggiorno la lista delle letture usando la potenza smussata
             try:
                 now_t = time.time()
                 fasi = SYSTEM_STATE.get('MONITOR_FASI', [0,0,0,0,0,0])
                 grid_total = sum(fasi[0:3])
                 solar_total = sum(fasi[3:6])
-                SYSTEM_STATE['ULTIME_LETTURE_FASI'].append((grid_total, solar_total, fasi.copy(), now_t, self.current_set_power))
+                SYSTEM_STATE['ULTIME_LETTURE_FASI'].append((grid_total, solar_total, fasi.copy(), now_t, int(round(self.display_power))))
                 if len(SYSTEM_STATE['ULTIME_LETTURE_FASI']) > 30:
                     SYSTEM_STATE['ULTIME_LETTURE_FASI'].pop(0)
             except Exception:
@@ -435,20 +476,14 @@ class WallboxController:
                 self.last_update_time = time.time()
                 time.sleep(0.5)
                 min_p = CONFIG['MONOFASE_MIN_POWER'] if self.fase == 0 else CONFIG['TRIFASE_MIN_POWER']
-                self.send_command({'btn': f'P{min_p}'})
-                self.current_set_power = min_p
-                self.update_shared_state()
-                # Registra evento anche qui per aggiornare il grafico immediatamente
+                # usa set_power per garantire smoothing e logging coerenti
                 try:
-                    now_t = time.time()
-                    fasi = SYSTEM_STATE.get('MONITOR_FASI', [0,0,0,0,0,0])
-                    grid_total = sum(fasi[0:3])
-                    solar_total = sum(fasi[3:6])
-                    SYSTEM_STATE['ULTIME_LETTURE_FASI'].append((grid_total, solar_total, fasi.copy(), now_t, self.current_set_power))
-                    if len(SYSTEM_STATE['ULTIME_LETTURE_FASI']) > 30:
-                        SYSTEM_STATE['ULTIME_LETTURE_FASI'].pop(0)
+                    self.set_power(min_p)
                 except Exception:
-                    pass
+                    # in caso di problemi con set_power fallback a impostazione diretta
+                    self.current_set_power = min_p
+                    self.display_power = float(self.current_set_power)
+                    self.update_shared_state()
 
     def initialize(self):
         log_msg("=== INIZIALIZZAZIONE SISTEMA ===")
