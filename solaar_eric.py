@@ -241,19 +241,22 @@ class EnergyMonitor:
 def run_logic(monitor, wallbox):
     potenza_generata = monitor.solar_now
     potenza_consumata = monitor.total_grid_load
+    potenza_carica = wallbox.current_set_power if wallbox.is_on else 0
+    live = abs(potenza_consumata - potenza_carica) + potenza_carica if wallbox.is_on else potenza_consumata
+    potenza_consumata = live
 
     potenza_generata += POTENZA_PRELEVABILE
     potenza_esportata = potenza_generata - potenza_consumata
-    potenza_carica = wallbox.current_set_power if wallbox.is_on else 0
-
+    
     potenza_minima = MONOFASE_MIN_POWER if wallbox.fase == 0 else TRIFASE_MIN_POWER
     potenza_massima = MONOFASE_MAX_POWER if wallbox.fase == 0 else TRIFASE_MAX_POWER
-    
+    consumata_casa = monitor.total_grid_load - potenza_carica if wallbox.is_on else potenza_consumata
+
     if potenza_consumata == 0:
         print("[INFO] Dati casa non ancora disponibili. Attendo...")
         return
 
-    print(f"\n[INFO] Potenza Generata (+ prelevabile: {POTENZA_PRELEVABILE}W): {potenza_generata:.0f}W | Potenza Consumata: {potenza_consumata:.0f}W | Potenza Esportata: {potenza_esportata:.0f}W | Wallbox: {'ON' if wallbox.is_on else 'OFF'} ({wallbox.current_set_power:.0f}W)")
+    print(f"\n[INFO] Potenza Generata (+ prelevabile: {POTENZA_PRELEVABILE}W): {potenza_generata:.0f}W | Potenza Consumata: {monitor.total_grid_load:.0f}W | Consumata Live: {live:.0f}W | Potenza Esportata: {potenza_esportata:.0f}W | Wallbox: {'ON' if wallbox.is_on else 'OFF'} ({wallbox.current_set_power:.0f}W)")
     #annullo timer spegnimento
     if wallbox.pending_off_until and potenza_generata >= potenza_minima:
         print("[INFO] Generazione ripristinata. Annullamento spegnimento programmato.")

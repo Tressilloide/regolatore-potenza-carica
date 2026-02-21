@@ -549,10 +549,12 @@ def run_logic(monitor, wallbox):
     
     potenza_generata = monitor.solar_now
     potenza_consumata = monitor.total_grid_load
-
+    potenza_carica = wallbox.current_set_power if wallbox.is_on else 0
+    potenza_live = abs(potenza_consumata - potenza_carica) + potenza_carica if wallbox.is_on else potenza_consumata
+    potenza_consumata = potenza_live
     potenza_generata += POTENZA_PRELEVABILE
     potenza_esportata = potenza_generata - potenza_consumata
-    potenza_carica = wallbox.current_set_power if wallbox.is_on else 0
+    consumata_casa = monitor.total_grid_load - potenza_carica if wallbox.is_on else potenza_consumata    
 
     potenza_minima = CONFIG['MONOFASE_MIN_POWER'] if wallbox.fase == 0 else CONFIG['TRIFASE_MIN_POWER']
     potenza_massima = CONFIG['MONOFASE_MAX_POWER'] if wallbox.fase == 0 else CONFIG['TRIFASE_MAX_POWER']
@@ -561,7 +563,7 @@ def run_logic(monitor, wallbox):
         return
 
     # Manteniamo questo log per capire sempre il contesto ad ogni ciclo
-    log_msg(f"[INFO] Gen: {potenza_generata:.0f}W | Cons: {potenza_consumata:.0f}W | Exp: {potenza_esportata:.0f}W | WB: {'ON' if wallbox.is_on else 'OFF'}")
+    log_msg(f"\n[INFO] Potenza Generata (+ prelevabile: {POTENZA_PRELEVABILE}W): {potenza_generata:.0f}W | Potenza Consumata: {monitor.total_grid_load:.0f}W | Consumata Live: {potenza_live:.0f}W | Potenza Esportata: {potenza_esportata:.0f}W | Wallbox: {'ON' if wallbox.is_on else 'OFF'} ({wallbox.current_set_power:.0f}W)")
     
     if wallbox.pending_off_until and potenza_generata >= potenza_minima:
         log_msg("[INFO] Generazione ripristinata. Annullamento spegnimento programmato.")
@@ -602,7 +604,7 @@ def run_logic(monitor, wallbox):
                     wallbox.set_power(potenza_minima)
                     return
 
-        if potenza_carica > potenza_generata or potenza_esportata < 0:
+        if potenza_carica > (potenza_generata - consumata_casa) or potenza_esportata < 0:
             nuova_potenza = potenza_carica - abs(potenza_esportata)
             if nuova_potenza < potenza_minima or potenza_generata < potenza_minima:
                 log_msg(f"[DECISIONE] Sole insufficiente. Minimo per {CONFIG['TIMER_SPEGNIMENTO']}s.")
@@ -671,7 +673,8 @@ def main():
         except KeyboardInterrupt:
             wallbox.turn_off(force=True)
             break
-        except Exception:
+        except Exception as e:
+            log_msg(f"[ERRORE] {e}")
             time.sleep(0.5)
 
 if __name__ == "__main__":
