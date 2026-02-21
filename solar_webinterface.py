@@ -33,7 +33,7 @@ CONFIG = {
     'IFACE': '192.168.1.193',
     'WALLBOX_IP': '192.168.1.22'
     ,
-    'SMOOTHING_ALPHA': 0.25,
+    'SMOOTHING_ALPHA': 0.5, 
     'MAX_DELTA_PER_SEC': 1500
 }
 
@@ -622,9 +622,9 @@ def run_logic(monitor, wallbox):
     # Manteniamo questo log per capire sempre il contesto ad ogni ciclo
     log_msg(f"\n[INFO] Potenza Generata (+ prelevabile: {POTENZA_PRELEVABILE}W): {potenza_generata:.0f}W | Potenza Consumata: {monitor.total_grid_load:.0f}W | Consumata Live: {potenza_live:.0f}W | Potenza Esportata: {potenza_esportata:.0f}W | Wallbox: {'ON' if wallbox.is_on else 'OFF'} ({wallbox.current_set_power:.0f}W)")
     
-    if wallbox.pending_off_until and potenza_generata >= potenza_minima:
-        log_msg("[INFO] Generazione ripristinata. Annullamento spegnimento programmato.")
-        wallbox.pending_off_until = 0
+    # Se è stato impostato un periodo di minimo/spiegamento, non annullarlo
+    # automaticamente quando la generazione si ripristina: attendiamo
+    # che scada l'intero periodo prima di decidere.
 
     if not wallbox.is_on:
         if potenza_esportata > potenza_minima:
@@ -637,12 +637,8 @@ def run_logic(monitor, wallbox):
         if wallbox.pending_off_until > 0:
             if now < wallbox.pending_off_until:
                 restante = wallbox.pending_off_until - now
-                log_msg(f"[INFO] Timer spegnimento: {restante:.0f}s...")
-                if potenza_generata >= potenza_minima:
-                    log_msg("[INFO] Generazione ripristinata. Annullo spegnimento.")
-                    wallbox.pending_off_until = 0
-                else:
-                    return 
+                log_msg(f"[INFO] Timer minimo attivo: {restante:.0f}s restanti (attendo la scadenza)...")
+                return
             else:
                 wallbox.pending_off_until = 0
                 if potenza_generata < potenza_minima:
