@@ -393,6 +393,17 @@ class WallboxController:
             self.current_set_power = watts
             self.last_update_time = now
             self.update_shared_state()
+            # Aggiorno la lista delle letture anche quando cambia la potenza della wallbox
+            try:
+                now_t = time.time()
+                fasi = SYSTEM_STATE.get('MONITOR_FASI', [0,0,0,0,0,0])
+                grid_total = sum(fasi[0:3])
+                solar_total = sum(fasi[3:6])
+                SYSTEM_STATE['ULTIME_LETTURE_FASI'].append((grid_total, solar_total, fasi.copy(), now_t, self.current_set_power))
+                if len(SYSTEM_STATE['ULTIME_LETTURE_FASI']) > 30:
+                    SYSTEM_STATE['ULTIME_LETTURE_FASI'].pop(0)
+            except Exception:
+                pass
         
 
     def turn_on(self):
@@ -427,6 +438,17 @@ class WallboxController:
                 self.send_command({'btn': f'P{min_p}'})
                 self.current_set_power = min_p
                 self.update_shared_state()
+                # Registra evento anche qui per aggiornare il grafico immediatamente
+                try:
+                    now_t = time.time()
+                    fasi = SYSTEM_STATE.get('MONITOR_FASI', [0,0,0,0,0,0])
+                    grid_total = sum(fasi[0:3])
+                    solar_total = sum(fasi[3:6])
+                    SYSTEM_STATE['ULTIME_LETTURE_FASI'].append((grid_total, solar_total, fasi.copy(), now_t, self.current_set_power))
+                    if len(SYSTEM_STATE['ULTIME_LETTURE_FASI']) > 30:
+                        SYSTEM_STATE['ULTIME_LETTURE_FASI'].pop(0)
+                except Exception:
+                    pass
 
     def initialize(self):
         log_msg("=== INIZIALIZZAZIONE SISTEMA ===")
@@ -618,6 +640,8 @@ def run_logic(monitor, wallbox):
             nuova_potenza = potenza_carica + abs(potenza_esportata)
             if nuova_potenza > potenza_generata:
                 return
+            if nuova_potenza + consumata_casa > potenza_generata:
+                nuova_potenza = potenza_generata - consumata_casa
             if nuova_potenza > potenza_massima:
                 nuova_potenza = potenza_massima
             log_msg(f"[DECISIONE] Aumento a {nuova_potenza:.0f}W")
