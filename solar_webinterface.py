@@ -52,6 +52,9 @@ SYSTEM_STATE = {
     'LOGS': [] # Buffer per la console Web
 }
 
+# Variabile globale per accedere al controller dalla UI Web
+wallbox_instance = None 
+
 load_dotenv()
 API_KEY = os.getenv('API_KEY')
 CHAT_ID = os.getenv('CHAT_ID')
@@ -91,6 +94,8 @@ HTML_TEMPLATE = """
         input[type="number"] { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
         button { background: #28a745; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; width: 100%; font-size: 1em; }
         button:hover { background: #218838; }
+        .btn-warning { background: #ffc107; color: #333; margin-top: 15px; }
+        .btn-warning:hover { background: #e0a800; }
         .phase-box { display: flex; justify-content: space-between; border-bottom: 1px solid #eee; padding: 5px 0; }
         .tot-box { display: flex; justify-content: space-between; background-color: #e9ecef; padding: 8px 5px; margin-top: 10px; border-radius: 4px; font-weight: bold; }
         .status-on { color: green; font-weight: bold; }
@@ -127,6 +132,7 @@ HTML_TEMPLATE = """
                     <input type="number" id="protezione" value="300">
                 </div>
                 <button onclick="updateSettings()">Salva Impostazioni</button>
+                <button class="btn-warning" onclick="reinitWallbox()">🔄 Re-Inizializza Wallbox</button>
             </div>
 
             <div class="card">
@@ -289,6 +295,24 @@ HTML_TEMPLATE = """
             fetchData();
         }
 
+        async function reinitWallbox() {
+            if (!confirm("Sei sicuro di voler forzare la re-inizializzazione della Wallbox?")) return;
+            
+            try {
+                const response = await fetch('/api/init_wallbox', { method: 'POST' });
+                const result = await response.json();
+                if (result.success) {
+                    alert("Comando inviato! Controlla la console per l'esito.");
+                    fetchData();
+                } else {
+                    alert("Errore nell'invio del comando.");
+                }
+            } catch (e) {
+                console.error("Errore:", e);
+                alert("Errore di rete durante la richiesta.");
+            }
+        }
+
         // Avvio
         fetchData();
         setInterval(fetchData, 2000); // Aggiorna ogni 2 secondi
@@ -347,6 +371,16 @@ def update_settings():
         CONFIG['POTENZA_PROTEZIONE'] = int(data['protezione'])
     log_msg(f"[WEB] Parametri aggiornati: Prelevabile={CONFIG['POTENZA_PRELEVABILE']}, Protezione={CONFIG['POTENZA_PROTEZIONE']}")
     return jsonify({'success': True})
+
+@app.route('/api/init_wallbox', methods=['POST'])
+def force_init_wallbox():
+    global wallbox_instance
+    if wallbox_instance:
+        log_msg("[WEB] Richiesta manuale di re-inizializzazione Wallbox!")
+        # Richiama l'initialize della wallbox.
+        wallbox_instance.initialize()
+        return jsonify({'success': True})
+    return jsonify({'success': False, 'error': 'Controller non disponibile'})
 
 def run_flask():
     app.run(host='0.0.0.0', port=80, debug=False, use_reloader=False)
@@ -682,7 +716,7 @@ async def invia_notifica(messaggio):
     if not API_KEY or not CHAT_ID: return
     try:
         bot = Bot(token=API_KEY)
-        await bot.send_message(chat_id=CHAT_ID, text=messaggio)
+        #await bot.send_message(chat_id=CHAT_ID, text=messaggio)
     except Exception as e:
         log_msg(f"[ERRORE TELEGRAM] {e}")
 
@@ -690,6 +724,15 @@ async def invia_notifica(messaggio):
 # MAIN
 # -----------------------------------------------------------
 def main():
+    global wallbox_instance  # Dichiaro l'uso della variabile globale creata su
+
+    # Inizializzo le classi
+    monitor = EnergyMonitor()
+    wallbox_instance = WallboxController()  # Popolo la variabile globale
+
+    # Alias per compatibilità con il resto del codice nel main
+    wallbox = wallbox_instance
+
     # AVVIO THREAD SERVER WEB
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True # Si chiude quando chiudi lo script
@@ -699,9 +742,6 @@ def main():
     try: 
         asyncio.run(invia_notifica(f"SISTEMA AVVIATO."))
     except Exception: pass
-    
-    monitor = EnergyMonitor()
-    wallbox = WallboxController()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
