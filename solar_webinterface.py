@@ -8,8 +8,14 @@ import json
 import os
 import asyncio
 import threading
+import io
+import matplotlib
+matplotlib.use('Agg') # Backend non interattivo per thread-safety
+import matplotlib.pyplot as plt
+
 from dotenv import load_dotenv
-from telegram import Bot
+from telegram import Bot, Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 from flask import Flask, jsonify, request, render_template_string
 
 # -----------------------------------------------------------
@@ -23,23 +29,22 @@ CONFIG = {
     'MONOFASE_MAX_POWER': 7360,
     'TRIFASE_MIN_POWER': 4140,
     'TRIFASE_MAX_POWER': 22000,
-    'POTENZA_PROTEZIONE': 300,      # Modificabile da Web
-    'POTENZA_PRELEVABILE': 0,       # Modificabile da Web
+    'POTENZA_PROTEZIONE': 300,      # Modificabile da Web e Telegram
+    'POTENZA_PRELEVABILE': 0,       # Modificabile da Web e Telegram
     'COOLDOWN_ACCENSIONE': 60,
     'UPDATE_INTERVAL_S': 5,
     'TIMER_SPEGNIMENTO': 60,
     'MCAST_GRP': '224.192.32.19',
     'MCAST_PORT': 22600,
     'IFACE': '192.168.1.193',
-    'WALLBOX_IP': '192.168.1.22'
-    ,
+    'WALLBOX_IP': '192.168.1.22',
     'SMOOTHING_ALPHA': 0.5, 
     'MAX_DELTA_PER_SEC': 1500
 }
 
 WALLBOX_URL = f"http://{CONFIG['WALLBOX_IP']}/index.json"
 
-# Stato condiviso per la Web UI
+# Stato condiviso per la Web UI e Telegram
 SYSTEM_STATE = {
     'ULTIMA_LETTURA_FASI': None,
     'ULTIMA_LETTURA_SOLARE': None,
@@ -52,7 +57,7 @@ SYSTEM_STATE = {
     'LOGS': [] # Buffer per la console Web
 }
 
-# Variabile globale per accedere al controller dalla UI Web
+# Variabile globale per accedere al controller dalla UI Web e da Telegram
 wallbox_instance = None 
 
 load_dotenv()
@@ -71,8 +76,149 @@ def log_msg(msg):
         SYSTEM_STATE['LOGS'].pop(0)
 
 # -----------------------------------------------------------
+# GESTIONE TELEGRAM BOT (RICEZIONE COMANDI)
+# -----------------------------------------------------------
+def check_auth(update: Update) -> bool:
+    """Verifica che il comando provenga dall'utente autorizzato."""
+    if str(update.effective_chat.id) != str(CHAT_ID):
+        log_msg(f"[TELEGRAM] Tentativo di accesso non autorizzato da {update.effective_chat.id}")
+        return False
+    return True
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not check_auth(update): return
+    msg = (
+        "🤖 *Comandi Solar Controller*\n\n"
+        "/info - Mostra lo stato attuale del sistema\n"
+        "/accendi - Forza l'accensione della Wallbox\n"
+        "/spegni - Forza lo spegnimento della Wallbox\n"
+        "/setPotenzaPrelevabile <W> - Imposta potenza prelevabile dalla rete\n"
+        "/setPotenzaProtezione <W> - Imposta la soglia di protezione\n"
+        "/grafici - Invia il grafico real-time delle potenze\n"
+    )
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not check_auth(update): return
+    fasi = SYSTEM_STATE['MONITOR_FASI']
+    tot_grid = sum(fasi[0:3])
+    tot_solar = sum(fasi[3:6])
+    wb_status = "🟢 ON" if SYSTEM_STATE['WALLBOX_STATUS'] else "🔴 OFF"
+    wb_power = SYSTEM_STATE['WALLBOX_POWER'] if SYSTEM_STATE['WALLBOX_STATUS'] else 0
+    modalita = "Trifase" if SYSTEM_STATE['IMPIANTO_FASE'] == 1 else "Monofase"
+    
+    msg = (
+        "📊 *Stato Sistema*\n\n"
+        f"☀️ *Solare:* {tot_solar:.0f} W\n"
+        f"🔌 *Rete:* {tot_grid:.0f} W\n"
+        f"🚗 *Wallbox:* {wb_status} ({wb_power:.0f} W)\n"
+        f"⚙️ *Modalità:* {modalita}\n"
+        f"🛠️ *Prelevabile:* {CONFIG['POTENZA_PRELEVABILE']} W\n"
+        f"🛡️ *Protezione:* {CONFIG['POTENZA_PROTEZIONE']} W\n"
+    )
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+async def cmd_accendi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not check_auth(update): return
+    if wallbox_instance:
+        wallbox_instance.turn_on()
+        await update.message.reply_text("✅ *Comando inviato:* Accensione Wallbox", parse_mode='Markdown')
+
+async def cmd_spegni(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not check_auth(update): return
+    if wallbox_instance:
+        wallbox_instance.turn_off(force=True)
+        await update.message.reply_text("🛑 *Comando inviato:* Spegnimento Wallbox", parse_mode='Markdown')
+
+async def cmd_set_prelevabile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not check_auth(update): return
+    try:
+        valore = int(context.args[0])
+        CONFIG['POTENZA_PRELEVABILE'] = valore
+        log_msg(f"[TELEGRAM] Potenza Prelevabile impostata a {valore}W")
+        await update.message.reply_text(f"✅ *Potenza Prelevabile* impostata a {valore} W", parse_mode='Markdown')
+    except (IndexError, ValueError):
+        await update.message.reply_text("⚠️ Usa il formato: `/setPotenzaPrelevabile 1000`", parse_mode='Markdown')
+
+async def cmd_set_protezione(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not check_auth(update): return
+    try:
+        valore = int(context.args[0])
+        CONFIG['POTENZA_PROTEZIONE'] = valore
+        log_msg(f"[TELEGRAM] Potenza Protezione impostata a {valore}W")
+        await update.message.reply_text(f"✅ *Potenza Protezione* impostata a {valore} W", parse_mode='Markdown')
+    except (IndexError, ValueError):
+        await update.message.reply_text("⚠️ Usa il formato: `/setPotenzaProtezione 300`", parse_mode='Markdown')
+
+async def cmd_grafici(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not check_auth(update): return
+    
+    history = SYSTEM_STATE['ULTIME_LETTURE_FASI']
+    if not history or len(history) < 2:
+        await update.message.reply_text("⏳ Non ci sono ancora abbastanza dati per generare il grafico. Riprova tra poco.")
+        return
+
+    await update.message.reply_text("📊 Generazione grafico in corso...")
+    
+    # Prepara i dati per matplotlib
+    times = [time.strftime("%H:%M:%S", time.localtime(h[3])) for h in history]
+    grid = [h[0] for h in history]
+    solar = [h[1] for h in history]
+    wb = [h[4] if len(h) > 4 else 0 for h in history]
+
+    # Crea il grafico
+    plt.figure(figsize=(10, 5))
+    plt.plot(times, grid, label='Consumo Rete (W)', color='#ff6384', linewidth=2)
+    plt.fill_between(times, solar, color='#4bc0c0', alpha=0.2)
+    plt.plot(times, solar, label='Produzione Solare (W)', color='#4bc0c0', linewidth=2)
+    plt.fill_between(times, wb, color='#36a2eb', alpha=0.1)
+    plt.plot(times, wb, label='Potenza Wallbox (W)', color='#36a2eb', linewidth=2)
+    
+    plt.title("Andamento Energetico Real-Time")
+    plt.xlabel("Orario")
+    plt.ylabel("Watt (W)")
+    plt.legend(loc="upper left")
+    plt.grid(True, linestyle='--', alpha=0.6)
+    
+    # Mostra solo alcuni tick sull'asse X per evitare sovrapposizioni
+    plt.xticks(rotation=45)
+    plt.gca().xaxis.set_major_locator(plt.MaxNLocator(8)) 
+    plt.tight_layout()
+
+    # Salva in memoria (BytesIO)
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    plt.close()
+
+    # Invia l'immagine
+    await update.message.reply_photo(photo=buf)
+
+def run_telegram_polling():
+    """Inizializza e avvia il polling di Telegram in un thread separato"""
+    if not API_KEY:
+        log_msg("[TELEGRAM] API_KEY mancante. Bot disabilitato.")
+        return
+    
+    app = Application.builder().token(API_KEY).build()
+    
+    app.add_handler(CommandHandler("start", cmd_help))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("info", cmd_info))
+    app.add_handler(CommandHandler("accendi", cmd_accendi))
+    app.add_handler(CommandHandler("spegni", cmd_spegni))
+    app.add_handler(CommandHandler("setPotenzaPrelevabile", cmd_set_prelevabile))
+    app.add_handler(CommandHandler("setPotenzaProtezione", cmd_set_protezione))
+    app.add_handler(CommandHandler("grafici", cmd_grafici))
+    
+    log_msg(">>> BOT TELEGRAM ATTIVO. In attesa di comandi... <<<")
+    # stop_signals=None evita conflitti di segnali con il thread principale
+    app.run_polling(stop_signals=None)
+
+# -----------------------------------------------------------
 # INTERFACCIA WEB (HTML/JS)
 # -----------------------------------------------------------
+# (Il template HTML rimane invariato, l'ho tenuto per completezza dello script)
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="it">
@@ -225,13 +371,11 @@ HTML_TEMPLATE = """
                 const response = await fetch('/api/data');
                 const data = await response.json();
 
-                // Aggiorna Inputs (solo se non hanno focus)
                 if (document.activeElement.id !== 'prelevabile') 
                     document.getElementById('prelevabile').placeholder = data.config.prelevabile;
                 if (document.activeElement.id !== 'protezione') 
                     document.getElementById('protezione').placeholder = data.config.protezione;
 
-                // Aggiorna Stato e Calcolo Secondi Trascorsi
                 const wbSpan = document.getElementById('wb_status');
                 wbSpan.innerText = data.status.wb_on ? "ON" : "OFF";
                 wbSpan.className = data.status.wb_on ? "status-on" : "status-off";
@@ -249,7 +393,6 @@ HTML_TEMPLATE = """
                 document.getElementById('last_solar').innerText = formatTime(lastSolar);
                 document.getElementById('sec_solar').innerText = lastSolar ? `(${Math.max(0, Math.round(serverTime - lastSolar))}s fa)` : '';
 
-                // Aggiorna Fasi e Totali
                 const f = data.status.fasi;
                 for(let i=0; i<6; i++) {
                     document.getElementById('l'+(i+1)).innerText = Math.round(f[i]);
@@ -257,7 +400,6 @@ HTML_TEMPLATE = """
                 document.getElementById('tot_grid').innerText = Math.round(data.status.grid_total);
                 document.getElementById('tot_solar').innerText = Math.round(data.status.solar_total);
 
-                // Aggiorna Grafico
                 const history = data.history;
                 chart.data.labels = history.map(h => formatTime(h.time));
                 chart.data.datasets[0].data = history.map(h => h.grid);
@@ -265,9 +407,7 @@ HTML_TEMPLATE = """
                 chart.data.datasets[2].data = history.map(h => h.wb);
                 chart.update();
 
-                // Aggiorna Console
                 const consoleDiv = document.getElementById('console');
-                // Controlliamo se l'utente ha scrollato in su, in tal caso non forziamo lo scroll in basso
                 const isScrolledToBottom = consoleDiv.scrollHeight - consoleDiv.clientHeight <= consoleDiv.scrollTop + 5;
                 
                 consoleDiv.innerHTML = data.logs.join('<br>');
@@ -297,7 +437,6 @@ HTML_TEMPLATE = """
 
         async function reinitWallbox() {
             if (!confirm("Sei sicuro di voler forzare la re-inizializzazione della Wallbox?")) return;
-            
             try {
                 const response = await fetch('/api/init_wallbox', { method: 'POST' });
                 const result = await response.json();
@@ -307,15 +446,11 @@ HTML_TEMPLATE = """
                 } else {
                     alert("Errore nell'invio del comando.");
                 }
-            } catch (e) {
-                console.error("Errore:", e);
-                alert("Errore di rete durante la richiesta.");
-            }
+            } catch (e) { console.error("Errore:", e); }
         }
 
-        // Avvio
         fetchData();
-        setInterval(fetchData, 2000); // Aggiorna ogni 2 secondi
+        setInterval(fetchData, 2000); 
     </script>
 </body>
 </html>
@@ -328,7 +463,6 @@ def index():
 @app.route('/api/data')
 def get_data():
     history = []
-    # Combina i dati. Assumiamo che la lista fasi sia la principale per il timing
     for item in SYSTEM_STATE['ULTIME_LETTURE_FASI']:
         history.append({
             'grid': item[0],
@@ -337,7 +471,6 @@ def get_data():
             'wb': item[4] if len(item) > 4 else 0 
         })
     
-    # Calcolo totale fasi in background
     fasi = SYSTEM_STATE['MONITOR_FASI']
     tot_grid = sum(fasi[0:3])
     tot_solar = sum(fasi[3:6])
@@ -377,7 +510,6 @@ def force_init_wallbox():
     global wallbox_instance
     if wallbox_instance:
         log_msg("[WEB] Richiesta manuale di re-inizializzazione Wallbox!")
-        # Richiama l'initialize della wallbox.
         wallbox_instance.initialize()
         return jsonify({'success': True})
     return jsonify({'success': False, 'error': 'Controller non disponibile'})
@@ -386,7 +518,7 @@ def run_flask():
     app.run(host='0.0.0.0', port=80, debug=False, use_reloader=False)
 
 # -----------------------------------------------------------
-# GESTORE WALLBOX 
+# GESTORE WALLBOX E CLASSI SOTTOSTANTI
 # -----------------------------------------------------------
 class WallboxController:
     def __init__(self):
@@ -396,14 +528,12 @@ class WallboxController:
         self.fase = 0
         self.time_turned_off = 0  
         self.pending_off_until = 0
-        # smoothing / rate-limit
         self.smoothing_alpha = CONFIG.get('SMOOTHING_ALPHA', 0.25)
         self.max_delta_per_sec = CONFIG.get('MAX_DELTA_PER_SEC', 1500)
         self.last_power_cmd_time = time.time()
         self.display_power = 0
 
     def update_shared_state(self):
-        # publish the smoothed/displayed power to the web UI
         SYSTEM_STATE['WALLBOX_POWER'] = int(round(self.display_power))
         SYSTEM_STATE['WALLBOX_STATUS'] = self.is_on
         SYSTEM_STATE['IMPIANTO_FASE'] = self.fase
@@ -416,7 +546,6 @@ class WallboxController:
             return False
 
     def set_power(self, watts):
-        # Use CONFIG limits
         if self.fase == 0:
             min_p = CONFIG['MONOFASE_MIN_POWER']
             max_p = CONFIG['MONOFASE_MAX_POWER']
@@ -426,15 +555,12 @@ class WallboxController:
         requested = int(max(min_p, min(max_p, int(watts))))
 
         now = time.time()
-        # Protezione: variazioni troppo piccole non inviate quando è ON
         if abs(requested - self.current_set_power) < CONFIG['POTENZA_PROTEZIONE'] and self.is_on:
             log_msg(f"[INFO] Variazione potenza ({requested}W) inferiore alla soglia di protezione ({CONFIG['POTENZA_PROTEZIONE']}W). Nessun cambiamento.")
             return
 
-        # Rate limiter: limita la variazione massima in base al tempo trascorso
         elapsed = now - (self.last_power_cmd_time or now)
         allowed_delta = self.max_delta_per_sec * max(elapsed, 0.01)
-        # limit target change relative to last sent power
         if requested > self.current_set_power + allowed_delta:
             limited = int(self.current_set_power + allowed_delta)
         elif requested < self.current_set_power - allowed_delta:
@@ -442,20 +568,16 @@ class WallboxController:
         else:
             limited = requested
 
-        # Rispetta UPDATE_INTERVAL_S
         if self.last_update_time > 0 and (now - self.last_update_time < CONFIG['UPDATE_INTERVAL_S']):
             return
 
-        # Applica EMA smoothing sul valore da inviare alla centralina
         if self.display_power == 0:
             smoothed = float(limited)
         else:
             smoothed = self.smoothing_alpha * float(limited) + (1 - self.smoothing_alpha) * float(self.display_power)
 
         send_value = int(round(smoothed))
-        # Se il valore arrotondato è uguale a quello già inviato, niente da fare
         if send_value == self.current_set_power:
-            # aggiorna display_power comunque per convergere
             self.display_power = smoothed
             self.update_shared_state()
             return
@@ -468,7 +590,6 @@ class WallboxController:
             self.last_power_cmd_time = now
             self.display_power = smoothed
             self.update_shared_state()
-            # Aggiorno la lista delle letture usando la potenza smussata
             try:
                 now_t = time.time()
                 fasi = SYSTEM_STATE.get('MONITOR_FASI', [0,0,0,0,0,0])
@@ -480,7 +601,6 @@ class WallboxController:
             except Exception:
                 pass
         
-
     def turn_on(self):
         if not self.is_on:
             if self.time_turned_off > 0:
@@ -510,11 +630,9 @@ class WallboxController:
                 self.last_update_time = time.time()
                 time.sleep(0.5)
                 min_p = CONFIG['MONOFASE_MIN_POWER'] if self.fase == 0 else CONFIG['TRIFASE_MIN_POWER']
-                # usa set_power per garantire smoothing e logging coerenti
                 try:
                     self.set_power(min_p)
                 except Exception:
-                    # in caso di problemi con set_power fallback a impostazione diretta
                     self.current_set_power = min_p
                     self.display_power = float(self.current_set_power)
                     self.update_shared_state()
@@ -560,9 +678,6 @@ class WallboxController:
         time.sleep(1)
         log_msg("=== PRONTO. IN ATTESA PACCHETTI ===")
 
-# -----------------------------------------------------------
-# MONITOR DATI 
-# -----------------------------------------------------------
 class EnergyMonitor:
     def __init__(self):
         self.solar_now = 0.0        
@@ -576,7 +691,7 @@ class EnergyMonitor:
             xml_str = data.decode('utf-8', errors='ignore')
             root = ET.fromstring(xml_str)
             
-            if root.tag == 'electricity': #fasi
+            if root.tag == 'electricity': 
                 channels = root.find('channels')
                 if channels:
                     p = {}
@@ -594,27 +709,21 @@ class EnergyMonitor:
                     self.solar_now = l4 + l5 + l6 
                     self.fases = [l1, l2, l3, l4, l5, l6]
                     
-                    # Rimuoviamo il print "gigante" per non spammare la nuova console/terminale
-                    # print(f" | RETE | TOT: {self.total_grid_load:.0f}W   ---   | SOLARE | TOT: {self.solar_now:.0f}W")
-                    
                     self.ctrletturefasi += 1
                     SYSTEM_STATE['ULTIMA_LETTURA_FASI'] = time.time()
                     SYSTEM_STATE['MONITOR_FASI'] = self.fases
                     self.time = SYSTEM_STATE['ULTIMA_LETTURA_FASI']
                     
-                    # Recupero la potenza della wallbox SOLO SE ACCESA, altrimenti 0 per il grafico
                     wb_status = SYSTEM_STATE.get('WALLBOX_STATUS', False)
                     wb_power = SYSTEM_STATE.get('WALLBOX_POWER', 0) if wb_status else 0
                     
-                    # Aggiorno la lista per il grafico aggiungendo wb_power come quinto elemento
                     SYSTEM_STATE['ULTIME_LETTURE_FASI'].append((self.total_grid_load, self.solar_now, self.fases, self.time, wb_power))
                     if len(SYSTEM_STATE['ULTIME_LETTURE_FASI']) > 30:
                         SYSTEM_STATE['ULTIME_LETTURE_FASI'].pop(0)    
             
                     return "TRIGGER"
 
-
-            elif root.tag == 'solar': #generata
+            elif root.tag == 'solar': 
                 curr = root.find('current')
                 if curr is not None:
                     gen = float(curr.find('generating').text)
@@ -631,11 +740,7 @@ class EnergyMonitor:
             pass
         return None
 
-# -----------------------------------------------------------
-# LOGICA DI CONTROLLO
-# -----------------------------------------------------------
 def run_logic(monitor, wallbox):
-    # Recupera i valori dinamici da CONFIG
     POTENZA_PRELEVABILE = CONFIG['POTENZA_PRELEVABILE']
     
     potenza_generata = monitor.solar_now
@@ -653,12 +758,7 @@ def run_logic(monitor, wallbox):
     if potenza_consumata == 0:
         return
 
-    # Manteniamo questo log per capire sempre il contesto ad ogni ciclo
     log_msg(f"\n[INFO] Potenza Generata (+ prelevabile: {POTENZA_PRELEVABILE}W): {potenza_generata:.0f}W | Potenza Consumata: {monitor.total_grid_load:.0f}W | Consumata Live: {potenza_live:.0f}W | Potenza Esportata: {potenza_esportata:.0f}W | Wallbox: {'ON' if wallbox.is_on else 'OFF'} ({wallbox.current_set_power:.0f}W)")
-    
-    # Se è stato impostato un periodo di minimo/spiegamento, non annullarlo
-    # automaticamente quando la generazione si ripristina: attendiamo
-    # che scada l'intero periodo prima di decidere.
 
     if not wallbox.is_on:
         if potenza_esportata > potenza_minima:
@@ -713,10 +813,11 @@ def run_logic(monitor, wallbox):
             wallbox.set_power(nuova_potenza)
 
 async def invia_notifica(messaggio):
+    """Invia notifiche unilaterali (usato dal thread principale)"""
     if not API_KEY or not CHAT_ID: return
     try:
         bot = Bot(token=API_KEY)
-        #await bot.send_message(chat_id=CHAT_ID, text=messaggio)
+        await bot.send_message(chat_id=CHAT_ID, text=messaggio)
     except Exception as e:
         log_msg(f"[ERRORE TELEGRAM] {e}")
 
@@ -724,23 +825,25 @@ async def invia_notifica(messaggio):
 # MAIN
 # -----------------------------------------------------------
 def main():
-    global wallbox_instance  # Dichiaro l'uso della variabile globale creata su
+    global wallbox_instance
 
-    # Inizializzo le classi
     monitor = EnergyMonitor()
-    wallbox_instance = WallboxController()  # Popolo la variabile globale
-
-    # Alias per compatibilità con il resto del codice nel main
+    wallbox_instance = WallboxController()
     wallbox = wallbox_instance
 
-    # AVVIO THREAD SERVER WEB
+    # 1. AVVIO THREAD SERVER WEB
     flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True # Si chiude quando chiudi lo script
+    flask_thread.daemon = True 
     flask_thread.start()
     log_msg(">>> INTERFACCIA WEB ATTIVA SU http://localhost:5000 <<<")
 
+    # 2. AVVIO THREAD BOT TELEGRAM
+    tg_thread = threading.Thread(target=run_telegram_polling)
+    tg_thread.daemon = True
+    tg_thread.start()
+
     try: 
-        asyncio.run(invia_notifica(f"SISTEMA AVVIATO."))
+        asyncio.run(invia_notifica(f"✅ SISTEMA AVVIATO."))
     except Exception: pass
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
