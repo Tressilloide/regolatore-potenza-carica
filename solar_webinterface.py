@@ -10,6 +10,8 @@ import asyncio
 import threading
 import io
 import matplotlib
+
+from solaar_eric import invia_notifica
 matplotlib.use('Agg') # Backend non interattivo per thread-safety
 import matplotlib.pyplot as plt
 
@@ -808,6 +810,12 @@ def run_logic(monitor, wallbox):
             if nuova_potenza + consumata_casa > potenza_generata:
                 nuova_potenza = potenza_generata - consumata_casa
             if nuova_potenza > potenza_massima:
+                try: 
+                    if wallbox.fase == 1:
+                        asyncio.run(invia_notifica(f"⚠️ Potenza massima raggiunta ({potenza_massima:.0f}W)."))
+                    else:
+                        asyncio.run(invia_notifica(f"⚠️ Potenza massima raggiunta ({potenza_massima:.0f}W). Consiglio: mettere l'impianto in modalità trifase per sfruttare meglio la potenza disponibile."))
+                except Exception: pass
                 nuova_potenza = potenza_massima
             log_msg(f"[DECISIONE] Aumento a {nuova_potenza:.0f}W")
             wallbox.set_power(nuova_potenza)
