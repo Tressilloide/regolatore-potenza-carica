@@ -547,7 +547,7 @@ class WallboxController:
         except Exception:
             return False
 
-    def set_power(self, watts):
+    def set_power(self, watts, bypass):
         if self.fase == 0:
             min_p = CONFIG['MONOFASE_MIN_POWER']
             max_p = CONFIG['MONOFASE_MAX_POWER']
@@ -557,34 +557,37 @@ class WallboxController:
         requested = int(max(min_p, min(max_p, int(watts))))
 
         now = time.time()
-        if abs(requested - self.current_set_power) < CONFIG['POTENZA_PROTEZIONE'] and self.is_on:
-            log_msg(f"[INFO] Variazione potenza ({requested}W) inferiore alla soglia di protezione ({CONFIG['POTENZA_PROTEZIONE']}W). Nessun cambiamento.")
-            return
+        
+        if not bypass:#bypasso sia il filtro che la sogli a di protezione
+            if abs(requested - self.current_set_power) < CONFIG['POTENZA_PROTEZIONE'] and self.is_on:
+                log_msg(f"[INFO] Variazione potenza ({requested}W) inferiore alla soglia di protezione ({CONFIG['POTENZA_PROTEZIONE']}W). Nessun cambiamento.")
+                return
+            elapsed = now - (self.last_power_cmd_time or now)
+            allowed_delta = self.max_delta_per_sec * max(elapsed, 0.01)
+            if requested > self.current_set_power + allowed_delta:
+                limited = int(self.current_set_power + allowed_delta)
+            elif requested < self.current_set_power - allowed_delta:
+                limited = int(self.current_set_power - allowed_delta)
+            else:
+                limited = requested
 
-        elapsed = now - (self.last_power_cmd_time or now)
-        allowed_delta = self.max_delta_per_sec * max(elapsed, 0.01)
-        if requested > self.current_set_power + allowed_delta:
-            limited = int(self.current_set_power + allowed_delta)
-        elif requested < self.current_set_power - allowed_delta:
-            limited = int(self.current_set_power - allowed_delta)
-        else:
-            limited = requested
+            if self.last_update_time > 0 and (now - self.last_update_time < CONFIG['UPDATE_INTERVAL_S']):
+                return
 
-        if self.last_update_time > 0 and (now - self.last_update_time < CONFIG['UPDATE_INTERVAL_S']):
-            return
+            if self.display_power == 0:
+                smoothed = float(limited)
+            else:
+                smoothed = self.smoothing_alpha * float(limited) + (1 - self.smoothing_alpha) * float(self.display_power)
 
-        if self.display_power == 0:
-            smoothed = float(limited)
-        else:
-            smoothed = self.smoothing_alpha * float(limited) + (1 - self.smoothing_alpha) * float(self.display_power)
+            send_value = int(round(smoothed))
+            if send_value == self.current_set_power:
+                self.display_power = smoothed
+                self.update_shared_state()
+                return
 
-        send_value = int(round(smoothed))
-        if send_value == self.current_set_power:
-            self.display_power = smoothed
-            self.update_shared_state()
-            return
-
-        log_msg(f"[AZIONE] CAMBIO POTENZA -> richiesta={requested}W limited={limited}W invio={send_value}W")
+            log_msg(f"[AZIONE] CAMBIO POTENZA -> richiesta={requested}W limited={limited}W invio={send_value}W")
+        else: 
+                send_value = requested
 
         if self.send_command({'btn': f'P{send_value}'}):
             self.current_set_power = send_value
@@ -612,7 +615,7 @@ class WallboxController:
                     return
             
             log_msg("[AZIONE] ACCENSIONE (ON)")
-            self.set_power(CONFIG['MONOFASE_MIN_POWER'] if self.fase == 0 else CONFIG['TRIFASE_MIN_POWER']) 
+            self.set_power(CONFIG['MONOFASE_MIN_POWER'] if self.fase == 0 else CONFIG['TRIFASE_MIN_POWER'], bypass=True) 
 
             if self.send_command({'btn': 'i'}):
                 self.is_on = True
@@ -633,7 +636,7 @@ class WallboxController:
                 time.sleep(0.5)
                 min_p = CONFIG['MONOFASE_MIN_POWER'] if self.fase == 0 else CONFIG['TRIFASE_MIN_POWER']
                 try:
-                    self.set_power(min_p)
+                    self.set_power(min_p, bypass=True)
                 except Exception:
                     self.current_set_power = min_p
                     self.display_power = float(self.current_set_power)
@@ -672,10 +675,10 @@ class WallboxController:
         
         if self.fase == 0:
             log_msg("1. Imposto potenza minima (1380W)...")
-            self.set_power(CONFIG['MONOFASE_MIN_POWER'])
+            self.set_power(CONFIG['MONOFASE_MIN_POWER'], bypass=True)
         elif self.fase == 1:
             log_msg("1. Imposto potenza minima (4140)...")
-            self.set_power(CONFIG['TRIFASE_MIN_POWER'])
+            self.set_power(CONFIG['TRIFASE_MIN_POWER'], bypass=True)
 
         time.sleep(1)
         log_msg("=== PRONTO. IN ATTESA PACCHETTI ===")
@@ -790,18 +793,18 @@ def run_logic(monitor, wallbox):
                     return
                 else:
                     log_msg(f"[DECISIONE] Generazione sufficiente. Continuo.")
-                    wallbox.set_power(potenza_minima)
+                    wallbox.set_power(potenza_minima, bypass=True)
                     return
 
         if potenza_carica > (potenza_generata - consumata_casa) or potenza_esportata < 0:
             nuova_potenza = potenza_carica - abs(potenza_esportata)
             if nuova_potenza < potenza_minima or potenza_generata < potenza_minima:
                 log_msg(f"[DECISIONE] Sole insufficiente. Minimo per {CONFIG['TIMER_SPEGNIMENTO']}s.")
-                wallbox.set_power(potenza_minima)
+                wallbox.set_power(potenza_minima, bypass=True)
                 wallbox.pending_off_until = now + CONFIG['TIMER_SPEGNIMENTO']
             else:
                 log_msg(f"[DECISIONE] Diminuisco a {nuova_potenza:.0f}W")
-                wallbox.set_power(nuova_potenza)
+                wallbox.set_power(nuova_potenza, bypass=False)
 
         else: 
             nuova_potenza = potenza_carica + abs(potenza_esportata)
@@ -817,8 +820,11 @@ def run_logic(monitor, wallbox):
                         asyncio.run(invia_notifica(f"⚠️ Potenza massima raggiunta ({potenza_massima:.0f}W). Consiglio: mettere l'impianto in modalità trifase per sfruttare meglio la potenza disponibile."))
                 except Exception: pass
                 nuova_potenza = potenza_massima
+                wallbox.set_power(nuova_potenza, bypass=True)
+                log_msg(f"[DECISIONE] Aumento a {nuova_potenza:.0f}W")
+                return
             log_msg(f"[DECISIONE] Aumento a {nuova_potenza:.0f}W")
-            wallbox.set_power(nuova_potenza)
+            wallbox.set_power(nuova_potenza, bypass=False)
 
 async def invia_notifica(messaggio):
     """Invia notifiche unilaterali (usato dal thread principale)"""
