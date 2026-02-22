@@ -588,6 +588,7 @@ class WallboxController:
             log_msg(f"[AZIONE] CAMBIO POTENZA -> richiesta={requested}W limited={limited}W invio={send_value}W")
         else: 
                 send_value = requested
+                smoothed = float(send_value)
 
         if self.send_command({'btn': f'P{send_value}'}):
             self.current_set_power = send_value
@@ -750,7 +751,7 @@ def run_logic(monitor, wallbox):
     
     potenza_generata = monitor.solar_now
     potenza_consumata = monitor.total_grid_load
-    potenza_carica = wallbox.current_set_power if wallbox.is_on else 0
+    potenza_carica = wallbox.display_power if wallbox.is_on else 0
     potenza_live = abs(potenza_consumata - potenza_carica) + potenza_carica if wallbox.is_on else potenza_consumata
     potenza_consumata = potenza_live
     potenza_generata += POTENZA_PRELEVABILE
