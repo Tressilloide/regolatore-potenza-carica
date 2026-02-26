@@ -123,14 +123,18 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_accendi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_auth(update): return
     if wallbox_instance:
+        # clear any manual off override so automation can resume
+        wallbox_instance.manual_off = False
         wallbox_instance.turn_on()
-        await update.message.reply_text("✅ *Comando inviato:* Accensione Wallbox", parse_mode='Markdown')
+        await update.message.reply_text("✅ *Comando inviato:* Accensione Wallbox (override manuale disattivato)", parse_mode='Markdown')
 
 async def cmd_spegni(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_auth(update): return
     if wallbox_instance:
+        # activate manual off override so it stays off until /accendi
+        wallbox_instance.manual_off = True
         wallbox_instance.turn_off(force=True)
-        await update.message.reply_text("🛑 *Comando inviato:* Spegnimento Wallbox", parse_mode='Markdown')
+        await update.message.reply_text("🛑 *Comando inviato:* Spegnimento Wallbox (override manuale attivo)", parse_mode='Markdown')
 
 async def cmd_set_prelevabile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_auth(update): return
@@ -534,6 +538,9 @@ class WallboxController:
         self.max_delta_per_sec = CONFIG.get('MAX_DELTA_PER_SEC', 1500)
         self.last_power_cmd_time = time.time()
         self.display_power = 0
+        # manual override flag set when user issues /spegni via Telegram
+        # while True the automatic logic will not turn the wallbox back on
+        self.manual_off = False
 
     def update_shared_state(self):
         SYSTEM_STATE['WALLBOX_POWER'] = int(round(self.display_power))
@@ -747,6 +754,10 @@ class EnergyMonitor:
         return None
 
 def run_logic(monitor, wallbox):
+    # if user has manually requested the wallbox to remain off, skip all automatic decisions
+    if getattr(wallbox, 'manual_off', False):
+        log_msg("[INFO] Override manuale attivo, wallbox rimane spento fino a comando /accendi")
+        return
     POTENZA_PRELEVABILE = CONFIG['POTENZA_PRELEVABILE']
     
     potenza_generata = monitor.solar_now
