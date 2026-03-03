@@ -848,6 +848,9 @@ def run_logic(monitor, wallbox):
             nuova_potenza = potenza_carica + abs(potenza_esportata)
             if nuova_potenza > potenza_generata:
                 return
+            delta_potenza = nuova_potenza - potenza_carica
+            if delta_potenza + potenza_consumata > potenza_generata:
+                return
             if nuova_potenza + consumata_casa > potenza_generata:
                 nuova_potenza = potenza_generata - consumata_casa
             if nuova_potenza > potenza_massima:
