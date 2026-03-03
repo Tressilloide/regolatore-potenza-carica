@@ -541,6 +541,9 @@ class WallboxController:
         # manual override flag set when user issues /spegni via Telegram
         # while True the automatic logic will not turn the wallbox back on
         self.manual_off = False
+        # tracking for sustained max power notifications
+        self.max_reached_start = None   # timestamp when we first hit max
+        self.max_notified = False      # whether notification was already sent
 
     def update_shared_state(self):
         SYSTEM_STATE['WALLBOX_POWER'] = int(round(self.display_power))
@@ -771,7 +774,30 @@ def run_logic(monitor, wallbox):
 
     potenza_minima = CONFIG['MONOFASE_MIN_POWER'] if wallbox.fase == 0 else CONFIG['TRIFASE_MIN_POWER']
     potenza_massima = CONFIG['MONOFASE_MAX_POWER'] if wallbox.fase == 0 else CONFIG['TRIFASE_MAX_POWER']
-    
+
+    # ------------------------------------------------------------------
+    # notifica potenza massima solo se mantenuta per almeno 60s
+    now = time.time()
+    if wallbox.is_on:
+        # verifica se siamo al massimo o sopra
+        if potenza_carica >= potenza_massima:
+            if wallbox.max_reached_start is None:
+                wallbox.max_reached_start = now
+            elif not wallbox.max_notified and now - wallbox.max_reached_start >= 60:
+                try:
+                    if wallbox.fase == 1:
+                        asyncio.run(invia_notifica(f"⚠️ Potenza massima raggiunta ({potenza_massima:.0f}W)."))
+                    else:
+                        asyncio.run(invia_notifica(f"⚠️ Potenza massima raggiunta ({potenza_massima:.0f}W). Consiglio: mettere l'impianto in modalità trifase per sfruttare meglio la potenza disponibile."))
+                except Exception:
+                    pass
+                wallbox.max_notified = True
+        else:
+            # siamo scesi sotto, resettiamo contatori
+            wallbox.max_reached_start = None
+            wallbox.max_notified = False
+    # ------------------------------------------------------------------
+
     if potenza_consumata == 0:
         return
 
@@ -825,12 +851,8 @@ def run_logic(monitor, wallbox):
             if nuova_potenza + consumata_casa > potenza_generata:
                 nuova_potenza = potenza_generata - consumata_casa
             if nuova_potenza > potenza_massima:
-                try: 
-                    if wallbox.fase == 1:
-                        asyncio.run(invia_notifica(f"⚠️ Potenza massima raggiunta ({potenza_massima:.0f}W)."))
-                    else:
-                        asyncio.run(invia_notifica(f"⚠️ Potenza massima raggiunta ({potenza_massima:.0f}W). Consiglio: mettere l'impianto in modalità trifase per sfruttare meglio la potenza disponibile."))
-                except Exception: pass
+                # limito alla potenza massima disponibile, la notifica viene gestita
+                # dal blocco di controllo sopra per evitare messaggi ripetuti.
                 nuova_potenza = potenza_massima
                 wallbox.set_power(nuova_potenza, bypass=True)
                 log_msg(f"[DECISIONE] Aumento a {nuova_potenza:.0f}W")
