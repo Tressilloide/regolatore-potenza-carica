@@ -36,11 +36,15 @@ CONFIG = {
     'COOLDOWN_ACCENSIONE': 60,
     'UPDATE_INTERVAL_S': 5,
     'TIMER_SPEGNIMENTO': 60,
+    # PID controller defaults
+    'PID_KP': 0.8,
+    'PID_KI': 0.12,
+    'PID_KD': 0.03,
+    'PID_SAMPLE_TIME': 1.0,
     'MCAST_GRP': '224.192.32.19',
     'MCAST_PORT': 22600,
     'IFACE': '192.168.1.193',
     'WALLBOX_IP': '192.168.1.22',
-    'SMOOTHING_ALPHA': 0.5, 
     'MAX_DELTA_PER_SEC': 1500
 }
 
@@ -526,6 +530,54 @@ def run_flask():
 # -----------------------------------------------------------
 # GESTORE WALLBOX E CLASSI SOTTOSTANTI
 # -----------------------------------------------------------
+class PIDController:
+    """Semplice controller PID che restituisce un valore di uscita assoluto.
+    Viene gestito un sample time per evitare calcoli troppo frequenti.
+    """
+    def __init__(self, kp=1.0, ki=0.0, kd=0.0, output_limits=(0, 10000), sample_time=1.0):
+        self.kp = float(kp)
+        self.ki = float(ki)
+        self.kd = float(kd)
+        self.min_output, self.max_output = output_limits
+        self.sample_time = float(sample_time)
+
+        self._last_time = None
+        self._last_error = 0.0
+        self._integral = 0.0
+
+    def reset(self):
+        self._last_time = None
+        self._last_error = 0.0
+        self._integral = 0.0
+
+    def compute(self, setpoint, measurement):
+        now = time.time()
+        if self._last_time is None:
+            self._last_time = now
+            self._last_error = setpoint - measurement
+            return None
+
+        dt = now - self._last_time
+        if dt <= 0.0:
+            return None
+        if dt < self.sample_time:
+            return None
+
+        error = float(setpoint) - float(measurement)
+        self._integral += error * dt
+        derivative = (error - self._last_error) / dt if dt > 0 else 0.0
+
+        output = (self.kp * error) + (self.ki * self._integral) + (self.kd * derivative)
+
+        # clamp
+        output = max(self.min_output, min(self.max_output, output))
+
+        # save state
+        self._last_error = error
+        self._last_time = now
+
+        return output
+
 class WallboxController:
     def __init__(self):
         self.current_set_power = 0
@@ -534,7 +586,6 @@ class WallboxController:
         self.fase = 0
         self.time_turned_off = 0  
         self.pending_off_until = 0
-        self.smoothing_alpha = CONFIG.get('SMOOTHING_ALPHA', 0.25)
         self.max_delta_per_sec = CONFIG.get('MAX_DELTA_PER_SEC', 1500)
         self.last_power_cmd_time = time.time()
         self.display_power = 0
@@ -544,6 +595,14 @@ class WallboxController:
         # tracking for sustained max power notifications
         self.max_reached_start = None   # timestamp when we first hit max
         self.max_notified = False      # whether notification was already sent
+        # PID controller for smooth power regulation (outputs absolute power)
+        self.pid = PIDController(
+            kp=CONFIG.get('PID_KP', 0.8),
+            ki=CONFIG.get('PID_KI', 0.0),
+            kd=CONFIG.get('PID_KD', 0.0),
+            output_limits=(CONFIG.get('MONOFASE_MIN_POWER', 1380), CONFIG.get('MONOFASE_MAX_POWER', 7360)),
+            sample_time=CONFIG.get('PID_SAMPLE_TIME', 1.0)
+        )
 
     def update_shared_state(self):
         SYSTEM_STATE['WALLBOX_POWER'] = int(round(self.display_power))
@@ -584,27 +643,23 @@ class WallboxController:
             if self.last_update_time > 0 and (now - self.last_update_time < CONFIG['UPDATE_INTERVAL_S']):
                 return
 
-            if self.display_power == 0:
-                smoothed = float(limited)
-            else:
-                smoothed = self.smoothing_alpha * float(limited) + (1 - self.smoothing_alpha) * float(self.display_power)
-
-            send_value = int(round(smoothed))
+            # senza smoothing esponenziale: inviamo il valore limitato direttamente
+            send_value = int(round(limited))
             if send_value == self.current_set_power:
-                self.display_power = smoothed
+                # aggiorniamo display_power per riflettere lo stato corrente
+                self.display_power = float(send_value)
                 self.update_shared_state()
                 return
 
             log_msg(f"[AZIONE] CAMBIO POTENZA -> richiesta={requested}W limited={limited}W invio={send_value}W")
-        else: 
-                send_value = requested
-                smoothed = float(send_value)
+        else:
+            send_value = requested
 
         if self.send_command({'btn': f'P{send_value}'}):
             self.current_set_power = send_value
             self.last_update_time = now
             self.last_power_cmd_time = now
-            self.display_power = smoothed
+            self.display_power = float(send_value)
             self.update_shared_state()
             try:
                 now_t = time.time()
@@ -682,6 +737,8 @@ class WallboxController:
 
         log_msg("1. Metto in OFF (Attesa dati)...")
         self.last_update_time = 0 
+    
+        self.turn_off(force=True)
         self.turn_off(force=True)
         
         if self.fase == 0:
@@ -693,6 +750,28 @@ class WallboxController:
 
         time.sleep(1)
         log_msg("=== PRONTO. IN ATTESA PACCHETTI ===")
+
+    def update_power_with_pid(self, desired_power):
+        """Regola la potenza verso `desired_power` usando il PID interno.
+        Il PID lavora su valori assoluti (W)."""
+        # aggiorna limiti in base alla fase attuale
+        min_p = CONFIG['MONOFASE_MIN_POWER'] if self.fase == 0 else CONFIG['TRIFASE_MIN_POWER']
+        max_p = CONFIG['MONOFASE_MAX_POWER'] if self.fase == 0 else CONFIG['TRIFASE_MAX_POWER']
+        self.pid.min_output, self.pid.max_output = min_p, max_p
+
+        out = self.pid.compute(desired_power, self.display_power)
+        if out is None:
+            return
+
+        target = int(round(out))
+        if target == self.current_set_power:
+            # aggiorna visualizzazione ma non invia comando identico
+            self.display_power = float(out)
+            self.update_shared_state()
+            return
+
+        # invia comando PID (bypass=False per applicare limiti di variazione)
+        self.set_power(target, bypass=False)
 
 class EnergyMonitor:
     def __init__(self):
@@ -834,34 +913,25 @@ def run_logic(monitor, wallbox):
                     wallbox.set_power(potenza_minima, bypass=True)
                     return
 
-        if potenza_carica > (potenza_generata - consumata_casa) or potenza_esportata < 0:
-            nuova_potenza = potenza_carica - abs(potenza_esportata)
-            if nuova_potenza < potenza_minima or potenza_generata < potenza_minima:
-                log_msg(f"[DECISIONE] Sole insufficiente. Minimo per {CONFIG['TIMER_SPEGNIMENTO']}s.")
-                wallbox.set_power(potenza_minima, bypass=True)
-                wallbox.pending_off_until = now + CONFIG['TIMER_SPEGNIMENTO']
-            else:
-                log_msg(f"[DECISIONE] Diminuisco a {nuova_potenza:.0f}W")
-                wallbox.set_power(nuova_potenza, bypass=False)
+        # Calcolo la potenza desiderata per assorbire la produzione locale
+        desired_power = potenza_generata - consumata_casa
 
-        else: 
-            nuova_potenza = potenza_carica + abs(potenza_esportata)
-            if nuova_potenza > potenza_generata:
-                return
-            delta_potenza = nuova_potenza - potenza_carica
-            if delta_potenza + potenza_consumata > potenza_generata:
-                return
-            if nuova_potenza + consumata_casa > potenza_generata:
-                nuova_potenza = potenza_generata - consumata_casa
-            if nuova_potenza > potenza_massima:
-                # limito alla potenza massima disponibile, la notifica viene gestita
-                # dal blocco di controllo sopra per evitare messaggi ripetuti.
-                nuova_potenza = potenza_massima
-                wallbox.set_power(nuova_potenza, bypass=True)
-                log_msg(f"[DECISIONE] Aumento a {nuova_potenza:.0f}W")
-                return
-            log_msg(f"[DECISIONE] Aumento a {nuova_potenza:.0f}W")
-            wallbox.set_power(nuova_potenza, bypass=False)
+        # Se la potenza desiderata è sotto il minimo (o la generazione è troppo bassa)
+        if desired_power < potenza_minima or potenza_generata < potenza_minima:
+            log_msg(f"[DECISIONE] Sole insufficiente. Minimo per {CONFIG['TIMER_SPEGNIMENTO']}s.")
+            wallbox.set_power(potenza_minima, bypass=True)
+            wallbox.pending_off_until = now + CONFIG['TIMER_SPEGNIMENTO']
+            return
+
+        # Se la potenza desiderata supera la massima disponibile, fissiamo al massimo
+        if desired_power > potenza_massima:
+            log_msg(f"[DECISIONE] Richiesta superiore al massimo disponibile; imposto massima {potenza_massima}W.")
+            wallbox.set_power(potenza_massima, bypass=True)
+            return
+
+        # Altrimenti usiamo il PID per regolare la potenza in modo fluido verso il valore desiderato
+        log_msg(f"[DECISIONE] PID regola verso {desired_power:.0f}W")
+        wallbox.update_power_with_pid(desired_power)
 
 async def invia_notifica(messaggio):
     """Invia notifiche unilaterali (usato dal thread principale)"""
