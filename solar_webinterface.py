@@ -80,7 +80,7 @@ def log_msg(msg):
     """Salva il log sia su terminale che nel buffer per la Web UI"""
     t_str = time.strftime("%H:%M:%S")
     full_msg = f"[{t_str}] {msg}"
-    print(full_msg)
+    print(full_msg, flush=True)
     SYSTEM_STATE['LOGS'].append(full_msg)
     # Tieni solo gli ultimi 50 messaggi in memoria per non appesantire
     if len(SYSTEM_STATE['LOGS']) > 50:
@@ -775,11 +775,12 @@ def run_logic(monitor, wallbox):
     potenza_generata = monitor.solar_now
     potenza_consumata = monitor.total_grid_load
     potenza_carica = wallbox.display_power if wallbox.is_on else 0
-    potenza_live = abs(potenza_consumata - potenza_carica) + potenza_carica if wallbox.is_on else potenza_consumata
-    potenza_consumata = potenza_live
+    potenza_casa = potenza_consumata - potenza_carica if wallbox.is_on else potenza_consumata
     potenza_generata += POTENZA_PRELEVABILE
     potenza_esportata = potenza_generata - potenza_consumata
-    consumata_casa = monitor.total_grid_load - potenza_carica if wallbox.is_on else potenza_consumata    
+    
+    #log_msg(f"\n[INFO] Potenza Generata (+ prelevabile: {POTENZA_PRELEVABILE}W): {potenza_generata:.0f}W | Potenza Consumata: {monitor.total_grid_load:.0f}W | Consumata Live: {potenza_live:.0f}W | Potenza Esportata: {potenza_esportata:.0f}W | Wallbox: {'ON' if wallbox.is_on else 'OFF'} ({wallbox.current_set_power:.0f}W)")
+    log_msg(f"\n[INFO] Gen: {potenza_generata:.0f}W  | Casa: {potenza_casa:.0f}W | Esp: {potenza_esportata:.0f}W | WB: {'ON' if wallbox.is_on else 'OFF'} ({potenza_carica:.0f}W)")
 
     potenza_minima = CONFIG['MONOFASE_MIN_POWER'] if wallbox.fase == 0 else CONFIG['TRIFASE_MIN_POWER']
     potenza_massima = CONFIG['MONOFASE_MAX_POWER'] if wallbox.fase == 0 else CONFIG['TRIFASE_MAX_POWER']
@@ -809,8 +810,6 @@ def run_logic(monitor, wallbox):
 
     if potenza_consumata == 0:
         return
-
-    log_msg(f"\n[INFO] Potenza Generata (+ prelevabile: {POTENZA_PRELEVABILE}W): {potenza_generata:.0f}W | Potenza Consumata: {monitor.total_grid_load:.0f}W | Consumata Live: {potenza_live:.0f}W | Potenza Esportata: {potenza_esportata:.0f}W | Wallbox: {'ON' if wallbox.is_on else 'OFF'} ({wallbox.current_set_power:.0f}W)")
 
     if not wallbox.is_on:
         if potenza_esportata > potenza_minima:
@@ -843,7 +842,7 @@ def run_logic(monitor, wallbox):
                     wallbox.set_power(potenza_minima, bypass=True)
                     return
 
-        if potenza_carica > (potenza_generata - consumata_casa) or potenza_esportata < 0:
+        if potenza_carica > (potenza_generata - potenza_casa) or potenza_esportata < 0:
             nuova_potenza = potenza_carica - abs(potenza_esportata)
             if nuova_potenza < potenza_minima or potenza_generata < potenza_minima:
                 log_msg(f"[DECISIONE] Sole insufficiente. Minimo per {CONFIG['TIMER_SPEGNIMENTO']}s.")
@@ -854,14 +853,13 @@ def run_logic(monitor, wallbox):
                 wallbox.set_power(nuova_potenza, bypass=False)
 
         else: 
-            print(f"[DEBUG] Potenza carica: {potenza_carica:.0f}W, Potenza generata: {potenza_generata:.0f}W, Consumata casa: {consumata_casa:.0f}W, Esportata: {potenza_esportata:.0f}W")
             nuova_potenza = potenza_carica + abs(potenza_esportata)
             if nuova_potenza > potenza_generata:
                 return
             delta_potenza = nuova_potenza - potenza_carica
-            if consumata_casa + delta_potenza > potenza_generata:
+            if potenza_casa + delta_potenza > potenza_generata:
                 return
-            if nuova_potenza + consumata_casa > potenza_generata:
+            if nuova_potenza + potenza_casa > potenza_generata:
                 return
             if nuova_potenza > potenza_massima:
                 # limito alla potenza massima disponibile, la notifica viene gestita
