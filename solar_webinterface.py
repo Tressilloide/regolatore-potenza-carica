@@ -845,6 +845,7 @@ def run_logic(monitor, wallbox):
                 wallbox.set_power(nuova_potenza, bypass=False)
 
         else: 
+            print(f"[DEBUG] Potenza carica: {potenza_carica:.0f}W, Potenza generata: {potenza_generata:.0f}W, Consumata casa: {consumata_casa:.0f}W, Esportata: {potenza_esportata:.0f}W")
             nuova_potenza = potenza_carica + abs(potenza_esportata)
             if nuova_potenza > potenza_generata:
                 return
