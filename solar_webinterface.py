@@ -62,10 +62,19 @@ SYSTEM_STATE = {
 # Variabile globale per accedere al controller dalla UI Web e da Telegram
 wallbox_instance = None 
 
+# ... (tutti i tuoi import)
+
 load_dotenv()
 API_KEY = os.getenv('API_KEY')
 CHAT_ID = os.getenv('CHAT_ID')
+
+# Configurazione logging base
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s', datefmt='%H:%M:%S')
+# Silenzia il rumore di fondo delle librerie
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("werkzeug").setLevel(logging.ERROR)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+# -----------------------
 
 def log_msg(msg):
     """Salva il log sia su terminale che nel buffer per la Web UI"""
