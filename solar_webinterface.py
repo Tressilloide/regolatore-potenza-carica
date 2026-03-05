@@ -40,6 +40,7 @@ CONFIG = {
     'MCAST_PORT': 22600,
     'IFACE': '192.168.1.23',
     'WALLBOX_IP': '192.168.1.22',
+    'PORT' :5000,
     'SMOOTHING_ALPHA': 0.5, 
     'MAX_DELTA_PER_SEC': 1500
 }
@@ -530,7 +531,7 @@ def force_init_wallbox():
     return jsonify({'success': False, 'error': 'Controller non disponibile'})
 
 def run_flask():
-    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+    app.run(host='0.0.0.0', port=CONFIG['PORT'], debug=False, use_reloader=False)
 
 # -----------------------------------------------------------
 # GESTORE WALLBOX E CLASSI SOTTOSTANTI
