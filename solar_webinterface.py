@@ -38,7 +38,7 @@ CONFIG = {
     'TIMER_SPEGNIMENTO': 60,
     'MCAST_GRP': '224.192.32.19',
     'MCAST_PORT': 22600,
-    'IFACE': '192.168.1.193',
+    'IFACE': '192.168.1.23',
     'WALLBOX_IP': '192.168.1.22',
     'SMOOTHING_ALPHA': 0.5, 
     'MAX_DELTA_PER_SEC': 1500
@@ -521,7 +521,7 @@ def force_init_wallbox():
     return jsonify({'success': False, 'error': 'Controller non disponibile'})
 
 def run_flask():
-    app.run(host='0.0.0.0', port=80, debug=False, use_reloader=False)
+    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
 
 # -----------------------------------------------------------
 # GESTORE WALLBOX E CLASSI SOTTOSTANTI
@@ -849,7 +849,7 @@ def run_logic(monitor, wallbox):
             if nuova_potenza > potenza_generata:
                 return
             delta_potenza = nuova_potenza - potenza_carica
-            if consumata_casa + nuova_potenza > potenza_generata:
+            if consumata_casa + delta_potenza > potenza_generata:
                 return
             if nuova_potenza + consumata_casa > potenza_generata:
                 nuova_potenza = potenza_generata - consumata_casa
