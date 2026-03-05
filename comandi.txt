@@ -1,0 +1,2 @@
+sudo journalctl -u solar_web.service -f -o cat #output file
+sudo systemctl restart solar_web.service #restarta
