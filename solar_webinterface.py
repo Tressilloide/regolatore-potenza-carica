@@ -860,10 +860,10 @@ def run_logic(monitor, wallbox):
             if nuova_potenza > potenza_generata:
                 return
             delta_potenza = nuova_potenza - potenza_carica
-            if potenza_casa + delta_potenza > potenza_generata:
-                return
-            if nuova_potenza + potenza_casa > potenza_generata:
-                return
+            if potenza_casa + delta_potenza >potenza_generata or nuova_potenza + potenza_casa > potenza_generata:
+                nuova_potenza = potenza_generata - potenza_casa
+                log_msg(f"[DECISIONE] Limito aumento a {nuova_potenza:.0f}W per evitare sovraccarico casa")
+            
             if nuova_potenza > potenza_massima:
                 # limito alla potenza massima disponibile, la notifica viene gestita
                 # dal blocco di controllo sopra per evitare messaggi ripetuti.
