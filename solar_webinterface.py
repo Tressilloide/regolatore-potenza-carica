@@ -708,6 +708,7 @@ class EnergyMonitor:
     def __init__(self):
         self.solar_now = 0.0        
         self.total_grid_load = 0.0  
+        self.house_load = 0.0
         self.fases = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         self.ctrletturefasi = 0
         self.time = None
@@ -742,6 +743,7 @@ class EnergyMonitor:
                     
                     wb_status = SYSTEM_STATE.get('WALLBOX_STATUS', False)
                     wb_power = SYSTEM_STATE.get('WALLBOX_POWER', 0) if wb_status else 0
+                    self.house_load = self.total_grid_load - wb_power
                     
                     SYSTEM_STATE['ULTIME_LETTURE_FASI'].append((self.total_grid_load, self.solar_now, self.fases, self.time, wb_power))
                     if len(SYSTEM_STATE['ULTIME_LETTURE_FASI']) > 30:
@@ -776,7 +778,7 @@ def run_logic(monitor, wallbox):
     potenza_generata = monitor.solar_now
     potenza_consumata = monitor.total_grid_load
     potenza_carica = wallbox.display_power if wallbox.is_on else 0
-    potenza_casa = potenza_consumata - potenza_carica if wallbox.is_on else potenza_consumata
+    potenza_casa = monitor.house_load
     potenza_generata += POTENZA_PRELEVABILE
     potenza_esportata = potenza_generata - potenza_consumata
     
