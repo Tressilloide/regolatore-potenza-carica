@@ -41,7 +41,7 @@ CONFIG = {
     'IFACE': '192.168.1.23',
     'WALLBOX_IP': '192.168.1.22',
     'PORT' :5000,
-    'SMOOTHING_ALPHA': 0.5, 
+    'SMOOTHING_ALPHA': 0.9, 
     'MAX_DELTA_PER_SEC': 1500
 }
 
@@ -846,7 +846,7 @@ def run_logic(monitor, wallbox):
                     return
 
         if potenza_consumata > potenza_generata:
-            nuova_potenza = potenza_generata - potenza_casa
+            nuova_potenza = potenza_generata - potenza_casa - 200#200W evito on/off
             log_msg(f"[DECISIONE]2 Diminuisco a {nuova_potenza:.0f}W")
             wallbox.set_power(nuova_potenza, bypass=False)
         if potenza_carica > (potenza_generata - potenza_casa) or potenza_esportata < 0:
