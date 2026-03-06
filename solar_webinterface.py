@@ -846,7 +846,7 @@ def run_logic(monitor, wallbox):
                     return
 
         if potenza_carica > (potenza_generata - potenza_casa) or potenza_esportata < 0:
-            nuova_potenza = potenza_carica - abs(potenza_esportata)
+            nuova_potenza = potenza_generata - abs(potenza_consumata-potenza_generata)
             if nuova_potenza < potenza_minima or potenza_generata < potenza_minima:
                 log_msg(f"[DECISIONE] Sole insufficiente. Minimo per {CONFIG['TIMER_SPEGNIMENTO']}s.")
                 wallbox.set_power(potenza_minima, bypass=True)
