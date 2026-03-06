@@ -845,8 +845,12 @@ def run_logic(monitor, wallbox):
                     wallbox.set_power(potenza_minima, bypass=True)
                     return
 
+        if potenza_consumata > potenza_generata:
+            nuova_potenza = potenza_generata - potenza_casa
+            log_msg(f"[DECISIONE]2 Diminuisco a {nuova_potenza:.0f}W")
+            wallbox.set_power(nuova_potenza, bypass=False)
         if potenza_carica > (potenza_generata - potenza_casa) or potenza_esportata < 0:
-            nuova_potenza = potenza_generata - abs(potenza_consumata-potenza_generata)
+            nuova_potenza = potenza_carica - abs(potenza_esportata)
             if nuova_potenza < potenza_minima or potenza_generata < potenza_minima:
                 log_msg(f"[DECISIONE] Sole insufficiente. Minimo per {CONFIG['TIMER_SPEGNIMENTO']}s.")
                 wallbox.set_power(potenza_minima, bypass=True)
@@ -861,8 +865,7 @@ def run_logic(monitor, wallbox):
                 return
             delta_potenza = nuova_potenza - potenza_carica
             if potenza_casa + delta_potenza >potenza_generata or nuova_potenza + potenza_casa > potenza_generata:
-                nuova_potenza = potenza_generata - potenza_casa
-                log_msg(f"[DECISIONE] Limito aumento a {nuova_potenza:.0f}W per evitare sovraccarico casa")
+                return
             
             if nuova_potenza > potenza_massima:
                 # limito alla potenza massima disponibile, la notifica viene gestita
