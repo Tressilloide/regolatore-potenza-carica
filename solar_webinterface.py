@@ -860,7 +860,7 @@ def run_logic(monitor, wallbox):
                 wallbox.set_power(nuova_potenza, bypass=False)
 
         else: 
-            nuova_potenza = potenza_carica + abs(potenza_esportata)
+            nuova_potenza = potenza_carica + abs(potenza_generata-potenza_consumata)- 100
             if nuova_potenza > potenza_generata:
                 return
             delta_potenza = nuova_potenza - potenza_carica
