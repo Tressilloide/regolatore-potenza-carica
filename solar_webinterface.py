@@ -829,10 +829,10 @@ def run_logic(monitor, wallbox):
                 return
             else:
                 wallbox.pending_off_until = 0
-                if potenza_generata < potenza_minima:
+                if potenza_generata < potenza_minima or potenza_esportata < -200:#spengo se continuo ad importare piu di 200w
                     log_msg(f"[DECISIONE] Sole insufficiente. Spengo.")
                     try: 
-                        asyncio.run(invia_notifica(f"⚠️ Potenza insufficiente ({potenza_generata:.0f}W). Spengo wallbox."))
+                        asyncio.run(invia_notifica(f"⚠️ Potenza insufficiente ({potenza_generata:.0f}W) consumo casa ({potenza_casa:.0f}W). Spengo wallbox."))
                         if wallbox.fase == 1:
                             asyncio.run(invia_notifica(f"⚠️ Consiglio: mettere l'impianto in modalità monofase per sfruttare meglio la potenza disponibile."))
                         else:
