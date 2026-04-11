@@ -210,6 +210,15 @@ async def cmd_grafici(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Invia l'immagine
     await update.message.reply_photo(photo=buf)
 
+async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not check_auth(update): return
+    if wallbox_instance:
+        log_msg("[TELEGRAM] Richiesta manuale di re-inizializzazione Wallbox!")
+        wallbox_instance.initialize()
+        await update.message.reply_text("🔄 *Comando inviato:* Re-inizializzazione Wallbox in corso. Controlla la console per l'esito.", parse_mode='Markdown')
+    else:
+        await update.message.reply_text("❌ *Errore:* Controller Wallbox non disponibile.", parse_mode='Markdown')
+
 def run_telegram_polling():
     """Inizializza e avvia il polling di Telegram in un thread separato"""
     if not API_KEY:
@@ -226,6 +235,7 @@ def run_telegram_polling():
     app.add_handler(CommandHandler("setPotenzaPrelevabile", cmd_set_prelevabile))
     app.add_handler(CommandHandler("setPotenzaProtezione", cmd_set_protezione))
     app.add_handler(CommandHandler("grafici", cmd_grafici))
+    app.add_handler(CommandHandler("restart", cmd_restart))
     
     log_msg(">>> BOT TELEGRAM ATTIVO. In attesa di comandi... <<<")
     # stop_signals=None evita conflitti di segnali con il thread principale
