@@ -42,7 +42,8 @@ CONFIG = {
     'WALLBOX_IP': '192.168.1.22',
     'PORT' :5000,
     'SMOOTHING_ALPHA': 0.9, 
-    'MAX_DELTA_PER_SEC': 1500
+    'MAX_DELTA_PER_SEC': 1500,
+    'MAX_FAILED_OFF_ATTEMPTS': 2    # Tentativi falliti prima di considerare wallbox offline
 }
 
 WALLBOX_URL = f"http://{CONFIG['WALLBOX_IP']}/index.json"
@@ -564,6 +565,10 @@ class WallboxController:
         # tracking for sustained max power notifications
         self.max_reached_start = None   # timestamp when we first hit max
         self.max_notified = False      # whether notification was already sent
+        # contatore per tracciare tentativi falliti di spegnimento
+        # se il wallbox non risponde N volte, assume che sia offline
+        self.failed_off_attempts = 0
+        self.last_off_attempt_time = None
 
     def update_shared_state(self):
         SYSTEM_STATE['WALLBOX_POWER'] = int(round(self.display_power))
@@ -650,6 +655,7 @@ class WallboxController:
 
             if self.send_command({'btn': 'i'}):
                 self.is_on = True
+                self.failed_off_attempts = 0  # Reset contatore quando si accende
                 self.last_update_time = time.time()
                 self.update_shared_state()
             
@@ -662,6 +668,7 @@ class WallboxController:
             log_msg("[AZIONE] SPEGNIMENTO (OFF)")
             if self.send_command({'btn': 'o'}):
                 self.is_on = False
+                self.failed_off_attempts = 0  # Reset contatore quando lo spegnimento riesce
                 self.time_turned_off = time.time() 
                 self.last_update_time = time.time()
                 time.sleep(0.5)
@@ -672,6 +679,24 @@ class WallboxController:
                     self.current_set_power = min_p
                     self.display_power = float(self.current_set_power)
                     self.update_shared_state()
+            else:
+                # Comando di spegnimento fallito - incrementa contatore
+                self.failed_off_attempts += 1
+                self.last_off_attempt_time = now
+                max_attempts = CONFIG.get('MAX_FAILED_OFF_ATTEMPTS', 3)
+                
+                if self.failed_off_attempts >= max_attempts:
+                    # Dopo N tentativi falliti, assume che il wallbox sia offline/spento fisicamente
+                    log_msg(f"[AVVISO] Wallbox non risponde ai comandi di spegnimento ({self.failed_off_attempts} tentativi falliti). Assumo che sia offline/spento fisicamente.")
+                    try:
+                        asyncio.run(invia_notifica("🛑 Colonnina spenta manualmente in precedenza"))
+                    except Exception as e:
+                        log_msg(f"[ERRORE] Invio notifica fallito: {e}")
+                    self.is_on = False  # Considero il wallbox come spento
+                    self.failed_off_attempts = 0  # Reset contatore
+                    self.update_shared_state()
+                else:
+                    log_msg(f"[AVVISO] Comando OFF fallito ({self.failed_off_attempts}/{max_attempts} tentativi). Riproverò...")
 
     def initialize(self):
         log_msg("=== INIZIALIZZAZIONE SISTEMA ===")
