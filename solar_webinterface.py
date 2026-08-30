@@ -758,11 +758,17 @@ HTML_TEMPLATE = """
                     <input type="number" id="protezione" oninput="marcaSporco(event)">
                 </div>
                 <div class="input-group">
-                    <label>🔋 Limite di carica: <span id="limite_val">--</span> kWh</label>
+                    <label>🔋 Limite di carica: <span id="limite_val">--</span> kWh
+                        (<span id="limite_stato">--</span>)</label>
                     <input type="range" id="limite" min="1" max="100" step="1"
                            oninput="marcaSporco(event); document.getElementById('limite_val').innerText = this.value;">
+                    <button type="button" id="btn_limite_toggle" onclick="toggleLimite()">--</button>
                     <div class="nota" id="nota_limite" hidden>
                         Comando centralina non ancora configurato: il valore viene salvato ma non inviato.
+                    </div>
+                    <div class="nota">
+                        ⚠️ Se la centralina usa il dato di energia stimata (nessun contatore reale),
+                        l'energia effettivamente erogata puo' essere inferiore al valore impostato.
                     </div>
                 </div>
                 <div class="input-group toggle-row">
@@ -927,6 +933,16 @@ HTML_TEMPLATE = """
                 document.getElementById('nota_limite').hidden = !!data.status.limite_supportato;
                 document.getElementById('eco_stato').innerText = data.config.eco ? '🟢 Attiva' : '⚪ Disattiva';
 
+                // Stato reale del limite: sempre quello letto dalla centralina
+                // (campo 'limit' > 0 = attivo), mai un flag locale che potrebbe
+                // disallinearsi da quanto l'hardware ricorda per conto suo.
+                const limiteAttivo = Number(data.status.limite_kwh_centralina) > 0;
+                const btnLimite = document.getElementById('btn_limite_toggle');
+                document.getElementById('limite_stato').innerText = limiteAttivo ? '🟢 attivo' : '⚪ disattivo';
+                btnLimite.textContent = limiteAttivo ? 'Disattiva' : 'Attiva';
+                btnLimite.dataset.attivo = limiteAttivo ? '1' : '0';
+                btnLimite.disabled = !data.status.limite_supportato;
+
                 // Allarmi di salute del sistema
                 const allarmi = [];
                 if (!data.status.centralina_online) allarmi.push('⚠️ Centralina non raggiungibile');
@@ -1056,6 +1072,31 @@ HTML_TEMPLATE = """
             }
         }
 
+        async function toggleLimite() {
+            const btn = document.getElementById('btn_limite_toggle');
+            const nuovoStato = btn.dataset.attivo !== '1';
+            btn.disabled = true;
+            try {
+                const resp = await fetch('/api/limite_toggle', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ attivo: nuovoStato })
+                });
+                const res = await resp.json().catch(() => ({}));
+                if (!resp.ok || !res.success) {
+                    mostraEsito('Errore: ' + (res.error || res.messaggio || 'sconosciuto'), false);
+                    return;
+                }
+                mostraEsito(res.messaggio || 'Fatto.', true);
+            } catch (e) {
+                mostraEsito('Errore di rete: ' + e, false);
+            } finally {
+                // Rilegge lo stato reale dalla centralina e riabilita il bottone
+                // di conseguenza, sia in caso di successo sia di errore.
+                fetchData();
+            }
+        }
+
         async function reinitWallbox() {
             if (!confirm("Sei sicuro di voler forzare la re-inizializzazione della Wallbox?")) return;
             try {
@@ -1118,6 +1159,7 @@ def get_data():
             'sensore_online': SYSTEM_STATE['SENSORE_ONLINE'],
             'manual_off': bool(wallbox_instance and wallbox_instance.manual_off),
             'limite_supportato': bool(CONFIG['CMD_LIMITE_TEMPLATE']),
+            'limite_kwh_centralina': SYSTEM_STATE.get('LIMITE_KWH_CENTRALINA'),
         }
         configurazione = {
             'prelevabile': CONFIG['POTENZA_PRELEVABILE'],
@@ -1206,6 +1248,28 @@ def update_settings():
         wallbox_instance.set_limite_kwh(puliti['LIMITE_KWH'])
 
     return jsonify({'success': True, 'applicati': puliti})
+
+@app.route('/api/limite_toggle', methods=['POST'])
+def toggle_limite():
+    """Attiva/disattiva il limite kWh senza toccare il valore ricordato.
+
+    Il pulsante fisico della centralina (btn=l) e' un toggle stateful:
+    da un bottone web stateless e' rischioso (un doppio invio lo rimette
+    nello stato sbagliato). Qui si usa invece L<valore>/L0, entrambi
+    deterministici: 'attivo' decide se inviare CONFIG['LIMITE_KWH'] oppure 0.
+    """
+    if not wallbox_instance:
+        return jsonify({'success': False, 'error': 'Controller non disponibile'}), 503
+    if not CONFIG.get('CMD_LIMITE_TEMPLATE'):
+        return jsonify({'success': False, 'error': 'Comando limite non configurato'}), 400
+
+    dati = request.get_json(silent=True)
+    if not isinstance(dati, dict) or 'attivo' not in dati:
+        return jsonify({'success': False, 'error': "Parametro 'attivo' mancante"}), 400
+
+    valore = CONFIG['LIMITE_KWH'] if dati['attivo'] else 0
+    inviato, messaggio = wallbox_instance.set_limite_kwh(valore)
+    return jsonify({'success': inviato, 'messaggio': messaggio, 'attivo': bool(dati['attivo'])}), (200 if inviato else 502)
 
 @app.route('/api/init_wallbox', methods=['POST'])
 def force_init_wallbox():
@@ -1400,7 +1464,13 @@ class WallboxController:
         return 'cambiata'
 
     def set_limite_kwh(self, kwh):
-        """Imposta l'energia da caricare (1-100 kWh) sulla centralina.
+        """Imposta l'energia da caricare (0-100 kWh) sulla centralina.
+
+        0 e' un valore valido e significa "limite disattivato": la centralina
+        usa esattamente questa convenzione (campo 'limit' a 0 = nessun tetto),
+        e L0 e' il modo deterministico di disattivare senza dipendere dal
+        pulsante fisico btn=l, che e' un toggle stateful (send-and-forget da
+        un bottone web rischia di lasciarlo nello stato sbagliato).
 
         Finche' CONFIG['CMD_LIMITE_TEMPLATE'] e' None NON invia nulla: il valore
         viene solo salvato. Questo permette di deployare la funzione prima di
@@ -1408,7 +1478,7 @@ class WallboxController:
         Ritorna (inviato, messaggio).
         """
         template = CONFIG.get('CMD_LIMITE_TEMPLATE')
-        kwh = max(1, min(100, int(kwh)))
+        kwh = max(0, min(100, int(kwh)))
 
         if not template:
             msg = "Valore salvato, ma il comando della centralina non è ancora configurato (vedi CMD_LIMITE_TEMPLATE)."
@@ -1421,7 +1491,7 @@ class WallboxController:
         if not ok:
             return False, "Comando non accettato dalla centralina."
 
-        log_msg(f"[LIMITE] Impostato a {kwh} kWh")
+        log_msg(f"[LIMITE] {'Disattivato' if kwh == 0 else f'Impostato a {kwh} kWh'}")
 
         # Verifica: rileggo e confronto. E' il modo piu' rapido per capire se
         # l'ipotesi sul formato del comando e' corretta.
@@ -1431,7 +1501,7 @@ class WallboxController:
             if dati is not None and str(dati.get(chiave)) != str(kwh):
                 return False, (f"Comando inviato ma la centralina riporta "
                                f"{chiave}={dati.get(chiave)}: verificare CMD_LIMITE_TEMPLATE.")
-        return True, f"Limite impostato a {kwh} kWh."
+        return True, ("Limite disattivato." if kwh == 0 else f"Limite impostato a {kwh} kWh.")
 
     def set_power(self, watts, bypass):
         """Wrapper con lock. La logica sta in _set_power.
