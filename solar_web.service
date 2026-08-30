@@ -3,16 +3,22 @@ Description=Interfaccia Web Solar EVR
 After=network.target
 
 [Service]
-# Esegue lo script usando l'interprete Python 3
-ExecStart=/home/pi/Desktop/EVR/venv/bin/python3 /home/pi/Desktop/EVR/regolatore-potenza-carica/solar_webinterface.py
-# Cartella di lavoro (utile se lo script carica file locali)
-WorkingDirectory=/home/pi/Desktop/EVR/regolatore-potenza-carica/
-# Utente che esegue lo script
-User=pi
-# Riavvio automatico in caso di errore/crash
+# Usa il Python dell'ambiente virtuale (venv)
+ExecStart=/home/tressilloide/solar/regolatore-potenza-carica/venv/bin/python3 /home/tressilloide/solar/regolatore-potenza-carica/solar_webinterface.py
+
+# Cartella di lavoro corretta
+WorkingDirectory=/home/tressilloide/solar/regolatore-potenza-carica/
+
+# Utente attuale
+User=tressilloide
+
+# Riavvio automatico
 Restart=always
-# Attende 5 secondi prima di riprovare il riavvio
 RestartSec=5
+
+# Output dei log per il debug (utile per vedere errori di matplotlib o rete)
+StandardOutput=inherit
+StandardError=inherit
 
 [Install]
 WantedBy=multi-user.target

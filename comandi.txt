@@ -5,7 +5,7 @@ sudo systemctl status solar_web.service          # stato + uso memoria
 
 ### VENV E LIBRERIE ####################################################
 # Percorso dell'interprete usato dal service
-VENV=/home/pi/Desktop/EVR/venv/bin/python3
+VENV=/home/tressilloide/solar/regolatore-potenza-carica/venv/bin/python3
 
 # Verifica quali librerie sono installate e con che versione
 $VENV -c "import telegram, flask, requests, matplotlib, dotenv, sys; \
@@ -16,15 +16,18 @@ print('requests', requests.__version__); \
 print('matplot ', matplotlib.__version__)"
 
 # Installazione / aggiornamento delle librerie necessarie
-/home/pi/Desktop/EVR/venv/bin/pip install --upgrade \
+/home/tressilloide/solar/regolatore-potenza-carica/venv/bin/pip install --upgrade \
     python-telegram-bot flask requests python-dotenv matplotlib
 
 # Verifica sintassi PRIMA di riavviare il servizio
-$VENV -m py_compile /home/pi/Desktop/EVR/regolatore-potenza-carica/solar_webinterface.py
+$VENV -m py_compile /home/tressilloide/solar/regolatore-potenza-carica/solar_webinterface.py
 
 ### DIAGNOSI BOT TELEGRAM ##############################################
-# I nomi di comando con MAIUSCOLE sono rifiutati da python-telegram-bot v20+.
-# Se in passato il bot non rispondeva, la causa e' questa: cercare l'errore.
+# NOTA (verificato sul campo, ptb 22.7): CommandHandler fa .lower() sia in
+# registrazione che in matching, quindi nomi con MAIUSCOLE NON causano piu'
+# ValueError e funzionano comunque (case-insensitive). Il codice nuovo
+# registra comunque i comandi in try/except e logga un alias non supportato
+# se capita con altre versioni di PTB.
 sudo journalctl -u solar_web.service --since "-3 days" \
   | grep -iE "not a valid bot command|no current event loop|BOT TELEGRAM ATTIVO|Traceback"
 

@@ -57,14 +57,12 @@ CONFIG = {
     'INTERVALLO_SYNC_FASE': 30,     # Ogni quanti secondi rileggere 'tfase' dalla centralina
 
     # --- Limite di ricarica (kWh) --------------------------------------
-    # DA CONFERMARE leggendo la funzione chglimit() della centralina:
-    #   curl -s http://192.168.1.22/ -o /tmp/wb.html
-    #   grep -n -A 15 "function chglimit" /tmp/wb.html
-    # Finche' CMD_LIMITE_TEMPLATE resta None il codice NON invia nulla alla
-    # centralina: si puo' deployare in sicurezza prima di aver finito l'analisi.
-    'CMD_LIMITE_TEMPLATE': None,    # es. 'L{valore}'  -> index.json?btn=L50
-    'CMD_LIMITE_ATTIVA': None,      # btn del pulsante "Limite", se esiste
-    'CHIAVE_LIMITE_JSON': None,     # chiave di index.json che riporta il limite attuale
+    # Confermato sul campo leggendo chglimit()/pushed_limit() della centralina
+    # e verificato inviando btn=L45 con la wallbox spenta: la centralina
+    # risponde con "limit": "45" e lo mantiene alla rilettura successiva.
+    'CMD_LIMITE_TEMPLATE': 'L{valore}',   # -> index.json?btn=L50
+    'CMD_LIMITE_ATTIVA': 'l',       # btn=l: pulsante "Limite" (mostra/nasconde riga, non serve per impostare il valore)
+    'CHIAVE_LIMITE_JSON': 'limit',  # chiave di index.json che riporta il limite attuale
 
     # --- Storico e watchdog ---
     'STORICO_INTERVALLO_S': 10,     # Un campione ogni N secondi (downsampling)
@@ -1587,9 +1585,10 @@ class WallboxController:
             log_msg(f"2. Imposto potenza minima ({min_p}W)...")
             self.set_power(min_p, bypass=True)
 
-            # Riapplica il limite kWh salvato: la centralina puo' averlo perso
-            if CONFIG.get('CMD_LIMITE_TEMPLATE'):
-                self.set_limite_kwh(CONFIG['LIMITE_KWH'])
+            # NB: qui non si reinvia il limite kWh salvato alla centralina.
+            # Il comando resta disponibile da UI/Telegram (set_limite_kwh), ma
+            # l'init non deve forzare nulla sull'hardware: il valore reale e'
+            # quello che la centralina ricorda per conto suo.
 
             time.sleep(1)
             log_msg("=== PRONTO. IN ATTESA PACCHETTI ===")
