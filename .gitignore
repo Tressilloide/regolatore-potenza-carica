@@ -1,1 +1,10 @@
 .env
+
+# File di stato generati a runtime (non vanno versionati)
+config_utente.json
+storico.jsonl
+storico_giornaliero.json
+*.tmp
+
+__pycache__/
+*.pyc
