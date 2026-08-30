@@ -39,7 +39,6 @@ CONFIG = {
     'TRIFASE_MAX_POWER': 22000,
     'POTENZA_PROTEZIONE': 300,      # Modificabile da Web e Telegram (persistito)
     'POTENZA_PRELEVABILE': 0,       # Modificabile da Web e Telegram (persistito)
-    'ECO_MODE': False,              # Modalita' Eco: carica solo con surplus reale (persistito)
     'LIMITE_KWH': 100,              # Energia da caricare, 1-100 kWh (persistito)
     'COOLDOWN_ACCENSIONE': 60,
     'UPDATE_INTERVAL_S': 5,
@@ -153,7 +152,6 @@ CHIAVI_PERSISTENTI = {
     # chiave: (minimo, massimo, tipo)
     'POTENZA_PRELEVABILE': (0, 20000, int),
     'POTENZA_PROTEZIONE':  (50, 5000, int),
-    'ECO_MODE':            (None, None, bool),
     'LIMITE_KWH':          (1, 100, int),
 }
 
@@ -357,7 +355,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/setPotenzaPrelevabile <W> - Potenza prelevabile dalla rete\n"
         "/setPotenzaProtezione <W> - Soglia di protezione\n"
         "/limite <kWh> - Energia da caricare (1-100)\n"
-        "/eco on|off - Ricarica solo con surplus fotovoltaico\n"
     )
     await update.message.reply_text(msg, parse_mode='Markdown')
 
@@ -370,7 +367,6 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fase_mode = SYSTEM_STATE['IMPIANTO_FASE']
         centralina_ok = SYSTEM_STATE['CENTRALINA_ONLINE']
         sensore_ok = SYSTEM_STATE['SENSORE_ONLINE']
-        eco = CONFIG['ECO_MODE']
         prelevabile = CONFIG['POTENZA_PRELEVABILE']
         protezione = CONFIG['POTENZA_PROTEZIONE']
         limite = CONFIG['LIMITE_KWH']
@@ -386,8 +382,7 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔌 *Rete:* {tot_grid:.0f} W\n"
         f"🚗 *Wallbox:* {wb_status} ({wb_power:.0f} W)\n"
         f"⚙️ *Modalità:* {modalita}\n"
-        f"🌱 *Eco:* {'ATTIVA' if eco else 'disattiva'}\n"
-        f"🛠️ *Prelevabile:* {prelevabile} W{' (ignorata in Eco)' if eco else ''}\n"
+        f"🛠️ *Prelevabile:* {prelevabile} W\n"
         f"🛡️ *Protezione:* {protezione} W\n"
         f"🔋 *Limite carica:* {limite} kWh\n"
     )
@@ -444,9 +439,8 @@ async def cmd_set_prelevabile(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     ok, errore = applica_impostazione('POTENZA_PRELEVABILE', context.args[0], 'TELEGRAM')
     if ok:
-        nota = "\n_(ignorata: modalità Eco attiva)_" if CONFIG['ECO_MODE'] else ""
         await update.message.reply_text(
-            f"✅ *Potenza Prelevabile* impostata a {CONFIG['POTENZA_PRELEVABILE']} W{nota}", parse_mode='Markdown')
+            f"✅ *Potenza Prelevabile* impostata a {CONFIG['POTENZA_PRELEVABILE']} W", parse_mode='Markdown')
     else:
         await update.message.reply_text(f"⚠️ {errore}\nEsempio: `/prelevabile 1000`", parse_mode='Markdown')
 
@@ -463,29 +457,6 @@ async def cmd_set_protezione(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"✅ *Potenza Protezione* impostata a {CONFIG['POTENZA_PROTEZIONE']} W", parse_mode='Markdown')
     else:
         await update.message.reply_text(f"⚠️ {errore}\nEsempio: `/protezione 300`", parse_mode='Markdown')
-
-async def cmd_eco(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Attiva/disattiva la modalita' Eco (ricarica solo con surplus reale)."""
-    if not check_auth(update): return
-    if not context.args:
-        stato = "🟢 ATTIVA" if CONFIG['ECO_MODE'] else "⚪ disattiva"
-        await update.message.reply_text(
-            f"🌱 *Modalità Eco:* {stato}\nUsa: `/eco on` oppure `/eco off`", parse_mode='Markdown')
-        return
-
-    ok, errore = applica_impostazione('ECO_MODE', context.args[0], 'TELEGRAM')
-    if not ok:
-        await update.message.reply_text("⚠️ Usa: `/eco on` oppure `/eco off`", parse_mode='Markdown')
-        return
-
-    if CONFIG['ECO_MODE']:
-        await update.message.reply_text(
-            "🌱 *Modalità Eco ATTIVA*\nLa wallbox carica solo con surplus fotovoltaico reale.\n"
-            f"_La potenza prelevabile ({CONFIG['POTENZA_PRELEVABILE']} W) viene ignorata._", parse_mode='Markdown')
-    else:
-        await update.message.reply_text(
-            f"⚪ *Modalità Eco disattivata*\nTorna attiva la potenza prelevabile: {CONFIG['POTENZA_PRELEVABILE']} W",
-            parse_mode='Markdown')
 
 async def cmd_limite(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Imposta l'energia da caricare in kWh (slider 'Limite' della centralina)."""
@@ -610,7 +581,6 @@ def _registra_comandi(app):
         (["spegni"], cmd_spegni),
         (["prelevabile", "setpotenzaprelevabile"], cmd_set_prelevabile),
         (["protezione", "setpotenzaprotezione"], cmd_set_protezione),
-        (["eco"], cmd_eco),
         (["limite"], cmd_limite),
         (["fase"], cmd_fase),
         (["energia"], cmd_energia),
@@ -751,7 +721,6 @@ HTML_TEMPLATE = """
                 <div class="input-group">
                     <label>Potenza Prelevabile (W)</label>
                     <input type="number" id="prelevabile" oninput="marcaSporco(event)">
-                    <div class="nota" id="nota_eco" hidden>Ignorata: modalità Eco attiva</div>
                 </div>
                 <div class="input-group">
                     <label>Potenza Protezione (W)</label>
@@ -771,10 +740,6 @@ HTML_TEMPLATE = """
                         l'energia effettivamente erogata puo' essere inferiore al valore impostato.
                     </div>
                 </div>
-                <div class="input-group toggle-row">
-                    <label for="eco">🌱 Modalità Eco (solo surplus)</label>
-                    <input type="checkbox" id="eco" onchange="marcaSporco(event)">
-                </div>
                 <button onclick="updateSettings()">Salva Impostazioni</button>
                 <button class="btn-warning" onclick="reinitWallbox()">🔄 Re-Inizializza Wallbox</button>
                 <div id="esito" class="esito" hidden></div>
@@ -785,7 +750,6 @@ HTML_TEMPLATE = """
                 <div class="stat">Wallbox: <span id="wb_status">--</span></div>
                 <div class="stat">Potenza WB: <span id="wb_power">0</span> W</div>
                 <div class="stat">Modalità: <span id="wb_mode">--</span></div>
-                <div class="stat">Eco: <span id="eco_stato">--</span></div>
                 <div id="allarmi"></div>
                 <div class="stat" style="font-size: 0.9em; color: #666;">Ultimo Agg. Fasi: <span id="last_fasi">--</span> <span id="sec_fasi" class="time-ago"></span></div>
                 <div class="stat" style="font-size: 0.9em; color: #666;">Ultimo Agg. Solare: <span id="last_solar">--</span> <span id="sec_solar" class="time-ago"></span></div>
@@ -924,14 +888,11 @@ HTML_TEMPLATE = """
                 // placeholder, che resta invisibile se il campo ha un valore).
                 aggiornaCampo('prelevabile', data.config.prelevabile);
                 aggiornaCampo('protezione', data.config.protezione);
-                aggiornaCampo('eco', data.config.eco);
                 aggiornaCampo('limite', data.config.limite);
                 document.getElementById('limite_val').innerText =
                     document.getElementById('limite').value || data.config.limite;
 
-                document.getElementById('nota_eco').hidden = !data.config.eco;
                 document.getElementById('nota_limite').hidden = !!data.status.limite_supportato;
-                document.getElementById('eco_stato').innerText = data.config.eco ? '🟢 Attiva' : '⚪ Disattiva';
 
                 // Stato reale del limite: sempre quello letto dalla centralina
                 // (campo 'limit' > 0 = attivo), mai un flag locale che potrebbe
@@ -1048,7 +1009,6 @@ HTML_TEMPLATE = """
             num('prelevabile', 'Potenza prelevabile');
             num('protezione', 'Potenza protezione');
             payload['limite'] = Number(document.getElementById('limite').value);
-            payload['eco'] = document.getElementById('eco').checked;
 
             if (errori.length) { mostraEsito('Correggi:\\n' + errori.join('\\n'), false); return; }
 
@@ -1134,7 +1094,6 @@ def index():
 CAMPI_WEB = {
     'prelevabile': 'POTENZA_PRELEVABILE',
     'protezione':  'POTENZA_PROTEZIONE',
-    'eco':         'ECO_MODE',
     'limite':      'LIMITE_KWH',
 }
 
@@ -1170,7 +1129,6 @@ def get_data():
         configurazione = {
             'prelevabile': CONFIG['POTENZA_PRELEVABILE'],
             'protezione': CONFIG['POTENZA_PROTEZIONE'],
-            'eco': CONFIG['ECO_MODE'],
             'limite': CONFIG['LIMITE_KWH'],
         }
 
@@ -2008,11 +1966,8 @@ def run_logic(monitor, wallbox):
                       600)
         return
 
-    # Modalita' Eco: si ignora la potenza prelevabile dalla rete, senza
-    # sovrascriverla in CONFIG. Disattivando Eco l'utente ritrova il suo valore.
     with STATO_LOCK:
-        eco = CONFIG['ECO_MODE']
-        POTENZA_PRELEVABILE = 0 if eco else CONFIG['POTENZA_PRELEVABILE']
+        POTENZA_PRELEVABILE = CONFIG['POTENZA_PRELEVABILE']
 
     potenza_generata = monitor.solar_now
     potenza_consumata = monitor.total_grid_load
@@ -2022,7 +1977,7 @@ def run_logic(monitor, wallbox):
     potenza_esportata = potenza_generata - potenza_consumata
 
     log_msg(f"[INFO] Gen: {potenza_generata:.0f}W  | Casa: {potenza_casa:.0f}W | Esp: {potenza_esportata:.0f}W | "
-            f"WB: {'ON' if wallbox.is_on else 'OFF'} ({potenza_carica:.0f}W){' | ECO' if eco else ''}")
+            f"WB: {'ON' if wallbox.is_on else 'OFF'} ({potenza_carica:.0f}W)")
 
     potenza_minima, potenza_massima = wallbox.limiti_potenza()
 
