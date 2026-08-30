@@ -985,7 +985,7 @@ HTML_TEMPLATE = """
 
                 // textContent, non innerHTML: i log non vengono interpretati
                 // come markup (il CSS white-space: pre-wrap rende gli a capo).
-                consoleDiv.textContent = data.logs.join('\n');
+                consoleDiv.textContent = data.logs.join('\\n');
 
                 if (isScrolledToBottom) {
                     consoleDiv.scrollTop = consoleDiv.scrollHeight;
@@ -1034,7 +1034,7 @@ HTML_TEMPLATE = """
             payload['limite'] = Number(document.getElementById('limite').value);
             payload['eco'] = document.getElementById('eco').checked;
 
-            if (errori.length) { mostraEsito('Correggi:\n' + errori.join('\n'), false); return; }
+            if (errori.length) { mostraEsito('Correggi:\\n' + errori.join('\\n'), false); return; }
 
             try {
                 const resp = await fetch('/api/settings', {
@@ -1045,7 +1045,7 @@ HTML_TEMPLATE = """
                 const res = await resp.json().catch(() => ({}));
                 // Prima si mostrava "salvato!" anche su HTTP 500.
                 if (!resp.ok || !res.success) {
-                    mostraEsito('Errore nel salvataggio:\n' + (res.errori || ['errore sconosciuto']).join('\n'), false);
+                    mostraEsito('Errore nel salvataggio:\\n' + (res.errori || ['errore sconosciuto']).join('\\n'), false);
                     return;
                 }
                 campiSporchi.clear();
