@@ -1076,17 +1076,23 @@ HTML_TEMPLATE = """
             const btn = document.getElementById('btn_limite_toggle');
             const nuovoStato = btn.dataset.attivo !== '1';
             btn.disabled = true;
+            // Attivando, si manda il valore ATTUALE dello slider (anche se non
+            // ancora salvato con "Salva Impostazioni"): altrimenti il bottone
+            // riattiverebbe silenziosamente un valore vecchio.
+            const payload = { attivo: nuovoStato };
+            if (nuovoStato) payload.kwh = Number(document.getElementById('limite').value);
             try {
                 const resp = await fetch('/api/limite_toggle', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ attivo: nuovoStato })
+                    body: JSON.stringify(payload)
                 });
                 const res = await resp.json().catch(() => ({}));
                 if (!resp.ok || !res.success) {
                     mostraEsito('Errore: ' + (res.error || res.messaggio || 'sconosciuto'), false);
                     return;
                 }
+                campiSporchi.delete('limite');
                 mostraEsito(res.messaggio || 'Fatto.', true);
             } catch (e) {
                 mostraEsito('Errore di rete: ' + e, false);
@@ -1251,12 +1257,17 @@ def update_settings():
 
 @app.route('/api/limite_toggle', methods=['POST'])
 def toggle_limite():
-    """Attiva/disattiva il limite kWh senza toccare il valore ricordato.
+    """Attiva/disattiva il limite kWh.
 
-    Il pulsante fisico della centralina (btn=l) e' un toggle stateful:
-    da un bottone web stateless e' rischioso (un doppio invio lo rimette
-    nello stato sbagliato). Qui si usa invece L<valore>/L0, entrambi
-    deterministici: 'attivo' decide se inviare CONFIG['LIMITE_KWH'] oppure 0.
+    Il pulsante fisico della centralina (btn=l) e' un toggle stateful: da un
+    bottone web stateless e' rischioso (un doppio invio lo rimette nello
+    stato sbagliato). Qui si usa invece L<valore>/L0, entrambi deterministici.
+
+    Se il body include 'kwh', e' il valore corrente scelto nello slider (non
+    ancora salvato con "Salva Impostazioni"): l'attivazione lo usa e lo rende
+    anche il nuovo CONFIG['LIMITE_KWH'] persistito, cosi' la posizione dello
+    slider al momento del click e' sempre quella che finisce sulla centralina,
+    non un valore vecchio salvato in precedenza.
     """
     if not wallbox_instance:
         return jsonify({'success': False, 'error': 'Controller non disponibile'}), 503
@@ -1267,9 +1278,20 @@ def toggle_limite():
     if not isinstance(dati, dict) or 'attivo' not in dati:
         return jsonify({'success': False, 'error': "Parametro 'attivo' mancante"}), 400
 
-    valore = CONFIG['LIMITE_KWH'] if dati['attivo'] else 0
+    attivo = bool(dati['attivo'])
+    if attivo:
+        ok, kwh_pulito, errore = valida_valore('LIMITE_KWH', dati.get('kwh', CONFIG['LIMITE_KWH']))
+        if not ok:
+            return jsonify({'success': False, 'error': errore}), 400
+        with STATO_LOCK:
+            CONFIG['LIMITE_KWH'] = kwh_pulito
+        salva_config()
+        valore = kwh_pulito
+    else:
+        valore = 0
+
     inviato, messaggio = wallbox_instance.set_limite_kwh(valore)
-    return jsonify({'success': inviato, 'messaggio': messaggio, 'attivo': bool(dati['attivo'])}), (200 if inviato else 502)
+    return jsonify({'success': inviato, 'messaggio': messaggio, 'attivo': attivo}), (200 if inviato else 502)
 
 @app.route('/api/init_wallbox', methods=['POST'])
 def force_init_wallbox():
@@ -1655,10 +1677,17 @@ class WallboxController:
             log_msg(f"2. Imposto potenza minima ({min_p}W)...")
             self.set_power(min_p, bypass=True)
 
-            # NB: qui non si reinvia il limite kWh salvato alla centralina.
-            # Il comando resta disponibile da UI/Telegram (set_limite_kwh), ma
-            # l'init non deve forzare nulla sull'hardware: il valore reale e'
-            # quello che la centralina ricorda per conto suo.
+            # NB: qui non si reinvia il limite kWh salvato alla centralina (il
+            # comando resta disponibile da UI/Telegram via set_limite_kwh). Per
+            # sicurezza pero' si forza SEMPRE lo spegnimento del limite se la
+            # centralina ne ricorda uno ancora attivo da una sessione precedente:
+            # cosi' un riavvio/reset non eredita mai silenziosamente un tetto di
+            # carica dimenticato acceso.
+            if CONFIG.get('CMD_LIMITE_TEMPLATE'):
+                limite_letto = SYSTEM_STATE.get('LIMITE_KWH_CENTRALINA')
+                if limite_letto not in (None, 0, '0'):
+                    log_msg(f"[LIMITE] Trovato limite attivo ereditato ({limite_letto} kWh): lo disattivo.")
+                    self.set_limite_kwh(0)
 
             time.sleep(1)
             log_msg("=== PRONTO. IN ATTESA PACCHETTI ===")
