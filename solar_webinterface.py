@@ -20,6 +20,7 @@ matplotlib.use('Agg') # Backend non interattivo per thread-safety
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.ticker import MaxNLocator
+from matplotlib.dates import DateFormatter
 
 from dotenv import load_dotenv
 from telegram import Bot, Update
@@ -53,18 +54,29 @@ CONFIG = {
     'MAX_DELTA_PER_SEC': 1500,
     'MAX_FAILED_OFF_ATTEMPTS': 2,   # Tentativi falliti prima di considerare wallbox offline
 
-    # --- Controllo fase automatico ---
-    'INTERVALLO_SYNC_FASE': 30,     # Ogni quanti secondi rileggere 'tfase' dalla centralina
+    # --- Interrogazione della centralina ---
+    # La lettura di index.json e' un GET su LAN (~5 ms): si puo' fare spesso.
+    # Va fatta spesso: pcar (potenza misurata) entra nell'anello di controllo,
+    # e una misura vecchia di 30s farebbe oscillare la regolazione perche' il
+    # regolatore non vedrebbe l'effetto dei comandi appena inviati.
+    'INTERVALLO_SYNC_FASE': 5,      # Rilettura stato + controllo fase
+    'MAX_ETA_PCAR': 20,             # Oltre questa eta' (s) pcar non e' affidabile
 
     # --- Limite di ricarica (kWh) --------------------------------------
-    # DA CONFERMARE leggendo la funzione chglimit() della centralina:
-    #   curl -s http://192.168.1.22/ -o /tmp/wb.html
-    #   grep -n -A 15 "function chglimit" /tmp/wb.html
-    # Finche' CMD_LIMITE_TEMPLATE resta None il codice NON invia nulla alla
-    # centralina: si puo' deployare in sicurezza prima di aver finito l'analisi.
-    'CMD_LIMITE_TEMPLATE': None,    # es. 'L{valore}'  -> index.json?btn=L50
-    'CMD_LIMITE_ATTIVA': None,      # btn del pulsante "Limite", se esiste
-    'CHIAVE_LIMITE_JSON': None,     # chiave di index.json che riporta il limite attuale
+    # CONFERMATO leggendo il sorgente della centralina:
+    #   function chglimit() { ... loadDoc("L"+p) ... }
+    #   function loadDoc(cmd) { ... 'index.json?btn='+cmd ... }
+    # Quindi: GET index.json?btn=L50  imposta 50 kWh. limit=0 significa
+    # "nessun limite"; il pulsante "Limite" (btn=l) attiva/disattiva la riga.
+    'CMD_LIMITE_TEMPLATE': 'L{valore}',
+    'CMD_LIMITE_ATTIVA': 'l',       # pulsante "Limite" (toggle)
+    'CHIAVE_LIMITE_JSON': 'limit',  # chiave di index.json con il limite attuale
+
+    # --- Lettura diretta dalla centralina ---
+    # index.json espone misure reali: pcar (potenza auto MISURATA), phome,
+    # psun, pnet, energy, status/desc, pwmin/pwmax, alg.
+    'USA_PCAR': True,               # usa la potenza auto misurata invece del setpoint
+    'ALG_MANUALE': '2',             # alg=2 (Man): l'unico in cui btn=P<watt> ha effetto
 
     # --- Storico e watchdog ---
     'STORICO_INTERVALLO_S': 10,     # Un campione ogni N secondi (downsampling)
@@ -92,6 +104,15 @@ SYSTEM_STATE = {
     'WALLBOX_STATUS': False,
     'IMPIANTO_FASE': 0, # 0=Mono, 1=Tri
     'LIMITE_KWH_CENTRALINA': None,  # Ultimo limite letto dalla centralina
+    'WB_PCAR': None,                # Potenza auto MISURATA dalla centralina (W)
+    'WB_PCAR_LETTO_IL': 0,          # Quando e' stata letta (per lo scarto se stantia)
+    'WB_ENERGIA_SESSIONE': 0,       # kWh della sessione corrente
+    'WB_TEMPO_SESSIONE': 0,
+    'WB_TEMP_PRESA': None,
+    'WB_TEMP_SCHEDA': None,
+    'WB_STATUS': '',
+    'WB_DESC': '',
+    'WB_ALG': '',
     'CENTRALINA_ONLINE': True,
     'SENSORE_ONLINE': True,
     'ERRORI_PARSING': 0,
@@ -349,7 +370,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Stato*\n"
         "/info - Stato attuale del sistema\n"
         "/energia - Riepilogo energetico di oggi\n"
-        "/grafici - Grafico real-time delle potenze\n"
+        "/grafici [15m|1h|6h|24h] - Grafico dell'andamento\n"
         "/fase - Rileva subito monofase/trifase\n\n"
         "*Controllo*\n"
         "/accendi - Forza l'accensione della Wallbox\n"
@@ -393,6 +414,27 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🛡️ *Protezione:* {protezione} W\n"
         f"🔋 *Limite carica:* {limite} kWh\n"
     )
+    # Dati letti direttamente dalla centralina
+    with STATO_LOCK:
+        desc = SYSTEM_STATE['WB_DESC']
+        pcar = SYSTEM_STATE['WB_PCAR']
+        sessione = SYSTEM_STATE['WB_ENERGIA_SESSIONE']
+        temp_presa = SYSTEM_STATE['WB_TEMP_PRESA']
+        alg = SYSTEM_STATE['WB_ALG']
+
+    if desc:
+        msg += f"\n🔎 *Centralina*\n🚙 Auto: {desc}\n"
+        if pcar is not None:
+            msg += f"📏 Potenza misurata: {pcar:.0f} W\n"
+        if sessione:
+            msg += f"🔋 Sessione: {sessione} kWh\n"
+        if temp_presa is not None:
+            msg += f"🌡️ Presa: {temp_presa:.0f} °C\n"
+
+    if alg and alg != CONFIG['ALG_MANUALE']:
+        nomi = {'0': 'Sole', '1': 'Eco', '2': 'Man', '3': 'Fast', '4': 'Alone'}
+        msg += (f"\n⚠️ Centralina in modalità *{nomi.get(alg, alg)}* invece di *Man*: "
+                f"i comandi di potenza non hanno effetto.\n")
     if not centralina_ok:
         msg += "\n⚠️ *Centralina non raggiungibile*\n"
     if not sensore_ok:
@@ -547,44 +589,77 @@ async def cmd_energia(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_grafici(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_auth(update): return
     
-    history = SYSTEM_STATE['ULTIME_LETTURE_FASI']
-    if not history or len(history) < 2:
-        await update.message.reply_text("⏳ Non ci sono ancora abbastanza dati per generare il grafico. Riprova tra poco.")
+    # Finestra temporale: /grafici [15m|1h|6h|24h], default 1h.
+    # Prima venive passato TUTTO il buffer (fino a 10000 punti, ~28 ore) con
+    # etichette "%H:%M:%S" senza data: matplotlib le trattava come categorie,
+    # quindi le 20:01 di ieri e di oggi finivano nella stessa colonna e la
+    # linea rimbalzava avanti e indietro creando una ragnatela illeggibile.
+    scelta = (context.args[0].lower() if context.args else '1h')
+    if scelta not in INTERVALLI:
+        await update.message.reply_text(
+            "⚠️ Intervallo non valido. Usa: `/grafici 15m`, `1h`, `6h` o `24h`", parse_mode='Markdown')
         return
 
-    await update.message.reply_text("📊 Generazione grafico in corso...")
+    punti = serie_storico(INTERVALLI[scelta], max_punti=400)
+    if len(punti) < 2:
+        await update.message.reply_text(
+            f"⏳ Non ci sono ancora abbastanza dati per l'intervallo {scelta}. Riprova tra poco.")
+        return
 
-    # Prepara i dati per matplotlib
-    times = [time.strftime("%H:%M:%S", time.localtime(h[3])) for h in history]
-    grid = [h[0] for h in history]
-    solar = [h[1] for h in history]
-    wb = [h[4] if len(h) > 4 else 0 for h in history]
+    await update.message.reply_text(f"📊 Generazione grafico ({scelta})...")
+    immagine = await asyncio.to_thread(genera_grafico, punti, scelta)
+    await update.message.reply_photo(photo=immagine)
 
-    # API a oggetti invece di pyplot: la figura non entra nel registro globale
-    # di pyplot, quindi non serve plt.close() e un'eccezione non lascia figure
-    # orfane in RAM a ogni /grafici (era un memory leak).
-    fig = Figure(figsize=(10, 5))
+def genera_grafico(punti, etichetta):
+    """Disegna il grafico e lo restituisce come PNG in memoria.
+
+    API a oggetti invece di pyplot: la figura non entra nel registro globale
+    di pyplot, quindi non serve close() e un'eccezione non lascia figure
+    orfane in RAM a ogni chiamata (era un memory leak).
+    """
+    # datetime reali sull'asse X, non stringhe: matplotlib li posiziona in
+    # scala temporale e i punti di giorni diversi non collidono piu'.
+    x = [datetime.datetime.fromtimestamp(p['time']) for p in punti]
+    grid = [p['grid'] for p in punti]
+    solar = [p['solar'] for p in punti]
+    wb = [p['wb'] for p in punti]
+
+    fig = Figure(figsize=(11, 5.5), dpi=110)
+    fig.patch.set_facecolor('#ffffff')
     ax = fig.subplots()
-    ax.plot(times, grid, label='Consumo Rete (W)', color='#ff6384', linewidth=2)
-    ax.fill_between(times, solar, color='#4bc0c0', alpha=0.2)
-    ax.plot(times, solar, label='Produzione Solare (W)', color='#4bc0c0', linewidth=2)
-    ax.fill_between(times, wb, color='#36a2eb', alpha=0.1)
-    ax.plot(times, wb, label='Potenza Wallbox (W)', color='#36a2eb', linewidth=2)
+    ax.set_facecolor('#fbfbfd')
 
-    ax.set_title("Andamento Energetico Real-Time")
-    ax.set_xlabel("Orario")
+    ax.fill_between(x, solar, color='#10b981', alpha=0.18)
+    ax.plot(x, solar, label='Produzione solare', color='#10b981', linewidth=2)
+    ax.fill_between(x, wb, color='#3b82f6', alpha=0.14)
+    ax.plot(x, wb, label='Potenza wallbox', color='#3b82f6', linewidth=2)
+    ax.plot(x, grid, label='Consumo rete', color='#ef4444', linewidth=1.8)
+
+    durata = punti[-1]['time'] - punti[0]['time']
+    ax.set_title(f"Andamento energetico — ultime {etichetta}", fontsize=13, fontweight='bold')
     ax.set_ylabel("Watt (W)")
-    ax.legend(loc="upper left")
-    ax.grid(True, linestyle='--', alpha=0.6)
+    ax.legend(loc="upper left", framealpha=0.9)
+    ax.grid(True, linestyle='--', alpha=0.35)
+    ax.set_ylim(bottom=0)
+
+    # Formato dell'ora scelto in base alla durata: oltre le 24h serve il giorno
+    if durata > 86400:
+        formato = '%d/%m %H:%M'
+    elif durata > 3600:
+        formato = '%H:%M'
+    else:
+        formato = '%H:%M:%S'
+    ax.xaxis.set_major_formatter(DateFormatter(formato))
     ax.xaxis.set_major_locator(MaxNLocator(8))
-    ax.tick_params(axis='x', rotation=45)
+    ax.tick_params(axis='x', rotation=30, labelsize=9)
+    for etichetta_x in ax.get_xticklabels():
+        etichetta_x.set_horizontalalignment('right')
     fig.tight_layout()
 
     buf = io.BytesIO()
     FigureCanvasAgg(fig).print_png(buf)
     buf.seek(0)
-
-    await update.message.reply_photo(photo=buf)
+    return buf
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Re-inizializzazione completa della centralina (ex /restart)."""
@@ -673,410 +748,571 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Solar Monitor - by Eric and Gemini</title>
+    <meta name="color-scheme" content="light dark">
+    <title>Solar Controller</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        body { font-family: 'Segoe UI', sans-serif; background: #f4f4f9; padding: 20px; color: #333; }
-        .container { max-width: 1000px; margin: 0 auto; }
-        .card { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 20px; }
-        h2 { margin-top: 0; color: #444; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; }
-        .stat { font-size: 1.2em; margin: 10px 0; }
-        .stat span { font-weight: bold; color: #007bff; }
-        .input-group { margin-bottom: 15px; }
-        label { display: block; margin-bottom: 5px; font-weight: bold; }
-        input[type="number"] { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
-        button { background: #28a745; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; width: 100%; font-size: 1em; }
-        button:hover { background: #218838; }
-        .btn-warning { background: #ffc107; color: #333; margin-top: 15px; }
-        .btn-warning:hover { background: #e0a800; }
-        .phase-box { display: flex; justify-content: space-between; border-bottom: 1px solid #eee; padding: 5px 0; }
-        .tot-box { display: flex; justify-content: space-between; background-color: #e9ecef; padding: 8px 5px; margin-top: 10px; border-radius: 4px; font-weight: bold; }
-        .status-on { color: green; font-weight: bold; }
-        .status-off { color: red; font-weight: bold; }
-        .time-ago { font-weight: normal !important; font-style: italic; color: #888 !important; font-size: 0.9em; margin-left: 5px; }
-        
-        /* Stile per la Console */
-        .console-box {
-            background: #1e1e1e;
-            color: #00ff00;
-            font-family: 'Courier New', Courier, monospace;
-            height: 250px;
-            overflow-y: scroll;
-            padding: 15px;
-            border-radius: 5px;
-            font-size: 0.9em;
-            line-height: 1.4;
-            white-space: pre-wrap;   /* i log arrivano come testo, non HTML */
+        :root {
+            --sfondo:      #f1f5f9;
+            --superficie:  #ffffff;
+            --superficie2: #f8fafc;
+            --bordo:       #e2e8f0;
+            --testo:       #0f172a;
+            --testo2:      #64748b;
+            --sole:        #10b981;
+            --auto:        #3b82f6;
+            --rete:        #ef4444;
+            --casa:        #f59e0b;
+            --ok:          #10b981;
+            --avviso:      #f59e0b;
+            --errore:      #ef4444;
+            --ombra:       0 1px 2px rgba(15,23,42,.06), 0 4px 12px rgba(15,23,42,.04);
+            --raggio:      14px;
+        }
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --sfondo:      #0b1120;
+                --superficie:  #131c31;
+                --superficie2: #1b2540;
+                --bordo:       #263149;
+                --testo:       #e8edf7;
+                --testo2:      #94a3b8;
+                --ombra:       0 1px 2px rgba(0,0,0,.4), 0 4px 16px rgba(0,0,0,.3);
+            }
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            padding: 20px 16px 48px;
+            background: var(--sfondo);
+            color: var(--testo);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+            font-size: 15px;
+            line-height: 1.5;
+            -webkit-font-smoothing: antialiased;
+        }
+        .wrap { max-width: 1120px; margin: 0 auto; }
+
+        /* ---------- intestazione ---------- */
+        .top {
+            display: flex; align-items: center; justify-content: space-between;
+            gap: 16px; flex-wrap: wrap; margin-bottom: 22px;
+        }
+        .top h1 { margin: 0; font-size: 1.45rem; font-weight: 650; letter-spacing: -.02em; }
+        .top .sub { color: var(--testo2); font-size: .85rem; margin-top: 2px; }
+        .pillole { display: flex; gap: 8px; flex-wrap: wrap; }
+        .pillola {
+            display: inline-flex; align-items: center; gap: 6px;
+            background: var(--superficie); border: 1px solid var(--bordo);
+            padding: 6px 13px; border-radius: 999px; font-size: .82rem; font-weight: 500;
+        }
+        .punto { width: 8px; height: 8px; border-radius: 50%; background: var(--testo2); flex: none; }
+        .punto.on   { background: var(--ok);     box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); }
+        .punto.off  { background: var(--testo2); }
+        .punto.warn { background: var(--avviso); box-shadow: 0 0 0 3px color-mix(in srgb, var(--avviso) 22%, transparent); }
+        .punto.err  { background: var(--errore); box-shadow: 0 0 0 3px color-mix(in srgb, var(--errore) 22%, transparent); }
+
+        /* ---------- struttura ---------- */
+        .card {
+            background: var(--superficie); border: 1px solid var(--bordo);
+            border-radius: var(--raggio); padding: 20px; box-shadow: var(--ombra);
+            margin-bottom: 16px;
+        }
+        .card h2 {
+            margin: 0 0 16px; font-size: .78rem; font-weight: 650;
+            text-transform: uppercase; letter-spacing: .07em; color: var(--testo2);
+        }
+        .colonne { display: grid; grid-template-columns: 1.35fr 1fr; gap: 16px; align-items: start; }
+        @media (max-width: 860px) { .colonne { grid-template-columns: 1fr; } }
+
+        /* ---------- flusso di potenza ---------- */
+        .flusso { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+        @media (max-width: 620px) { .flusso { grid-template-columns: repeat(2, 1fr); } }
+        .nodo {
+            background: var(--superficie2); border: 1px solid var(--bordo);
+            border-radius: 12px; padding: 14px 12px; text-align: center; position: relative;
+        }
+        .nodo .ico { font-size: 1.3rem; line-height: 1; }
+        .nodo .val { font-size: 1.45rem; font-weight: 680; margin-top: 7px; letter-spacing: -.02em;
+                     font-variant-numeric: tabular-nums; }
+        .nodo .um  { font-size: .74rem; font-weight: 500; color: var(--testo2); margin-left: 2px; }
+        .nodo .lab { font-size: .76rem; color: var(--testo2); margin-top: 3px; }
+        .nodo.sole .val { color: var(--sole); }
+        .nodo.auto .val { color: var(--auto); }
+        .nodo.rete .val { color: var(--rete); }
+        .nodo.casa .val { color: var(--casa); }
+
+        /* ---------- riquadri energia ---------- */
+        .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; }
+        .tile { background: var(--superficie2); border: 1px solid var(--bordo);
+                border-radius: 11px; padding: 13px; }
+        .tile .v { font-size: 1.25rem; font-weight: 660; letter-spacing: -.02em;
+                   font-variant-numeric: tabular-nums; }
+        .tile .l { font-size: .74rem; color: var(--testo2); margin-top: 3px; }
+
+        .eff { margin-top: 18px; }
+        .eff-top { display: flex; justify-content: space-between; align-items: baseline;
+                   font-size: .84rem; margin-bottom: 7px; }
+        .eff-top b { font-size: 1.3rem; font-weight: 680; color: var(--sole);
+                     font-variant-numeric: tabular-nums; }
+        .barra { height: 9px; background: var(--superficie2); border: 1px solid var(--bordo);
+                 border-radius: 999px; overflow: hidden; }
+        .barra > i { display: block; height: 100%; width: 0;
+                     background: linear-gradient(90deg, var(--casa), var(--sole));
+                     transition: width .5s ease; }
+
+        /* ---------- moduli ---------- */
+        .campo { margin-bottom: 15px; }
+        .campo label { display: block; font-size: .82rem; font-weight: 550;
+                       color: var(--testo2); margin-bottom: 6px; }
+        input[type=number], input[type=range] {
+            width: 100%; font-family: inherit; font-size: .95rem;
+        }
+        input[type=number] {
+            padding: 9px 11px; border: 1px solid var(--bordo); border-radius: 9px;
+            background: var(--superficie2); color: var(--testo);
+            font-variant-numeric: tabular-nums;
+        }
+        input[type=number]:focus {
+            outline: none; border-color: var(--auto);
+            box-shadow: 0 0 0 3px color-mix(in srgb, var(--auto) 18%, transparent);
+        }
+        input[type=range] { accent-color: var(--auto); cursor: pointer; margin: 4px 0; }
+
+        .switch { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+                  padding: 11px 13px; background: var(--superficie2);
+                  border: 1px solid var(--bordo); border-radius: 11px; margin-bottom: 15px; }
+        .switch .txt { font-size: .88rem; font-weight: 550; }
+        .switch .txt small { display: block; font-weight: 400; color: var(--testo2); font-size: .75rem; }
+        .switch input { width: 44px; height: 25px; appearance: none; background: var(--bordo);
+                        border-radius: 999px; position: relative; cursor: pointer;
+                        transition: background .2s; flex: none; }
+        .switch input:checked { background: var(--sole); }
+        .switch input::after { content: ""; position: absolute; top: 3px; left: 3px;
+                               width: 19px; height: 19px; background: #fff; border-radius: 50%;
+                               transition: transform .2s; }
+        .switch input:checked::after { transform: translateX(19px); }
+
+        button {
+            font-family: inherit; font-size: .9rem; font-weight: 560; cursor: pointer;
+            border: 1px solid transparent; border-radius: 10px; padding: 10px 16px;
+            transition: filter .15s, background .15s;
+        }
+        button:hover { filter: brightness(1.06); }
+        button:active { filter: brightness(.95); }
+        .b-primario { background: var(--auto); color: #fff; width: 100%; }
+        .b-secondario { background: var(--superficie2); color: var(--testo);
+                        border-color: var(--bordo); width: 100%; margin-top: 9px; }
+
+        .nota { font-size: .76rem; color: var(--testo2); margin-top: 6px; }
+        .esito { margin-top: 13px; padding: 10px 13px; border-radius: 9px;
+                 font-size: .84rem; white-space: pre-line; }
+        .esito.ok { background: color-mix(in srgb, var(--ok) 14%, transparent); color: var(--ok); }
+        .esito.ko { background: color-mix(in srgb, var(--errore) 14%, transparent); color: var(--errore); }
+
+        .avviso-box {
+            display: flex; gap: 9px; align-items: flex-start;
+            background: color-mix(in srgb, var(--avviso) 13%, transparent);
+            border: 1px solid color-mix(in srgb, var(--avviso) 32%, transparent);
+            color: var(--testo); padding: 11px 13px; border-radius: 10px;
+            font-size: .84rem; margin-bottom: 10px;
         }
 
-        /* --- Elementi aggiunti --- */
-        .nota { font-size: 0.82em; color: #777; margin-top: 6px; font-style: italic; }
-        .toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-        .toggle-row label { margin-bottom: 0; }
-        .toggle-row input[type="checkbox"] { width: 20px; height: 20px; cursor: pointer; }
-        input[type="range"] { width: 100%; cursor: pointer; }
+        /* ---------- fasi ---------- */
+        .fase-riga { display: flex; justify-content: space-between; align-items: center;
+                     padding: 8px 0; border-bottom: 1px solid var(--bordo); font-size: .88rem; }
+        .fase-riga:last-child { border-bottom: none; }
+        .fase-riga .n { color: var(--testo2); font-weight: 500; }
+        .fase-riga .w { font-variant-numeric: tabular-nums; font-weight: 560; }
+        .fase-tot { display: flex; justify-content: space-between; margin-top: 9px;
+                    padding: 10px 12px; background: var(--superficie2);
+                    border-radius: 9px; font-weight: 620; font-size: .9rem; }
+        .fase-tot .w { font-variant-numeric: tabular-nums; }
 
-        .esito { margin-top: 12px; padding: 10px; border-radius: 4px; font-size: 0.9em; white-space: pre-line; }
-        .esito.ok { background: #d4edda; color: #155724; }
-        .esito.ko { background: #f8d7da; color: #721c24; }
+        /* ---------- grafico ---------- */
+        .intervalli { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
+        .i-btn { background: var(--superficie2); color: var(--testo2);
+                 border: 1px solid var(--bordo); padding: 6px 14px;
+                 border-radius: 999px; font-size: .82rem; width: auto; }
+        .i-btn.attivo { background: var(--auto); color: #fff; border-color: var(--auto); }
+        .grafico-box { position: relative; height: 320px; }
 
-        .grid-energia { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
-        .tile { background: #f8f9fa; border-radius: 8px; padding: 14px; text-align: center; }
-        .tile-val { font-size: 1.5em; font-weight: bold; color: #007bff; }
-        .tile-lab { font-size: 0.8em; color: #666; margin-top: 4px; }
-
-        .eff-wrap { margin-top: 18px; }
-        .eff-head { display: flex; justify-content: space-between; margin-bottom: 6px; font-size: 0.95em; }
-        .eff-bar { background: #e9ecef; border-radius: 10px; height: 20px; overflow: hidden; }
-        .eff-fill { background: linear-gradient(90deg, #ffc107, #28a745); height: 100%; width: 0%; transition: width .4s; }
-
-        .range-bar { display: flex; gap: 8px; margin-bottom: 12px; }
-        .range-btn { width: auto; padding: 6px 16px; background: #e9ecef; color: #555; font-size: 0.9em; }
-        .range-btn:hover { background: #dde1e5; }
-        .range-btn.attivo { background: #007bff; color: white; }
-        .range-btn.attivo:hover { background: #0069d9; }
-
-        .allarme { background: #fff3cd; color: #856404; padding: 8px; border-radius: 4px; margin: 8px 0; font-size: 0.9em; }
+        /* ---------- console ---------- */
+        .console {
+            background: #0a0f1c; color: #4ade80; border: 1px solid var(--bordo);
+            font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+            height: 240px; overflow-y: auto; padding: 14px; border-radius: 11px;
+            font-size: .78rem; line-height: 1.65; white-space: pre-wrap; word-break: break-word;
+        }
+        .meta { display: flex; justify-content: space-between; font-size: .76rem;
+                color: var(--testo2); margin-top: 12px; flex-wrap: wrap; gap: 8px; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>☀️ Solar Controller</h1>
-        
-        <div class="grid">
+<div class="wrap">
+
+    <div class="top">
+        <div>
+            <h1>Solar Controller</h1>
+            <div class="sub">Regolazione della ricarica da surplus fotovoltaico</div>
+        </div>
+        <div class="pillole">
+            <span class="pillola"><span class="punto" id="p_wb"></span><span id="t_wb">--</span></span>
+            <span class="pillola"><span class="punto" id="p_auto"></span><span id="t_auto">--</span></span>
+            <span class="pillola"><span class="punto" id="p_fase"></span><span id="t_fase">--</span></span>
+        </div>
+    </div>
+
+    <div id="avvisi"></div>
+
+    <div class="card">
+        <h2>Flusso di potenza</h2>
+        <div class="flusso">
+            <div class="nodo sole"><div class="ico">☀️</div><div class="val"><span id="f_sole">0</span><span class="um">W</span></div><div class="lab">Produzione</div></div>
+            <div class="nodo casa"><div class="ico">🏠</div><div class="val"><span id="f_casa">0</span><span class="um">W</span></div><div class="lab">Casa</div></div>
+            <div class="nodo auto"><div class="ico">🚗</div><div class="val"><span id="f_auto">0</span><span class="um">W</span></div><div class="lab" id="f_auto_lab">Wallbox</div></div>
+            <div class="nodo rete"><div class="ico">⚡</div><div class="val"><span id="f_rete">0</span><span class="um">W</span></div><div class="lab">Rete</div></div>
+        </div>
+        <div class="meta">
+            <span>Fasi aggiornate: <span id="last_fasi">--</span> <span id="sec_fasi"></span></span>
+            <span>Solare aggiornato: <span id="last_solar">--</span> <span id="sec_solar"></span></span>
+        </div>
+    </div>
+
+    <div class="colonne">
+        <div>
             <div class="card">
-                <h2>⚙️ Impostazioni</h2>
-                <!-- Nessun attributo value= hard-coded: i valori arrivano dal
-                     server in fetchData(), altrimenti la pagina mostrerebbe
-                     sempre i default anche dopo un salvataggio. -->
-                <div class="input-group">
-                    <label>Potenza Prelevabile (W)</label>
-                    <input type="number" id="prelevabile" oninput="marcaSporco(event)">
-                    <div class="nota" id="nota_eco" hidden>Ignorata: modalità Eco attiva</div>
+                <h2>Energia di oggi</h2>
+                <div class="tiles">
+                    <div class="tile"><div class="v" id="e_solare">--</div><div class="l">☀️ Prodotta (kWh)</div></div>
+                    <div class="tile"><div class="v" id="e_import">--</div><div class="l">⚡ Importata (kWh)</div></div>
+                    <div class="tile"><div class="v" id="e_export">--</div><div class="l">↗️ Esportata (kWh)</div></div>
+                    <div class="tile"><div class="v" id="e_wb">--</div><div class="l">🚗 In auto (kWh)</div></div>
+                    <div class="tile"><div class="v" id="e_wb_fv">--</div><div class="l">🌱 Da solare (kWh)</div></div>
+                    <div class="tile"><div class="v" id="e_tempo">--</div><div class="l">⏱️ Carica (min)</div></div>
                 </div>
-                <div class="input-group">
-                    <label>Potenza Protezione (W)</label>
-                    <input type="number" id="protezione" oninput="marcaSporco(event)">
+                <div class="eff">
+                    <div class="eff-top"><span>Efficienza di carica</span><b id="e_eff">--</b></div>
+                    <div class="barra"><i id="e_eff_bar"></i></div>
+                    <div class="nota" id="nota_stima">Quota di ricarica coperta dal fotovoltaico.</div>
                 </div>
-                <div class="input-group">
-                    <label>🔋 Limite di carica: <span id="limite_val">--</span> kWh</label>
-                    <input type="range" id="limite" min="1" max="100" step="1"
-                           oninput="marcaSporco(event); document.getElementById('limite_val').innerText = this.value;">
-                    <div class="nota" id="nota_limite" hidden>
-                        Comando centralina non ancora configurato: il valore viene salvato ma non inviato.
+            </div>
+
+            <div class="card">
+                <h2>Andamento</h2>
+                <div class="intervalli">
+                    <button class="i-btn attivo" data-r="live" onclick="cambiaRange('live')">Live</button>
+                    <button class="i-btn" data-r="1h"  onclick="cambiaRange('1h')">1 ora</button>
+                    <button class="i-btn" data-r="6h"  onclick="cambiaRange('6h')">6 ore</button>
+                    <button class="i-btn" data-r="24h" onclick="cambiaRange('24h')">24 ore</button>
+                </div>
+                <div class="grafico-box"><canvas id="grafico"></canvas></div>
+            </div>
+
+            <div class="card">
+                <h2>Dettaglio fasi</h2>
+                <div class="colonne" style="gap:22px">
+                    <div>
+                        <div class="fase-riga"><span class="n">L1 rete</span><span class="w"><span id="l1">0</span> W</span></div>
+                        <div class="fase-riga"><span class="n">L2 rete</span><span class="w"><span id="l2">0</span> W</span></div>
+                        <div class="fase-riga"><span class="n">L3 rete</span><span class="w"><span id="l3">0</span> W</span></div>
+                        <div class="fase-tot"><span>Totale rete</span><span class="w"><span id="tot_grid">0</span> W</span></div>
+                    </div>
+                    <div>
+                        <div class="fase-riga"><span class="n">L4 solare</span><span class="w"><span id="l4">0</span> W</span></div>
+                        <div class="fase-riga"><span class="n">L5 solare</span><span class="w"><span id="l5">0</span> W</span></div>
+                        <div class="fase-riga"><span class="n">L6 solare</span><span class="w"><span id="l6">0</span> W</span></div>
+                        <div class="fase-tot"><span>Totale solare</span><span class="w"><span id="tot_solar">0</span> W</span></div>
                     </div>
                 </div>
-                <div class="input-group toggle-row">
-                    <label for="eco">🌱 Modalità Eco (solo surplus)</label>
+            </div>
+        </div>
+
+        <div>
+            <div class="card">
+                <h2>Impostazioni</h2>
+
+                <div class="switch">
+                    <div class="txt">Modalità Eco<small>Carica solo con surplus solare</small></div>
                     <input type="checkbox" id="eco" onchange="marcaSporco(event)">
                 </div>
-                <button onclick="updateSettings()">Salva Impostazioni</button>
-                <button class="btn-warning" onclick="reinitWallbox()">🔄 Re-Inizializza Wallbox</button>
+
+                <div class="campo">
+                    <label for="prelevabile">Potenza prelevabile dalla rete (W)</label>
+                    <input type="number" id="prelevabile" min="0" max="20000" oninput="marcaSporco(event)">
+                    <div class="nota" id="nota_eco" hidden>Ignorata mentre la modalità Eco è attiva.</div>
+                </div>
+
+                <div class="campo">
+                    <label for="protezione">Soglia di protezione (W)</label>
+                    <input type="number" id="protezione" min="50" max="5000" oninput="marcaSporco(event)">
+                    <div class="nota">Variazioni più piccole non vengono inviate alla centralina.</div>
+                </div>
+
+                <div class="campo">
+                    <label for="limite">Energia da caricare — <b id="limite_val">--</b> kWh</label>
+                    <input type="range" id="limite" min="1" max="100" step="1"
+                           oninput="marcaSporco(event); document.getElementById('limite_val').textContent = this.value;">
+                    <div class="nota" id="nota_limite" hidden></div>
+                </div>
+
+                <button class="b-primario" onclick="salva()">Salva impostazioni</button>
+                <button class="b-secondario" onclick="reinit()">🔄 Re-inizializza wallbox</button>
                 <div id="esito" class="esito" hidden></div>
             </div>
 
             <div class="card">
-                <h2>🔌 Stato Sistema</h2>
-                <div class="stat">Wallbox: <span id="wb_status">--</span></div>
-                <div class="stat">Potenza WB: <span id="wb_power">0</span> W</div>
-                <div class="stat">Modalità: <span id="wb_mode">--</span></div>
-                <div class="stat">Eco: <span id="eco_stato">--</span></div>
-                <div id="allarmi"></div>
-                <div class="stat" style="font-size: 0.9em; color: #666;">Ultimo Agg. Fasi: <span id="last_fasi">--</span> <span id="sec_fasi" class="time-ago"></span></div>
-                <div class="stat" style="font-size: 0.9em; color: #666;">Ultimo Agg. Solare: <span id="last_solar">--</span> <span id="sec_solar" class="time-ago"></span></div>
+                <h2>Centralina</h2>
+                <div class="fase-riga"><span class="n">Stato</span><span class="w" id="c_desc">--</span></div>
+                <div class="fase-riga"><span class="n">Potenza impostata</span><span class="w"><span id="c_set">0</span> W</span></div>
+                <div class="fase-riga"><span class="n">Potenza misurata</span><span class="w"><span id="c_pcar">--</span> W</span></div>
+                <div class="fase-riga"><span class="n">Sessione</span><span class="w"><span id="c_sess">--</span> kWh</span></div>
+                <div class="fase-riga"><span class="n">Temperatura presa</span><span class="w"><span id="c_temp">--</span> °C</span></div>
+                <div class="fase-riga"><span class="n">Limite impostato</span><span class="w" id="c_limite">--</span></div>
             </div>
-        </div>
 
-        <div class="card">
-            <h2>⚡ Energia di Oggi</h2>
-            <div class="grid-energia">
-                <div class="tile"><div class="tile-val" id="e_solare">--</div><div class="tile-lab">☀️ Prodotta (kWh)</div></div>
-                <div class="tile"><div class="tile-val" id="e_import">--</div><div class="tile-lab">🔌 Importata (kWh)</div></div>
-                <div class="tile"><div class="tile-val" id="e_export">--</div><div class="tile-lab">↗️ Esportata (kWh)</div></div>
-                <div class="tile"><div class="tile-val" id="e_wb">--</div><div class="tile-lab">🚗 In auto (kWh)*</div></div>
-                <div class="tile"><div class="tile-val" id="e_wb_fv">--</div><div class="tile-lab">🌱 Da fotovoltaico (kWh)</div></div>
-                <div class="tile"><div class="tile-val" id="e_tempo">--</div><div class="tile-lab">⏱️ Carica (min)</div></div>
+            <div class="card">
+                <h2>Console</h2>
+                <div id="console" class="console"></div>
             </div>
-            <div class="eff-wrap">
-                <div class="eff-head">Efficienza di carica <strong id="e_eff">--</strong></div>
-                <div class="eff-bar"><div class="eff-fill" id="e_eff_bar"></div></div>
-            </div>
-            <div class="nota">* La potenza della wallbox è il valore <em>comandato</em> alla centralina,
-               non una misura: i kWh in auto e l'efficienza sono una stima.</div>
-        </div>
-
-        <div class="card">
-            <h2>⚡ Dettaglio Fasi</h2>
-            <div class="grid">
-                <div>
-                    <h3>Consumo Rete (Grid)</h3>
-                    <div class="phase-box"><span>L1:</span> <span><span id="l1">0</span> W</span></div>
-                    <div class="phase-box"><span>L2:</span> <span><span id="l2">0</span> W</span></div>
-                    <div class="phase-box"><span>L3:</span> <span><span id="l3">0</span> W</span></div>
-                    <div class="tot-box"><span>TOTALE RETE:</span> <span><span id="tot_grid">0</span> W</span></div>
-                </div>
-                <div>
-                    <h3>Produzione (Solar)</h3>
-                    <div class="phase-box"><span>L4:</span> <span><span id="l4">0</span> W</span></div>
-                    <div class="phase-box"><span>L5:</span> <span><span id="l5">0</span> W</span></div>
-                    <div class="phase-box"><span>L6:</span> <span><span id="l6">0</span> W</span></div>
-                    <div class="tot-box"><span>TOTALE SOLARE:</span> <span><span id="tot_solar">0</span> W</span></div>
-                </div>
-            </div>
-        </div>
-
-        <div class="card">
-            <h2>📈 Grafico Andamento</h2>
-            <div class="range-bar">
-                <button class="range-btn attivo" data-range="live" onclick="cambiaRange('live')">Live</button>
-                <button class="range-btn" data-range="1h"  onclick="cambiaRange('1h')">1h</button>
-                <button class="range-btn" data-range="6h"  onclick="cambiaRange('6h')">6h</button>
-                <button class="range-btn" data-range="24h" onclick="cambiaRange('24h')">24h</button>
-            </div>
-            <canvas id="energyChart"></canvas>
-        </div>
-
-        <div class="card">
-            <h2>🖥️ Console Live</h2>
-            <div id="console" class="console-box"></div>
         </div>
     </div>
+</div>
 
-    <script>
-        const ctx = document.getElementById('energyChart').getContext('2d');
-        const chart = new Chart(ctx, {
-            type: 'line',
-            data: {
-                labels: [],
-                datasets: [{
-                    label: 'Consumo Rete (W)',
-                    borderColor: 'rgb(255, 99, 132)',
-                    data: [],
-                    fill: false,
-                    tension: 0.1
-                }, {
-                    label: 'Produzione Solare (W)',
-                    borderColor: 'rgb(75, 192, 192)',
-                    data: [],
-                    fill: true,
-                    backgroundColor: 'rgba(75, 192, 192, 0.2)',
-                    tension: 0.1
-                }, {
-                    label: 'Potenza Wallbox (W)',
-                    borderColor: 'rgb(54, 162, 235)',
-                    data: [],
-                    fill: true,
-                    backgroundColor: 'rgba(54, 162, 235, 0.1)',
-                    tension: 0.1
-                }]
-            },
-            options: {
-                responsive: true,
-                scales: { 
-                    x: { display: false },
-                    y: { beginAtZero: true }
-                },
-                animation: { duration: 0 }
-            }
+<script>
+const $ = id => document.getElementById(id);
+const num = v => (v === null || v === undefined) ? '--' : Math.round(v).toLocaleString('it-IT');
+
+/* I campi non vanno sovrascritti dal polling se l'utente ci sta scrivendo
+   (activeElement) o ha gia' modificato senza salvare (sporchi). */
+const sporchi = new Set();
+function marcaSporco(e) { sporchi.add(e.target.id); }
+
+function setCampo(id, valore) {
+    const el = $(id);
+    if (!el || document.activeElement === el || sporchi.has(id)) return;
+    if (el.type === 'checkbox') el.checked = !!valore; else el.value = valore;
+}
+
+function esito(testo, ok) {
+    const b = $('esito');
+    b.textContent = testo;
+    b.className = 'esito ' + (ok ? 'ok' : 'ko');
+    b.hidden = false;
+    if (ok) setTimeout(() => { b.hidden = true; }, 4000);
+}
+
+function stile() {
+    const c = getComputedStyle(document.documentElement);
+    return {
+        sole: c.getPropertyValue('--sole').trim(),
+        auto: c.getPropertyValue('--auto').trim(),
+        rete: c.getPropertyValue('--rete').trim(),
+        testo2: c.getPropertyValue('--testo2').trim(),
+        bordo: c.getPropertyValue('--bordo').trim()
+    };
+}
+
+const col = stile();
+const grafico = new Chart($('grafico').getContext('2d'), {
+    type: 'line',
+    data: { labels: [], datasets: [
+        { label: 'Solare', borderColor: col.sole, backgroundColor: col.sole + '26',
+          data: [], fill: true, tension: .3, pointRadius: 0, borderWidth: 2 },
+        { label: 'Wallbox', borderColor: col.auto, backgroundColor: col.auto + '1f',
+          data: [], fill: true, tension: .3, pointRadius: 0, borderWidth: 2 },
+        { label: 'Rete', borderColor: col.rete, backgroundColor: 'transparent',
+          data: [], fill: false, tension: .3, pointRadius: 0, borderWidth: 1.8 }
+    ]},
+    options: {
+        responsive: true, maintainAspectRatio: false, animation: { duration: 0 },
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+            legend: { labels: { color: col.testo2, usePointStyle: true, pointStyle: 'line',
+                                boxWidth: 22, font: { size: 12 } } },
+            tooltip: { callbacks: { label: c => c.dataset.label + ': ' + num(c.parsed.y) + ' W' } }
+        },
+        scales: {
+            x: { ticks: { color: col.testo2, maxTicksLimit: 8, font: { size: 11 } },
+                 grid: { color: col.bordo, drawTicks: false } },
+            y: { beginAtZero: true, ticks: { color: col.testo2, font: { size: 11 },
+                 callback: v => num(v) }, grid: { color: col.bordo, drawTicks: false } }
+        }
+    }
+});
+
+function oraDi(ts) {
+    if (!ts) return '--';
+    return new Date(ts * 1000).toLocaleTimeString('it-IT');
+}
+
+function disegna(punti) {
+    const lungo = punti.length > 1 && (punti[punti.length-1].time - punti[0].time) > 86400;
+    grafico.data.labels = punti.map(p => {
+        const d = new Date(p.time * 1000);
+        return lungo ? d.toLocaleString('it-IT', {day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit'})
+                     : d.toLocaleTimeString('it-IT', {hour:'2-digit', minute:'2-digit'});
+    });
+    grafico.data.datasets[0].data = punti.map(p => p.solar);
+    grafico.data.datasets[1].data = punti.map(p => p.wb);
+    grafico.data.datasets[2].data = punti.map(p => p.grid);
+    grafico.update();
+}
+
+let range = 'live';
+async function cambiaRange(r) {
+    range = r;
+    document.querySelectorAll('.i-btn').forEach(b => b.classList.toggle('attivo', b.dataset.r === r));
+    if (r === 'live') { aggiorna(); return; }
+    try {
+        const res = await fetch('/api/storico?range=' + r);
+        const d = await res.json();
+        if (d.success) disegna(d.punti);
+    } catch (e) { console.error(e); }
+}
+
+function pillola(punto, testo, stato, etichetta) {
+    $(punto).className = 'punto ' + stato;
+    $(testo).textContent = etichetta;
+}
+
+async function aggiorna() {
+    let d;
+    try {
+        d = await (await fetch('/api/data')).json();
+    } catch (e) { return; }
+
+    const s = d.status, c = d.config, en = d.energia || {};
+
+    /* --- pillole di stato --- */
+    pillola('p_wb', 't_wb', s.wb_on ? 'on' : 'off', s.wb_on ? 'Wallbox attiva' : 'Wallbox ferma');
+    const collegata = s.wb_status && s.wb_status !== '0';
+    pillola('p_auto', 't_auto', collegata ? 'on' : 'off', s.wb_desc || 'Auto: --');
+    pillola('p_fase', 't_fase', 'on', s.fase_mode === 1 ? 'Trifase' : 'Monofase');
+
+    /* --- avvisi --- */
+    const av = [];
+    if (!s.centralina_online) av.push('⚠️ Centralina non raggiungibile: i comandi non arrivano.');
+    if (!s.sensore_online)    av.push('📡 Nessun dato dal sensore: la regolazione è ferma sull\\'ultimo valore.');
+    if (s.manual_off)         av.push('✋ Override manuale attivo. Usa /accendi su Telegram per riprendere.');
+    if (s.alg_manuale === false) av.push('⚙️ La centralina non è in modalità "Man": i comandi di potenza vengono ignorati.');
+    const boxAv = $('avvisi');
+    boxAv.textContent = '';
+    av.forEach(t => {
+        const el = document.createElement('div');
+        el.className = 'avviso-box';
+        el.textContent = t;
+        boxAv.appendChild(el);
+    });
+
+    /* --- flusso di potenza --- */
+    const solare = s.solar_total || 0;
+    const wbW = (s.wb_pcar !== null && s.wb_pcar !== undefined) ? s.wb_pcar
+                                                                : (s.wb_on ? s.wb_power : 0);
+    const casa = Math.max(0, (s.grid_total || 0) - wbW);
+    $('f_sole').textContent = num(solare);
+    $('f_casa').textContent = num(casa);
+    $('f_auto').textContent = num(wbW);
+    $('f_rete').textContent = num(Math.abs((s.grid_total || 0) - solare));
+    $('f_auto_lab').textContent = (s.wb_pcar !== null && s.wb_pcar !== undefined)
+        ? 'Wallbox (misurata)' : 'Wallbox (stimata)';
+
+    $('last_fasi').textContent = oraDi(s.last_fasi);
+    $('sec_fasi').textContent = s.last_fasi ? '(' + Math.max(0, Math.round(s.server_time - s.last_fasi)) + 's fa)' : '';
+    $('last_solar').textContent = oraDi(s.last_solar);
+    $('sec_solar').textContent = s.last_solar ? '(' + Math.max(0, Math.round(s.server_time - s.last_solar)) + 's fa)' : '';
+
+    /* --- fasi --- */
+    (s.fasi || []).forEach((v, i) => { const el = $('l' + (i + 1)); if (el) el.textContent = num(v); });
+    $('tot_grid').textContent = num(s.grid_total);
+    $('tot_solar').textContent = num(s.solar_total);
+
+    /* --- centralina --- */
+    $('c_desc').textContent = s.wb_desc || '--';
+    $('c_set').textContent = num(s.wb_power);
+    $('c_pcar').textContent = num(s.wb_pcar);
+    $('c_sess').textContent = (s.wb_energia_sessione ?? '--');
+    $('c_temp').textContent = (s.wb_temp_presa ?? '--');
+    $('c_limite').textContent = (s.limite_centralina === '0' || s.limite_centralina === 0)
+        ? 'nessuno' : (s.limite_centralina ?? '--') + ' kWh';
+
+    /* --- energia --- */
+    const set = (id, v) => { $(id).textContent = (v === null || v === undefined) ? '--' : v; };
+    set('e_solare', en.solare_kwh); set('e_import', en.rete_importata_kwh);
+    set('e_export', en.rete_esportata_kwh); set('e_wb', en.wallbox_kwh);
+    set('e_wb_fv', en.wallbox_da_fv_kwh); set('e_tempo', en.minuti_carica);
+    const eff = en.efficienza;
+    $('e_eff').textContent = (eff === null || eff === undefined) ? '--' : eff + '%';
+    $('e_eff_bar').style.width = ((eff === null || eff === undefined) ? 0 : eff) + '%';
+    $('nota_stima').textContent = (s.wb_pcar !== null && s.wb_pcar !== undefined)
+        ? 'Quota di ricarica coperta dal fotovoltaico (potenza misurata dalla centralina).'
+        : 'Quota di ricarica coperta dal fotovoltaico. Valori stimati: la centralina non riporta la potenza misurata.';
+
+    /* --- impostazioni --- */
+    setCampo('prelevabile', c.prelevabile);
+    setCampo('protezione', c.protezione);
+    setCampo('eco', c.eco);
+    setCampo('limite', c.limite);
+    $('limite_val').textContent = $('limite').value || c.limite;
+    $('nota_eco').hidden = !c.eco;
+    const nl = $('nota_limite');
+    nl.hidden = !!s.limite_supportato;
+    if (!s.limite_supportato) nl.textContent = 'Comando non configurato: il valore viene salvato ma non inviato alla centralina.';
+
+    /* --- console --- */
+    const cons = $('console');
+    const giu = cons.scrollHeight - cons.clientHeight <= cons.scrollTop + 6;
+    cons.textContent = (d.logs || []).join('\\n');   /* textContent: niente markup interpretato */
+    if (giu) cons.scrollTop = cons.scrollHeight;
+
+    if (range === 'live') disegna(d.history || []);
+}
+
+async function salva() {
+    const payload = {}, errori = [];
+    const leggi = (id, etichetta) => {
+        const raw = $(id).value.trim();
+        if (raw === '') { errori.push(etichetta + ': campo vuoto'); return; }
+        const v = Number(raw);
+        if (!Number.isFinite(v)) { errori.push(etichetta + ': valore non numerico'); return; }
+        payload[id] = Math.round(v);
+    };
+    leggi('prelevabile', 'Potenza prelevabile');
+    leggi('protezione', 'Soglia di protezione');
+    payload.limite = Number($('limite').value);
+    payload.eco = $('eco').checked;
+    if (errori.length) { esito('Correggi:\\n' + errori.join('\\n'), false); return; }
+
+    try {
+        const r = await fetch('/api/settings', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
         });
-
-        function formatTime(timestamp) {
-            if (!timestamp) return "Mai";
-            const date = new Date(timestamp * 1000);
-            return date.toLocaleTimeString();
+        const res = await r.json().catch(() => ({}));
+        if (!r.ok || !res.success) {
+            esito('Salvataggio non riuscito:\\n' + (res.errori || ['errore sconosciuto']).join('\\n'), false);
+            return;
         }
+        sporchi.clear();
+        esito('Impostazioni salvate.', true);
+        aggiorna();
+    } catch (e) { esito('Errore di rete: ' + e, false); }
+}
 
-        // --- Ciclo di vita dei campi ------------------------------------
-        // Un campo non va sovrascritto dal polling se l'utente ci sta
-        // scrivendo (activeElement) o se ha gia' scritto e non ha ancora
-        // salvato (campiSporchi).
-        const campiSporchi = new Set();
-        function marcaSporco(e) { campiSporchi.add(e.target.id); }
+async function reinit() {
+    if (!confirm('Forzare la re-inizializzazione della wallbox?')) return;
+    try {
+        const r = await fetch('/api/init_wallbox', { method: 'POST' });
+        const res = await r.json();
+        if (r.ok && res.success) { esito('Re-inizializzazione avviata. Segui l\\'esito nella console.', true); aggiorna(); }
+        else esito('Errore: ' + (res.error || 'comando non riuscito'), false);
+    } catch (e) { esito('Errore di rete: ' + e, false); }
+}
 
-        function aggiornaCampo(id, valore) {
-            const el = document.getElementById(id);
-            if (!el) return;
-            if (document.activeElement === el) return;
-            if (campiSporchi.has(id)) return;
-            if (el.type === 'checkbox') el.checked = !!valore;
-            else el.value = valore;
-        }
-
-        function mostraEsito(testo, ok) {
-            const box = document.getElementById('esito');
-            box.textContent = testo;
-            box.className = 'esito ' + (ok ? 'ok' : 'ko');
-            box.hidden = false;
-            if (ok) setTimeout(() => { box.hidden = true; }, 4000);
-        }
-
-        async function fetchData() {
-            try {
-                const response = await fetch('/api/data');
-                const data = await response.json();
-
-                // I valori REALI del server finiscono in .value (non nel
-                // placeholder, che resta invisibile se il campo ha un valore).
-                aggiornaCampo('prelevabile', data.config.prelevabile);
-                aggiornaCampo('protezione', data.config.protezione);
-                aggiornaCampo('eco', data.config.eco);
-                aggiornaCampo('limite', data.config.limite);
-                document.getElementById('limite_val').innerText =
-                    document.getElementById('limite').value || data.config.limite;
-
-                document.getElementById('nota_eco').hidden = !data.config.eco;
-                document.getElementById('nota_limite').hidden = !!data.status.limite_supportato;
-                document.getElementById('eco_stato').innerText = data.config.eco ? '🟢 Attiva' : '⚪ Disattiva';
-
-                // Allarmi di salute del sistema
-                const allarmi = [];
-                if (!data.status.centralina_online) allarmi.push('⚠️ Centralina non raggiungibile');
-                if (!data.status.sensore_online) allarmi.push('📡 Nessun dato dal sensore');
-                if (data.status.manual_off) allarmi.push('✋ Override manuale attivo (/accendi per riprendere)');
-                const boxAll = document.getElementById('allarmi');
-                boxAll.textContent = '';
-                allarmi.forEach(a => {
-                    const d = document.createElement('div');
-                    d.className = 'allarme';
-                    d.textContent = a;
-                    boxAll.appendChild(d);
-                });
-
-                // Card energia
-                const en = data.energia || {};
-                const set = (id, v) => { document.getElementById(id).innerText = (v === undefined || v === null) ? '--' : v; };
-                set('e_solare', en.solare_kwh);
-                set('e_import', en.rete_importata_kwh);
-                set('e_export', en.rete_esportata_kwh);
-                set('e_wb', en.wallbox_kwh);
-                set('e_wb_fv', en.wallbox_da_fv_kwh);
-                set('e_tempo', en.minuti_carica);
-                const eff = en.efficienza;
-                document.getElementById('e_eff').innerText = (eff === undefined || eff === null) ? 'n/d' : eff + '%';
-                document.getElementById('e_eff_bar').style.width = ((eff === undefined || eff === null) ? 0 : eff) + '%';
-
-                const wbSpan = document.getElementById('wb_status');
-                wbSpan.innerText = data.status.wb_on ? "ON" : "OFF";
-                wbSpan.className = data.status.wb_on ? "status-on" : "status-off";
-                
-                document.getElementById('wb_power').innerText = data.status.wb_power;
-                document.getElementById('wb_mode').innerText = data.status.fase_mode === 1 ? "Trifase" : "Monofase";
-                
-                const serverTime = data.status.server_time;
-                const lastFasi = data.status.last_fasi;
-                const lastSolar = data.status.last_solar;
-
-                document.getElementById('last_fasi').innerText = formatTime(lastFasi);
-                document.getElementById('sec_fasi').innerText = lastFasi ? `(${Math.max(0, Math.round(serverTime - lastFasi))}s fa)` : '';
-                
-                document.getElementById('last_solar').innerText = formatTime(lastSolar);
-                document.getElementById('sec_solar').innerText = lastSolar ? `(${Math.max(0, Math.round(serverTime - lastSolar))}s fa)` : '';
-
-                const f = data.status.fasi;
-                for(let i=0; i<6; i++) {
-                    document.getElementById('l'+(i+1)).innerText = Math.round(f[i]);
-                }
-                document.getElementById('tot_grid').innerText = Math.round(data.status.grid_total);
-                document.getElementById('tot_solar').innerText = Math.round(data.status.solar_total);
-
-                if (rangeAttivo === 'live') disegnaGrafico(data.history);
-
-                const consoleDiv = document.getElementById('console');
-                const isScrolledToBottom = consoleDiv.scrollHeight - consoleDiv.clientHeight <= consoleDiv.scrollTop + 5;
-
-                // textContent, non innerHTML: i log non vengono interpretati
-                // come markup (il CSS white-space: pre-wrap rende gli a capo).
-                consoleDiv.textContent = data.logs.join('\n');
-
-                if (isScrolledToBottom) {
-                    consoleDiv.scrollTop = consoleDiv.scrollHeight;
-                }
-
-            } catch (e) { console.error("Errore fetch:", e); }
-        }
-
-        // --- Grafico con selettore di intervallo -------------------------
-        let rangeAttivo = 'live';
-
-        function disegnaGrafico(punti) {
-            chart.data.labels = punti.map(h => formatTime(h.time));
-            chart.data.datasets[0].data = punti.map(h => h.grid);
-            chart.data.datasets[1].data = punti.map(h => h.solar);
-            chart.data.datasets[2].data = punti.map(h => h.wb);
-            chart.update();
-        }
-
-        async function cambiaRange(r) {
-            rangeAttivo = r;
-            document.querySelectorAll('.range-btn').forEach(b =>
-                b.classList.toggle('attivo', b.dataset.range === r));
-            if (r === 'live') { fetchData(); return; }
-            try {
-                const resp = await fetch('/api/storico?range=' + r);
-                const dati = await resp.json();
-                if (dati.success) disegnaGrafico(dati.punti);
-            } catch (e) { console.error("Errore storico:", e); }
-        }
-
-        async function updateSettings() {
-            // Validazione lato client: cosi' NaN/null non arrivano nemmeno al
-            // server (che comunque li rifiuta con 400 - difesa in profondita').
-            const payload = {};
-            const errori = [];
-            const num = (id, etichetta) => {
-                const raw = document.getElementById(id).value.trim();
-                if (raw === '') { errori.push(etichetta + ': campo vuoto'); return; }
-                const v = Number(raw);
-                if (!Number.isFinite(v)) { errori.push(etichetta + ': valore non numerico'); return; }
-                payload[id] = Math.round(v);
-            };
-            num('prelevabile', 'Potenza prelevabile');
-            num('protezione', 'Potenza protezione');
-            payload['limite'] = Number(document.getElementById('limite').value);
-            payload['eco'] = document.getElementById('eco').checked;
-
-            if (errori.length) { mostraEsito('Correggi:\n' + errori.join('\n'), false); return; }
-
-            try {
-                const resp = await fetch('/api/settings', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
-                const res = await resp.json().catch(() => ({}));
-                // Prima si mostrava "salvato!" anche su HTTP 500.
-                if (!resp.ok || !res.success) {
-                    mostraEsito('Errore nel salvataggio:\n' + (res.errori || ['errore sconosciuto']).join('\n'), false);
-                    return;
-                }
-                campiSporchi.clear();
-                mostraEsito('Impostazioni salvate.', true);
-                fetchData();
-            } catch (e) {
-                mostraEsito('Errore di rete: ' + e, false);
-            }
-        }
-
-        async function reinitWallbox() {
-            if (!confirm("Sei sicuro di voler forzare la re-inizializzazione della Wallbox?")) return;
-            try {
-                const response = await fetch('/api/init_wallbox', { method: 'POST' });
-                const result = await response.json();
-                if (response.ok && result.success) {
-                    mostraEsito("Re-inizializzazione avviata. Segui l'esito nella console.", true);
-                    fetchData();
-                } else {
-                    mostraEsito('Errore: ' + (result.error || 'invio comando fallito'), false);
-                }
-            } catch (e) { mostraEsito('Errore di rete: ' + e, false); }
-        }
-
-        fetchData();
-        setInterval(fetchData, 2000);
-        // Lo storico lungo si aggiorna con calma: non serve ogni 2s
-        setInterval(() => { if (rangeAttivo !== 'live') cambiaRange(rangeAttivo); }, 60000);
-    </script>
+aggiorna();
+setInterval(aggiorna, 2000);
+setInterval(() => { if (range !== 'live') cambiaRange(range); }, 60000);
+</script>
 </body>
 </html>
 """
@@ -1098,11 +1334,10 @@ def get_data():
     # /api/data e' chiamata ogni 2s: restituisce solo la finestra recente.
     # Lo storico lungo ha il suo endpoint (/api/storico) e la sua cadenza,
     # altrimenti si trasferirebbero megabyte 30 volte al minuto.
-    limite_t = time.time() - 3600
-    history = [
-        {'grid': i[0], 'solar': i[1], 'time': i[3], 'wb': i[4] if len(i) > 4 else 0}
-        for i in list(SYSTEM_STATE['ULTIME_LETTURE_FASI']) if i[3] >= limite_t
-    ]
+    # serie_storico ordina e sottocampiona: senza ordinamento il grafico live
+    # disegnerebbe linee che rimbalzano tra i campioni ricaricati da disco e
+    # quelli nuovi.
+    history = serie_storico(3600, max_punti=240)
 
     with STATO_LOCK:
         fasi = list(SYSTEM_STATE['MONITOR_FASI'])
@@ -1120,6 +1355,16 @@ def get_data():
             'sensore_online': SYSTEM_STATE['SENSORE_ONLINE'],
             'manual_off': bool(wallbox_instance and wallbox_instance.manual_off),
             'limite_supportato': bool(CONFIG['CMD_LIMITE_TEMPLATE']),
+            # Dati letti direttamente dalla centralina
+            'wb_desc': SYSTEM_STATE['WB_DESC'],
+            'wb_status': SYSTEM_STATE['WB_STATUS'],
+            'wb_pcar': SYSTEM_STATE['WB_PCAR'],
+            'wb_energia_sessione': SYSTEM_STATE['WB_ENERGIA_SESSIONE'],
+            'wb_tempo_sessione': SYSTEM_STATE['WB_TEMPO_SESSIONE'],
+            'wb_temp_presa': SYSTEM_STATE['WB_TEMP_PRESA'],
+            'wb_alg': SYSTEM_STATE['WB_ALG'],
+            'alg_manuale': SYSTEM_STATE['WB_ALG'] in ('', CONFIG['ALG_MANUALE']),
+            'limite_centralina': SYSTEM_STATE['LIMITE_KWH_CENTRALINA'],
         }
         configurazione = {
             'prelevabile': CONFIG['POTENZA_PRELEVABILE'],
@@ -1138,36 +1383,12 @@ def get_data():
 
 @app.route('/api/storico')
 def get_storico():
-    """Storico esteso, sottocampionato lato server (max ~300 punti)."""
-    intervalli = {'1h': 3600, '6h': 21600, '24h': 86400}
+    """Storico esteso, ordinato e sottocampionato lato server (max ~300 punti)."""
     scelta = request.args.get('range', '1h')
-    if scelta not in intervalli:
+    if scelta not in INTERVALLI:
         return jsonify({'success': False, 'error': f"range non valido: {scelta}"}), 400
-
-    da = time.time() - intervalli[scelta]
-    punti = [i for i in list(SYSTEM_STATE['ULTIME_LETTURE_FASI']) if i[3] >= da]
-
-    # Sottocampionamento a bucket: media per bucket, non "uno ogni N"
-    massimo = 300
-    if len(punti) > massimo:
-        passo = len(punti) / massimo
-        aggregati = []
-        for n in range(massimo):
-            blocco = punti[int(n * passo):max(int((n + 1) * passo), int(n * passo) + 1)]
-            if not blocco:
-                continue
-            aggregati.append({
-                'grid': sum(b[0] for b in blocco) / len(blocco),
-                'solar': sum(b[1] for b in blocco) / len(blocco),
-                'wb': sum((b[4] if len(b) > 4 else 0) for b in blocco) / len(blocco),
-                'time': blocco[len(blocco) // 2][3],
-            })
-        punti_out = aggregati
-    else:
-        punti_out = [{'grid': i[0], 'solar': i[1], 'wb': i[4] if len(i) > 4 else 0, 'time': i[3]}
-                     for i in punti]
-
-    return jsonify({'success': True, 'range': scelta, 'punti': punti_out})
+    return jsonify({'success': True, 'range': scelta,
+                    'punti': serie_storico(INTERVALLI[scelta])})
 
 @app.route('/api/settings', methods=['POST'])
 def update_settings():
@@ -1294,6 +1515,8 @@ class WallboxController:
         self.sync_falliti = 0
         # anti-spam del log di override manuale
         self.ultimo_log_manual_off = 0
+        # l'auto e' fisicamente collegata? (da status/desc della centralina)
+        self.auto_collegata = False
 
     def update_shared_state(self):
         with STATO_LOCK:
@@ -1340,9 +1563,7 @@ class WallboxController:
                 reset_dedup('centralina_offline')
                 notifica("🔌 Centralina di nuovo raggiungibile.")
             self.sync_falliti = 0
-            chiave_limite = CONFIG.get('CHIAVE_LIMITE_JSON')
-            if chiave_limite and chiave_limite in dati:
-                SYSTEM_STATE['LIMITE_KWH_CENTRALINA'] = dati[chiave_limite]
+            self._assorbi_stato(dati)
             return dati
         except requests.exceptions.RequestException as e:
             log_throttled('centralina_connessione', f"[CENTRALINA] Errore di connessione: {e}", 300)
@@ -1354,6 +1575,94 @@ class WallboxController:
             SYSTEM_STATE['CENTRALINA_ONLINE'] = False
             self.sync_falliti += 1
             return None
+
+    def _assorbi_stato(self, dati):
+        """Estrae dal JSON della centralina tutto cio' che ci serve.
+
+        index.json espone misure REALI che prima ignoravamo completamente:
+          pcar  potenza assorbita dall'auto (misurata, non il setpoint)
+          phome/psun/pnet  consumo casa / produzione / scambio rete
+          energy/time      energia e durata della sessione corrente
+          status/desc      stato connessione ("Non collegata", ...)
+          pwmin/pwmax      limiti di potenza dichiarati dalla centralina
+          alg              algoritmo attivo (2 = Man, l'unico che accetta P<watt>)
+        """
+        def num(chiave, default=0.0):
+            try:
+                return float(dati.get(chiave, default))
+            except (TypeError, ValueError):
+                return default
+
+        with STATO_LOCK:
+            SYSTEM_STATE['WB_PCAR'] = num('pcar')
+            SYSTEM_STATE['WB_PCAR_LETTO_IL'] = time.time()
+            SYSTEM_STATE['WB_ENERGIA_SESSIONE'] = num('energy')
+            SYSTEM_STATE['WB_TEMPO_SESSIONE'] = num('time')
+            SYSTEM_STATE['WB_TEMP_PRESA'] = num('tplug')
+            SYSTEM_STATE['WB_TEMP_SCHEDA'] = num('tboard')
+            SYSTEM_STATE['WB_STATUS'] = str(dati.get('status', ''))
+            SYSTEM_STATE['WB_DESC'] = str(dati.get('desc', ''))
+            SYSTEM_STATE['WB_ALG'] = str(dati.get('alg', ''))
+            SYSTEM_STATE['LIMITE_KWH_CENTRALINA'] = dati.get('limit')
+
+        # L'auto e' collegata? status "0" = Non collegata.
+        collegata = str(dati.get('status', '0')) != '0'
+        if collegata != self.auto_collegata:
+            self.auto_collegata = collegata
+            desc = dati.get('desc', '?')
+            log_msg(f"[CENTRALINA] Stato connessione: {desc}")
+            notifica(f"🔌 Wallbox: {desc}", dedup_key='stato_connessione', min_intervallo=120)
+
+        # I limiti dichiarati dalla centralina hanno la precedenza sui nostri
+        # valori cablati: se l'impianto cambia, si adegua da solo.
+        # ATTENZIONE: la fase va presa dal JSON, non da self.fase. Questa
+        # funzione gira PRIMA che sync_fase aggiorni self.fase, quindi durante
+        # un cambio mono<->tri scriveremmo i limiti nella fase sbagliata.
+        pwmin, pwmax = num('pwmin'), num('pwmax')
+        if pwmin > 0 and pwmax > pwmin:
+            fase_json = 1 if str(dati.get('tfase')) == '1' else 0
+            chiave_min = 'TRIFASE_MIN_POWER' if fase_json == 1 else 'MONOFASE_MIN_POWER'
+            chiave_max = 'TRIFASE_MAX_POWER' if fase_json == 1 else 'MONOFASE_MAX_POWER'
+            with STATO_LOCK:
+                if CONFIG[chiave_min] != int(pwmin) or CONFIG[chiave_max] != int(pwmax):
+                    log_msg(f"[CENTRALINA] Limiti aggiornati dalla centralina: "
+                            f"{int(pwmin)}-{int(pwmax)}W (erano {CONFIG[chiave_min]}-{CONFIG[chiave_max]})")
+                    CONFIG[chiave_min] = int(pwmin)
+                    CONFIG[chiave_max] = int(pwmax)
+
+        # btn=P<watt> ha effetto solo con alg=2 (Man): se qualcuno passa la
+        # centralina a Sole/Eco dal suo pannello, i nostri comandi di potenza
+        # vengono ignorati in silenzio. Meglio accorgersene.
+        alg = str(dati.get('alg', ''))
+        if alg and alg != CONFIG['ALG_MANUALE']:
+            nomi = {'0': 'Sole', '1': 'Eco', '2': 'Man', '3': 'Fast', '4': 'Alone'}
+            log_throttled('alg_non_manuale',
+                          f"[AVVISO] Centralina in modalita' '{nomi.get(alg, alg)}': i comandi di "
+                          f"potenza vengono ignorati finche' non torna in 'Man'.", 600)
+            notifica(f"⚠️ La centralina è in modalità *{nomi.get(alg, alg)}*, non *Man*: "
+                     f"la regolazione automatica della potenza non ha effetto.",
+                     dedup_key='alg_non_manuale', min_intervallo=3600)
+
+    def potenza_reale(self):
+        """Potenza assorbita dall'auto, misurata dalla centralina.
+
+        Ritorna None se il dato non e' disponibile: il chiamante ripiega sul
+        setpoint (che e' una stima e puo' discostarsi parecchio, ad esempio a
+        batteria quasi carica quando l'auto assorbe meno di quanto concesso).
+        """
+        if not CONFIG.get('USA_PCAR'):
+            return None
+        valore = SYSTEM_STATE.get('WB_PCAR')
+        if valore is None:
+            return None
+        # Una misura stantia e' peggio del setpoint: il regolatore non vedrebbe
+        # l'effetto dei comandi appena inviati e continuerebbe a correggere.
+        eta = time.time() - SYSTEM_STATE.get('WB_PCAR_LETTO_IL', 0)
+        if eta > CONFIG.get('MAX_ETA_PCAR', 20):
+            log_throttled('pcar_stantia',
+                          f"[INFO] Potenza misurata vecchia di {eta:.0f}s: uso il setpoint.", 300)
+            return None
+        return valore
 
     def sync_fase(self):
         """Controllo leggero della sola chiave 'tfase', ogni 30s.
@@ -1800,6 +2109,47 @@ def carica_storico():
         return
     log_msg(f"[STORICO] Ricaricati {caricati} campioni da disco.")
 
+INTERVALLI = {'15m': 900, '1h': 3600, '6h': 21600, '24h': 86400}
+
+def serie_storico(secondi, max_punti=300):
+    """Estrae una serie temporale pulita dal buffer: finestra + ordinamento +
+    sottocampionamento a bucket.
+
+    Usata sia da /api/storico sia da /grafici. L'ORDINAMENTO e' essenziale:
+    il buffer mescola i campioni ricaricati da disco all'avvio con quelli
+    live, e un grafico su dati non ordinati disegna una ragnatela di linee
+    che rimbalzano avanti e indietro.
+    """
+    da = time.time() - secondi
+    punti = sorted((p for p in list(SYSTEM_STATE['ULTIME_LETTURE_FASI']) if p[3] >= da),
+                   key=lambda p: p[3])
+    if not punti:
+        return []
+
+    def tupla(p):
+        return {'time': p[3], 'grid': p[0], 'solar': p[1], 'wb': p[4] if len(p) > 4 else 0}
+
+    if len(punti) <= max_punti:
+        return [tupla(p) for p in punti]
+
+    # Media per bucket: conserva la forma della curva invece di buttare via
+    # campioni a caso (che farebbe sparire i picchi).
+    passo = len(punti) / max_punti
+    out = []
+    for n in range(max_punti):
+        inizio = int(n * passo)
+        fine = max(int((n + 1) * passo), inizio + 1)
+        blocco = punti[inizio:fine]
+        if not blocco:
+            continue
+        out.append({
+            'time': blocco[len(blocco) // 2][3],
+            'grid': sum(b[0] for b in blocco) / len(blocco),
+            'solar': sum(b[1] for b in blocco) / len(blocco),
+            'wb': sum((b[4] if len(b) > 4 else 0) for b in blocco) / len(blocco),
+        })
+    return out
+
 def ruota_storico():
     """Riscrive il file tenendo solo i campioni entro la retention."""
     if not os.path.exists(FILE_STORICO):
@@ -1866,8 +2216,18 @@ class EnergyMonitor:
                     SYSTEM_STATE['SENSORE_ONLINE'] = True
                     self.time = SYSTEM_STATE['ULTIMA_LETTURA_FASI']
 
+                    # Potenza wallbox: si preferisce SEMPRE pcar, la misura
+                    # reale letta dalla centralina ogni 30s. Il setpoint e'
+                    # solo una stima e si discosta parecchio quando l'auto
+                    # assorbe meno di quanto concesso (batteria quasi carica,
+                    # derating termico): in quel caso il consumo casa risultava
+                    # sottostimato e il regolatore continuava ad alzare.
                     wb_status = SYSTEM_STATE.get('WALLBOX_STATUS', False)
-                    wb_power = SYSTEM_STATE.get('WALLBOX_POWER', 0) if wb_status else 0
+                    misurata = SYSTEM_STATE.get('WB_PCAR') if CONFIG.get('USA_PCAR') else None
+                    if misurata is not None:
+                        wb_power = misurata
+                    else:
+                        wb_power = SYSTEM_STATE.get('WALLBOX_POWER', 0) if wb_status else 0
                     self.house_load = self.total_grid_load - wb_power
 
                     registra_campione(self.total_grid_load, self.solar_now,
@@ -1918,7 +2278,15 @@ def run_logic(monitor, wallbox):
 
     potenza_generata = monitor.solar_now
     potenza_consumata = monitor.total_grid_load
-    potenza_carica = wallbox.display_power if wallbox.is_on else 0
+    # Potenza in carica: si preferisce la misura reale della centralina (pcar).
+    # Con il solo setpoint, se l'auto assorbe meno di quanto concesso (batteria
+    # quasi carica, derating termico) il regolatore crede di erogare piu' di
+    # quanto faccia e continua ad alzare inutilmente.
+    misurata = wallbox.potenza_reale()
+    if misurata is not None and wallbox.is_on:
+        potenza_carica = misurata
+    else:
+        potenza_carica = wallbox.display_power if wallbox.is_on else 0
     potenza_casa = monitor.house_load
     potenza_generata += POTENZA_PRELEVABILE
     potenza_esportata = potenza_generata - potenza_consumata
@@ -2150,7 +2518,7 @@ def main():
     # 3. AVVIO THREAD PERIODICO (dopo initialize, per non sovrapporre un
     #    sync_fase alla inizializzazione di avvio)
     threading.Thread(target=thread_periodico, args=(wallbox,), daemon=True).start()
-    log_msg(f">>> CONTROLLO FASE AUTOMATICO ATTIVO (ogni {CONFIG['INTERVALLO_SYNC_FASE']}s) <<<")
+    log_msg(f">>> LETTURA CENTRALINA E CONTROLLO FASE ATTIVI (ogni {CONFIG['INTERVALLO_SYNC_FASE']}s) <<<")
 
     errori_consecutivi = 0
     while True:

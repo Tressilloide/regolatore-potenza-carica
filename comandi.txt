@@ -4,8 +4,13 @@ sudo systemctl restart solar_web.service         # restart
 sudo systemctl status solar_web.service          # stato + uso memoria
 
 ### VENV E LIBRERIE ####################################################
-# Percorso dell'interprete usato dal service
-VENV=/home/pi/Desktop/EVR/venv/bin/python3
+# NB: il solar_web.service versionato dice /home/pi/Desktop/EVR/ ma il deploy
+# reale e' altrove. Ricava i percorsi VERI dal service installato:
+systemctl cat solar_web.service | grep -E "ExecStart|WorkingDirectory|User"
+
+# Poi imposta queste due variabili di conseguenza:
+PROG=~/solar/regolatore-potenza-carica
+VENV=$(systemctl cat solar_web.service | grep ExecStart | sed 's/ExecStart=//' | awk '{print $1}')
 
 # Verifica quali librerie sono installate e con che versione
 $VENV -c "import telegram, flask, requests, matplotlib, dotenv, sys; \
@@ -16,11 +21,11 @@ print('requests', requests.__version__); \
 print('matplot ', matplotlib.__version__)"
 
 # Installazione / aggiornamento delle librerie necessarie
-/home/pi/Desktop/EVR/venv/bin/pip install --upgrade \
+$(dirname $VENV)/pip install --upgrade \
     python-telegram-bot flask requests python-dotenv matplotlib
 
 # Verifica sintassi PRIMA di riavviare il servizio
-$VENV -m py_compile /home/pi/Desktop/EVR/regolatore-potenza-carica/solar_webinterface.py
+$VENV -m py_compile $PROG/solar_webinterface.py
 
 ### DIAGNOSI BOT TELEGRAM ##############################################
 # I nomi di comando con MAIUSCOLE sono rifiutati da python-telegram-bot v20+.
@@ -28,31 +33,20 @@ $VENV -m py_compile /home/pi/Desktop/EVR/regolatore-potenza-carica/solar_webinte
 sudo journalctl -u solar_web.service --since "-3 days" \
   | grep -iE "not a valid bot command|no current event loop|BOT TELEGRAM ATTIVO|Traceback"
 
-### REVERSE ENGINEERING DEL LIMITE (slider "Energia da caricare") ######
-# A. Sorgente della funzione chglimit() -> da' il comando esatto
-curl -s http://192.168.1.22/ -o /tmp/centralina.html
-grep -n -A 20 "function chglimit" /tmp/centralina.html
-grep -n -A 20 "function modlimit" /tmp/centralina.html
-grep -oE 'src="[^"]+"' /tmp/centralina.html      # se il JS e' in un file esterno
-# poi:  curl -s http://192.168.1.22/NOMEFILE.js | grep -n -B3 -A20 chglimit
+### CENTRALINA EVR 3 W - API RICAVATA (vedi API_CENTRALINA.md) #########
+# Endpoint unico: GET http://192.168.1.22/index.json[?btn=<cmd>]
+#   i           accendi           o           spegni
+#   P<watt>     imposta potenza   L<kWh>      imposta energia da caricare
+#   s/e/m/f     algoritmo Sole/Eco/Man/Fast   l  attiva/disattiva limite
+# NB: P<watt> funziona SOLO con alg=2 (Man).
 
-# B. Diff dello stato: quale chiave cambia muovendo lo slider
-curl -s http://192.168.1.22/index.json > /tmp/a.json
-#   ... muovi lo slider "Energia da caricare" e premi "Limite" ...
-curl -s http://192.168.1.22/index.json > /tmp/b.json
-diff <(python3 -m json.tool /tmp/a.json) <(python3 -m json.tool /tmp/b.json)
+curl -s http://192.168.1.22/index.json | python3 -m json.tool
+curl -s http://192.168.1.22/info.html | sed 's/<[^>]*>/ /g'   # seriale e firmware
 
-# B-bis. Stessa cosa dall'interfaccia (endpoint diagnostico integrato):
-#   http://192.168.1.23:5000/api/wallbox_raw   -> campo "chiavi_cambiate"
-
-# C. Prova del comando ipotizzato (fare a WALLBOX SPENTA)
-curl -s "http://192.168.1.22/index.json?btn=L50"; echo
-curl -s http://192.168.1.22/index.json | python3 -m json.tool | grep -i limit
-# Se 'L' non funziona provare: E50, K50, l50, oppure ?limit=50
-
-# Quando il comando e' noto, in solar_webinterface.py impostare:
-#   'CMD_LIMITE_TEMPLATE': 'L{valore}'
-#   'CHIAVE_LIMITE_JSON':  'limit'      (il nome trovato al punto B)
+# Campi utili: pcar (potenza auto MISURATA), phome, psun, pnet, energy,
+#              status/desc, pwmin/pwmax, alg, limit, tfase, tplug
+# La percentuale di carica della batteria NON esiste: serve ISO 15118,
+# questa centralina parla IEC 61851 (vedi API_CENTRALINA.md).
 
 ### TEST DELLE API #####################################################
 IP=192.168.1.23:5000
@@ -73,10 +67,10 @@ curl -s -i -X POST -H 'Content-Type: application/json' -d '{"prelevabile":-5}'  
 # LA PROVA DELLA PERSISTENZA: i valori devono sopravvivere al riavvio
 sudo systemctl restart solar_web.service && sleep 12
 curl -s http://$IP/api/data | python3 -c "import json,sys; print(json.load(sys.stdin)['config'])"
-cat /home/pi/Desktop/EVR/regolatore-potenza-carica/config_utente.json
+cat $PROG/config_utente.json
 
 ### FILE DI STATO ######################################################
-cd /home/pi/Desktop/EVR/regolatore-potenza-carica/
+cd $PROG
 cat config_utente.json
 tail -5 storico.jsonl
 ls -lh storico.jsonl                 # cresce ~350 KB/giorno
@@ -88,5 +82,5 @@ sudo iptables -A INPUT -p udp --dport 22600 -j DROP    # simula sensore offline
 sudo iptables -D INPUT -p udp --dport 22600 -j DROP    # ripristina
 
 ### ROLLBACK ###########################################################
-cd /home/pi/Desktop/EVR/regolatore-potenza-carica/
+cd $PROG
 git checkout solar_webinterface.py && sudo systemctl restart solar_web.service
