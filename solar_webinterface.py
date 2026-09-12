@@ -2213,7 +2213,15 @@ class ContatoriEnergia:
             # Quota coperta dal fotovoltaico: il surplus disponibile alla casa
             # non puo' eccedere ne' la produzione al netto della casa ne' il
             # consumo effettivo della wallbox.
-            disponibile_fv = max(0.0, solare_w - casa_w)
+            # casa_w = rete_totale - potenza_wallbox, e puo' essere NEGATIVO
+            # quando la potenza wallbox sovrastima (setpoint invece della
+            # misura). Senza il clamp, solare_w - casa_w diventa maggiore
+            # della produzione reale e si attribuiva al fotovoltaico piu'
+            # energia di quanta ne fosse stata prodotta: l'efficienza
+            # risultava gonfiata (visto nei dati: 171 kWh "da FV" in un
+            # giorno da 70 kWh prodotti).
+            casa_reale = max(0.0, casa_w)
+            disponibile_fv = max(0.0, min(solare_w, solare_w - casa_reale))
             self.wallbox_da_fv_wh += min(wallbox_w, disponibile_fv) * ore
 
     def _controlla_rollover(self):
