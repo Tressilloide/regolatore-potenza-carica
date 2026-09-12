@@ -60,6 +60,16 @@ CONFIG = {
     # regolatore non vedrebbe l'effetto dei comandi appena inviati.
     'INTERVALLO_SYNC_FASE': 5,
     'MAX_ETA_PCAR': 20,             # Oltre questa eta' (s) pcar non e' affidabile
+
+    # --- Prezzi per la stima del risparmio (persistiti) ---
+    # Il risparmio di caricare col proprio sole invece che dalla rete e' la
+    # differenza tra quanto NON compri e quanto rinunci a vendere.
+    'PREZZO_ACQUISTO': 0.25,        # EUR/kWh comprati dalla rete
+    'PREZZO_VENDITA': 0.10,         # EUR/kWh ceduti alla rete
+
+    # --- Sicurezza ---
+    'TEMP_PRESA_ALLARME': 70,       # Oltre questa temperatura (C) scatta l'allarme
+    'TEMP_PRESA_ATTENZIONE': 60,
     'USA_PCAR': True,               # Usa la potenza auto misurata invece del setpoint
     'ALG_MANUALE': '2',             # alg=2 (Man): l'unico in cui btn=P<watt> ha effetto     # Ogni quanti secondi rileggere 'tfase' dalla centralina
 
@@ -86,6 +96,7 @@ DIR_BASE = os.path.dirname(os.path.abspath(__file__))
 FILE_CONFIG = os.path.join(DIR_BASE, 'config_utente.json')
 FILE_STORICO = os.path.join(DIR_BASE, 'storico.jsonl')
 FILE_STORICO_GIORNALIERO = os.path.join(DIR_BASE, 'storico_giornaliero.json')
+FILE_SESSIONI = os.path.join(DIR_BASE, 'sessioni.json')
 
 # Stato condiviso per la Web UI e Telegram
 SYSTEM_STATE = {
@@ -170,6 +181,8 @@ CHIAVI_PERSISTENTI = {
     'POTENZA_PRELEVABILE': (0, 20000, int),
     'POTENZA_PROTEZIONE':  (50, 5000, int),
     'LIMITE_KWH':          (1, 100, int),
+    'PREZZO_ACQUISTO':     (0, 5, float),
+    'PREZZO_VENDITA':      (0, 5, float),
 }
 
 def valida_valore(chiave, valore):
@@ -205,7 +218,7 @@ def valida_valore(chiave, valore):
     if temp != temp or temp in (float('inf'), float('-inf')):
         return False, None, f"{chiave}: valore non finito"
 
-    pulito = int(temp)
+    pulito = round(temp, 4) if tipo is float else int(temp)
     if minimo is not None and pulito < minimo:
         return False, None, f"{chiave}: minimo consentito {minimo} (ricevuto {pulito})"
     if massimo is not None and pulito > massimo:
@@ -362,6 +375,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Stato*\n"
         "/info - Stato attuale del sistema\n"
         "/energia - Riepilogo energetico di oggi\n"
+        "/storico [giorni] - Riepilogo degli ultimi giorni\n"
+        "/sessioni - Ultime sessioni di ricarica\n"
         "/grafici [15m|1h|6h|24h] - Grafico dell'andamento\n"
         "/fase - Rileva subito monofase/trifase\n\n"
         "*Controllo*\n"
@@ -501,6 +516,104 @@ async def cmd_limite(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"✅ *Limite* salvato: {CONFIG['LIMITE_KWH']} kWh", parse_mode='Markdown')
 
+async def cmd_storico(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Riepilogo degli ultimi giorni + grafico a barre."""
+    if not check_auth(update): return
+    try:
+        quanti = max(2, min(30, int(context.args[0]))) if context.args else 7
+    except (IndexError, ValueError):
+        quanti = 7
+
+    giorni = giorni_storico(quanti)
+    if len(giorni) < 1:
+        await update.message.reply_text("⏳ Non c'è ancora storico giornaliero.")
+        return
+
+    tot_fv = sum(g.get('wallbox_da_fv_kwh') or 0 for g in giorni)
+    tot_wb = sum(g.get('wallbox_kwh') or 0 for g in giorni)
+    tot_sol = sum(g.get('solare_kwh') or 0 for g in giorni)
+    tot_eur = sum(g.get('risparmio_eur') or 0 for g in giorni)
+    eff = (tot_fv / tot_wb * 100) if tot_wb > 0 else None
+
+    righe = []
+    for g in giorni[-10:]:
+        d = g.get('giorno', '?')[5:]     # MM-GG
+        e = g.get('efficienza')
+        righe.append(f"`{d}`  ☀️{g.get('solare_kwh', 0):5.1f}  🚗{g.get('wallbox_kwh', 0):5.1f}  "
+                     f"{'🌱' + format(e, '.0f') + '%' if e is not None else '  —'}")
+
+    msg = (f"📅 *Ultimi {len(giorni)} giorni*\n\n" + "\n".join(righe) +
+           f"\n\n*Totali*\n"
+           f"☀️ Prodotti: {tot_sol:.1f} kWh\n"
+           f"🚗 In auto: {tot_wb:.1f} kWh\n"
+           f"🌱 Da fotovoltaico: {tot_fv:.1f} kWh"
+           f"{f' ({eff:.0f}%)' if eff is not None else ''}\n"
+           f"💰 Risparmio stimato: {tot_eur:.2f} €\n")
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+    if len(giorni) >= 2:
+        immagine = await asyncio.to_thread(genera_grafico_giorni, giorni)
+        await update.message.reply_photo(photo=immagine)
+
+def genera_grafico_giorni(giorni):
+    """Barre impilate: kWh in auto da fotovoltaico vs da rete, per giorno."""
+    etichette = [g.get('giorno', '')[5:] for g in giorni]
+    da_fv = [g.get('wallbox_da_fv_kwh') or 0 for g in giorni]
+    da_rete = [max(0, (g.get('wallbox_kwh') or 0) - f) for g, f in zip(giorni, da_fv)]
+    solare = [g.get('solare_kwh') or 0 for g in giorni]
+
+    fig = Figure(figsize=(11, 5), dpi=110)
+    fig.patch.set_facecolor('#ffffff')
+    ax = fig.subplots()
+    ax.set_facecolor('#fbfbfd')
+
+    ax.bar(etichette, da_fv, label='In auto da fotovoltaico', color='#10b981')
+    ax.bar(etichette, da_rete, bottom=da_fv, label='In auto da rete', color='#f59e0b')
+    ax.plot(etichette, solare, label='Prodotti dal FV', color='#3b82f6',
+            linewidth=2, marker='o', markersize=4)
+
+    ax.set_title(f"Ricarica degli ultimi {len(giorni)} giorni", fontsize=13, fontweight='bold')
+    ax.set_ylabel("kWh")
+    ax.legend(loc='upper left', framealpha=.9, fontsize=9)
+    ax.grid(True, axis='y', linestyle='--', alpha=.35)
+    ax.tick_params(axis='x', rotation=45, labelsize=9)
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    FigureCanvasAgg(fig).print_png(buf)
+    buf.seek(0)
+    return buf
+
+async def cmd_sessioni(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ultime sessioni di ricarica registrate."""
+    if not check_auth(update): return
+    sessioni = list(reversed(leggi_sessioni(10)))
+
+    if contatori_instance and contatori_instance.inizio_carica:
+        minuti = (time.time() - contatori_instance.inizio_carica) / 60
+        kwh = SYSTEM_STATE.get('WB_ENERGIA_SESSIONE') or 0.0
+        corso = f"▶️ *In corso:* {minuti:.0f} min, {kwh:.2f} kWh\n\n"
+    else:
+        corso = ""
+
+    if not sessioni:
+        await update.message.reply_text(
+            corso + "📭 Nessuna sessione registrata finora.", parse_mode='Markdown')
+        return
+
+    righe = []
+    for s in sessioni:
+        quando = time.strftime('%d/%m %H:%M', time.localtime(s['inizio']))
+        fv = f" · 🌱{s['quota_fv']:.0f}%" if s.get('quota_fv') is not None else ""
+        righe.append(f"`{quando}`  {s['minuti']}min · {s['kwh']:.2f} kWh{fv}")
+
+    tot = sum(s['kwh'] for s in sessioni)
+    eur = sum(s.get('risparmio_eur') or 0 for s in sessioni)
+    await update.message.reply_text(
+        corso + f"🔌 *Ultime {len(sessioni)} sessioni*\n\n" + "\n".join(righe) +
+        f"\n\nTotale: {tot:.2f} kWh · risparmio stimato {eur:.2f} €",
+        parse_mode='Markdown')
+
 async def cmd_fase(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Forza subito una rilettura di 'tfase' dalla centralina."""
     if not check_auth(update): return
@@ -634,6 +747,8 @@ def _registra_comandi(app):
         (["limite"], cmd_limite),
         (["fase"], cmd_fase),
         (["energia"], cmd_energia),
+        (["storico"], cmd_storico),
+        (["sessioni"], cmd_sessioni),
         (["grafici"], cmd_grafici),
         (["reset", "restart"], cmd_reset),
     ]
@@ -884,6 +999,17 @@ HTML_TEMPLATE = """
             </div>
 
             <div class="card">
+                <h2>Ultimi giorni</h2>
+                <div class="grafico-box" style="height:260px"><canvas id="grafico_giorni"></canvas></div>
+                <div class="tiles" style="margin-top:16px">
+                    <div class="tile"><div class="v" id="g_solare">--</div><div class="l">Prodotti (kWh)</div></div>
+                    <div class="tile"><div class="v" id="g_auto">--</div><div class="l">In auto (kWh)</div></div>
+                    <div class="tile"><div class="v" id="g_eff">--</div><div class="l">Da solare</div></div>
+                    <div class="tile"><div class="v" id="g_eur">--</div><div class="l">Risparmio stimato</div></div>
+                </div>
+            </div>
+
+            <div class="card">
                 <h2>Dettaglio fasi</h2>
                 <div class="colonne" style="gap:22px">
                     <div>
@@ -932,6 +1058,23 @@ HTML_TEMPLATE = """
                     </div>
                 </div>
 
+                <div class="colonne" style="gap:10px">
+                    <div class="campo" style="margin-bottom:0">
+                        <label for="prezzo_acquisto">Prezzo acquisto (&euro;/kWh)</label>
+                        <input type="number" id="prezzo_acquisto" min="0" max="5" step="0.01"
+                               oninput="marcaSporco(event)">
+                    </div>
+                    <div class="campo" style="margin-bottom:0">
+                        <label for="prezzo_vendita">Prezzo vendita (&euro;/kWh)</label>
+                        <input type="number" id="prezzo_vendita" min="0" max="5" step="0.01"
+                               oninput="marcaSporco(event)">
+                    </div>
+                </div>
+                <div class="nota" style="margin-bottom:15px">
+                    Servono solo a stimare il risparmio: caricare col proprio sole evita
+                    l'acquisto ma rinuncia alla vendita.
+                </div>
+
                 <button class="b-primario" onclick="salva()">Salva impostazioni</button>
                 <button class="b-secondario" onclick="reinit()">Re-inizializza wallbox</button>
                 <div id="esito" class="esito" hidden></div>
@@ -945,6 +1088,12 @@ HTML_TEMPLATE = """
                 <div class="riga"><span class="n">Sessione</span><span class="w"><span id="c_sess">--</span> kWh</span></div>
                 <div class="riga"><span class="n">Temperatura presa</span><span class="w"><span id="c_temp">--</span> &deg;C</span></div>
                 <div class="riga"><span class="n">Limite centralina</span><span class="w" id="c_limite">--</span></div>
+            </div>
+
+            <div class="card">
+                <h2>Sessioni di ricarica</h2>
+                <div id="sessione_corso" hidden></div>
+                <div id="elenco_sessioni"></div>
             </div>
 
             <div class="card">
@@ -1014,6 +1163,98 @@ const grafico = new Chart($('grafico').getContext('2d'), {
 });
 
 function oraDi(ts) { return ts ? new Date(ts * 1000).toLocaleTimeString('it-IT') : '--'; }
+
+/* ---------- storico giornaliero (barre impilate) ---------- */
+const grafGiorni = new Chart($('grafico_giorni').getContext('2d'), {
+    type: 'bar',
+    data: { labels: [], datasets: [
+        { label: 'In auto da solare', data: [], backgroundColor: col.sole, stack: 'a' },
+        { label: 'In auto da rete', data: [], backgroundColor: col.casa, stack: 'a' },
+        { label: 'Prodotti dal FV', data: [], type: 'line', borderColor: col.auto,
+          backgroundColor: 'transparent', borderWidth: 2, pointRadius: 2, tension: .3 }
+    ]},
+    options: {
+        responsive: true, maintainAspectRatio: false, animation: { duration: 0 },
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+            legend: { labels: { color: col.testo2, usePointStyle: true, boxWidth: 12,
+                                font: { size: 11 } } },
+            tooltip: { callbacks: { label: c => c.dataset.label + ': ' + c.parsed.y.toFixed(1) + ' kWh' } }
+        },
+        scales: {
+            x: { stacked: true, ticks: { color: col.testo2, font: { size: 10 } },
+                 grid: { display: false } },
+            y: { stacked: true, beginAtZero: true,
+                 ticks: { color: col.testo2, font: { size: 10 } },
+                 grid: { color: col.bordo, drawTicks: false } }
+        }
+    }
+});
+
+async function caricaGiorni() {
+    try {
+        const d = await (await fetch('/api/giorni?quanti=14')).json();
+        if (!d.success) return;
+        const g = d.giorni;
+        grafGiorni.data.labels = g.map(x => (x.giorno || '').slice(5).replace('-', '/'));
+        const daFv = g.map(x => x.wallbox_da_fv_kwh || 0);
+        grafGiorni.data.datasets[0].data = daFv;
+        grafGiorni.data.datasets[1].data = g.map((x, i) => Math.max(0, (x.wallbox_kwh || 0) - daFv[i]));
+        grafGiorni.data.datasets[2].data = g.map(x => x.solare_kwh || 0);
+        grafGiorni.update();
+
+        const somma = (k) => g.reduce((a, x) => a + (x[k] || 0), 0);
+        const totWb = somma('wallbox_kwh'), totFv = somma('wallbox_da_fv_kwh');
+        $('g_solare').textContent = somma('solare_kwh').toFixed(0);
+        $('g_auto').textContent = totWb.toFixed(0);
+        $('g_eff').textContent = totWb > 0 ? Math.round(totFv / totWb * 100) + '%' : '--';
+        $('g_eur').textContent = somma('risparmio_eur').toFixed(2) + ' €';
+    } catch (e) { console.error(e); }
+}
+
+/* ---------- sessioni di ricarica ---------- */
+async function caricaSessioni() {
+    try {
+        const d = await (await fetch('/api/sessioni?quante=8')).json();
+        if (!d.success) return;
+
+        const corso = $('sessione_corso');
+        if (d.in_corso) {
+            corso.hidden = false;
+            corso.className = 'tot';
+            corso.textContent = 'In corso: ' + d.in_corso.minuti + ' min · '
+                              + d.in_corso.kwh.toFixed(2) + ' kWh';
+        } else {
+            corso.hidden = true;
+        }
+
+        const box = $('elenco_sessioni');
+        box.textContent = '';
+        if (!d.sessioni.length) {
+            const v = document.createElement('div');
+            v.className = 'nota';
+            v.textContent = 'Nessuna sessione registrata finora.';
+            box.appendChild(v);
+            return;
+        }
+        d.sessioni.forEach(s => {
+            const r = document.createElement('div');
+            r.className = 'riga';
+            const quando = new Date(s.inizio * 1000).toLocaleString('it-IT',
+                { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+            const sx = document.createElement('span');
+            sx.className = 'n';
+            sx.textContent = quando + ' · ' + s.minuti + ' min';
+            const dx = document.createElement('span');
+            dx.className = 'w';
+            dx.textContent = s.kwh.toFixed(2) + ' kWh'
+                           + (s.quota_fv !== null && s.quota_fv !== undefined
+                              ? ' · ' + Math.round(s.quota_fv) + '% sole' : '');
+            r.appendChild(sx); r.appendChild(dx);
+            box.appendChild(r);
+        });
+    } catch (e) { console.error(e); }
+}
 
 function disegna(punti) {
     const lungo = punti.length > 1 && (punti[punti.length - 1].time - punti[0].time) > 86400;
@@ -1107,6 +1348,8 @@ async function aggiorna() {
     setCampo('prelevabile', c.prelevabile);
     setCampo('protezione', c.protezione);
     setCampo('limite', c.limite);
+    setCampo('prezzo_acquisto', c.prezzo_acquisto);
+    setCampo('prezzo_vendita', c.prezzo_vendita);
     $('limite_val').textContent = $('limite').value || c.limite;
     $('nota_limite').hidden = !!s.limite_supportato;
 
@@ -1141,6 +1384,15 @@ async function salva() {
     leggi('prelevabile', 'Potenza prelevabile');
     leggi('protezione', 'Soglia di protezione');
     payload.limite = Number($('limite').value);
+    const prezzo = (id, etichetta) => {
+        const raw = $(id).value.trim();
+        if (raw === '') { errori.push(etichetta + ': campo vuoto'); return; }
+        const v = Number(raw);
+        if (!Number.isFinite(v) || v < 0) { errori.push(etichetta + ': valore non valido'); return; }
+        payload[id] = v;
+    };
+    prezzo('prezzo_acquisto', 'Prezzo acquisto');
+    prezzo('prezzo_vendita', 'Prezzo vendita');
     if (errori.length) { esito('Correggi:\\n' + errori.join('\\n'), false); return; }
 
     try {
@@ -1197,7 +1449,12 @@ async function reinit() {
 }
 
 aggiorna();
+caricaGiorni();
+caricaSessioni();
 setInterval(aggiorna, 2000);
+/* Giorni e sessioni cambiano di rado: bastano 60s, non serve il polling da 2s */
+setInterval(caricaGiorni, 60000);
+setInterval(caricaSessioni, 30000);
 setInterval(() => { if (range !== 'live') cambiaRange(range); }, 60000);
 </script>
 </body>
@@ -1213,6 +1470,8 @@ CAMPI_WEB = {
     'prelevabile': 'POTENZA_PRELEVABILE',
     'protezione':  'POTENZA_PROTEZIONE',
     'limite':      'LIMITE_KWH',
+    'prezzo_acquisto': 'PREZZO_ACQUISTO',
+    'prezzo_vendita':  'PREZZO_VENDITA',
 }
 
 @app.route('/api/data')
@@ -1256,6 +1515,8 @@ def get_data():
             'prelevabile': CONFIG['POTENZA_PRELEVABILE'],
             'protezione': CONFIG['POTENZA_PROTEZIONE'],
             'limite': CONFIG['LIMITE_KWH'],
+            'prezzo_acquisto': CONFIG['PREZZO_ACQUISTO'],
+            'prezzo_vendita': CONFIG['PREZZO_VENDITA'],
         }
 
     return jsonify({
@@ -1352,6 +1613,32 @@ def toggle_limite():
 
     inviato, messaggio = wallbox_instance.set_limite_kwh(valore)
     return jsonify({'success': inviato, 'messaggio': messaggio, 'attivo': attivo}), (200 if inviato else 502)
+
+@app.route('/api/giorni')
+def get_giorni():
+    """Storico giornaliero: finora veniva scritto su disco ma mai mostrato."""
+    try:
+        quanti = max(1, min(90, int(request.args.get('quanti', 14))))
+    except (TypeError, ValueError):
+        quanti = 14
+    return jsonify({'success': True, 'giorni': giorni_storico(quanti)})
+
+@app.route('/api/sessioni')
+def get_sessioni():
+    """Ultime sessioni di ricarica registrate."""
+    try:
+        quante = max(1, min(200, int(request.args.get('quante', 10))))
+    except (TypeError, ValueError):
+        quante = 10
+    sessioni = list(reversed(leggi_sessioni(quante)))
+    in_corso = None
+    if contatori_instance and contatori_instance.inizio_carica:
+        adesso = time.time()
+        in_corso = {
+            'minuti': round((adesso - contatori_instance.inizio_carica) / 60),
+            'kwh': round(SYSTEM_STATE.get('WB_ENERGIA_SESSIONE') or 0.0, 2),
+        }
+    return jsonify({'success': True, 'sessioni': sessioni, 'in_corso': in_corso})
 
 @app.route('/api/init_wallbox', methods=['POST'])
 def force_init_wallbox():
@@ -1553,6 +1840,26 @@ class WallboxController:
                             f"{int(pwmin)}-{int(pwmax)}W (erano {CONFIG[chiave_min]}-{CONFIG[chiave_max]})")
                     CONFIG[chiave_min] = int(pwmin)
                     CONFIG[chiave_max] = int(pwmax)
+
+        # Sicurezza: una presa che scalda troppo e' un rischio reale.
+        # tplug e' la temperatura della presa misurata dalla centralina.
+        tplug = num('tplug', -1)
+        if tplug > 0:
+            if tplug >= CONFIG['TEMP_PRESA_ALLARME']:
+                log_msg(f"[ALLARME] Temperatura presa {tplug:.0f}C oltre la soglia "
+                        f"di {CONFIG['TEMP_PRESA_ALLARME']}C!")
+                notifica(f"🔥 *ALLARME: presa a {tplug:.0f} °C*\n"
+                         f"Oltre la soglia di sicurezza ({CONFIG['TEMP_PRESA_ALLARME']} °C). "
+                         f"Verificare il collegamento.",
+                         dedup_key='temp_allarme', min_intervallo=600)
+            elif tplug >= CONFIG['TEMP_PRESA_ATTENZIONE']:
+                log_throttled('temp_attenzione',
+                              f"[AVVISO] Temperatura presa elevata: {tplug:.0f}C", 600)
+                notifica(f"🌡️ Presa a {tplug:.0f} °C: temperatura elevata, tenere d'occhio.",
+                         dedup_key='temp_attenzione', min_intervallo=3600)
+            else:
+                reset_dedup('temp_allarme')
+                reset_dedup('temp_attenzione')
 
         # btn=P<watt> ha effetto solo con alg=2 (Man): se la centralina viene
         # messa in Sole/Eco dal suo pannello, i nostri comandi di potenza
@@ -1862,6 +2169,8 @@ class ContatoriEnergia:
         self.azzera()
         self.inizio_carica = None
         self.wh_inizio_sessione = 0.0
+        self.fv_inizio_sessione = 0.0
+        self.energy_inizio = 0.0
 
     def azzera(self):
         self.solare_wh = 0.0
@@ -1925,18 +2234,60 @@ class ContatoriEnergia:
     def inizio_sessione(self):
         self.inizio_carica = time.time()
         self.wh_inizio_sessione = self.wallbox_wh
+        self.fv_inizio_sessione = self.wallbox_da_fv_wh
+        # Contatore della centralina a inizio sessione: e' una misura reale,
+        # a differenza dei nostri Wh integrati dal setpoint.
+        self.energy_inizio = SYSTEM_STATE.get('WB_ENERGIA_SESSIONE') or 0.0
 
     def fine_sessione(self):
+        """Chiude la sessione, la salva su disco e notifica."""
         if self.inizio_carica is None:
             return
-        durata = time.time() - self.inizio_carica
-        kwh = (self.wallbox_wh - self.wh_inizio_sessione) / 1000.0
+        fine = time.time()
+        durata = fine - self.inizio_carica
+        kwh_stimati = (self.wallbox_wh - self.wh_inizio_sessione) / 1000.0
+        kwh_fv = (self.wallbox_da_fv_wh - self.fv_inizio_sessione) / 1000.0
+        inizio = self.inizio_carica
         self.inizio_carica = None
+
         if durata < 60:
-            return   # sessioni lampo: non vale la pena notificarle
-        notifica(f"🔋 Sessione di carica terminata\n"
-                 f"Durata: {durata/60:.0f} min\n"
-                 f"Energia: {kwh:.2f} kWh (stimata)")
+            return   # sessioni lampo: non vale la pena registrarle
+
+        # La centralina azzera 'energy' a fine sessione, quindi il valore letto
+        # per ultimo e' quello buono; se manca si ripiega sulla stima.
+        kwh_reali = SYSTEM_STATE.get('WB_ENERGIA_SESSIONE') or 0.0
+        misurata = kwh_reali > 0
+        kwh = kwh_reali if misurata else kwh_stimati
+        quota_fv = min(100.0, kwh_fv / kwh_stimati * 100.0) if kwh_stimati > 0 else None
+
+        sessione = {
+            'inizio': inizio,
+            'fine': fine,
+            'minuti': round(durata / 60),
+            'kwh': round(kwh, 2),
+            'kwh_misurati': misurata,
+            'quota_fv': round(quota_fv, 1) if quota_fv is not None else None,
+            'potenza_media': round(kwh * 1000 / (durata / 3600)) if durata > 0 else 0,
+            'risparmio_eur': risparmio_euro(kwh * (quota_fv or 0) / 100.0,
+                                            kwh * (1 - (quota_fv or 0) / 100.0)),
+        }
+        try:
+            elenco = leggi_json(FILE_SESSIONI, [])
+            elenco.append(sessione)
+            scrivi_json(FILE_SESSIONI, elenco[-200:])   # retention: ultime 200
+        except Exception as e:
+            log_msg(f"[SESSIONE] Salvataggio fallito: {e}")
+
+        log_msg(f"[SESSIONE] Terminata: {durata/60:.0f} min, {kwh:.2f} kWh"
+                f"{f', {quota_fv:.0f}% da FV' if quota_fv is not None else ''}")
+        testo = (f"🔋 *Sessione di carica terminata*\n"
+                 f"⏱️ Durata: {durata/60:.0f} min\n"
+                 f"⚡ Energia: {kwh:.2f} kWh{'' if misurata else ' (stimata)'}\n")
+        if quota_fv is not None:
+            testo += f"🌱 Da fotovoltaico: {quota_fv:.0f}%\n"
+        if sessione['risparmio_eur'] > 0:
+            testo += f"💰 Risparmio stimato: {sessione['risparmio_eur']:.2f} €\n"
+        notifica(testo)
 
     def riepilogo(self):
         eff = self.efficienza_carica()
@@ -2047,6 +2398,64 @@ def carica_storico():
     log_msg(f"[STORICO] Ricaricati {caricati} campioni da disco.")
 
 INTERVALLI = {'15m': 900, '1h': 3600, '6h': 21600, '24h': 86400}
+
+def leggi_json(percorso, default):
+    """Legge un file JSON tollerando assenza e corruzione."""
+    if not os.path.exists(percorso):
+        return default
+    try:
+        with open(percorso, 'r', encoding='utf-8') as f:
+            dati = json.load(f)
+        return dati if isinstance(dati, type(default)) else default
+    except (json.JSONDecodeError, OSError) as e:
+        log_msg(f"[FILE] Lettura {os.path.basename(percorso)} fallita: {e}")
+        return default
+
+def scrivi_json(percorso, dati):
+    """Scrittura atomica: tmp + os.replace."""
+    tmp = percorso + '.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(dati, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, percorso)
+        return True
+    except OSError as e:
+        log_msg(f"[FILE] Scrittura {os.path.basename(percorso)} fallita: {e}")
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+def risparmio_euro(kwh_da_fv, kwh_da_rete=0.0):
+    """Stima del risparmio di aver caricato col proprio sole.
+
+    Caricare dal fotovoltaico evita di comprare (PREZZO_ACQUISTO) ma rinuncia
+    a vendere quell'energia (PREZZO_VENDITA): il guadagno netto e' la
+    differenza. L'energia presa dalla rete e' invece un costo.
+    """
+    delta = CONFIG['PREZZO_ACQUISTO'] - CONFIG['PREZZO_VENDITA']
+    return round(kwh_da_fv * delta - kwh_da_rete * CONFIG['PREZZO_ACQUISTO'], 2)
+
+def giorni_storico(quanti=14):
+    """Ultimi N giorni chiusi + la giornata in corso, con risparmio stimato."""
+    giorni = leggi_json(FILE_STORICO_GIORNALIERO, [])[-quanti:]
+    if contatori_instance:
+        oggi = contatori_instance.riepilogo()
+        # il giorno in corso non e' ancora nel file: lo aggiungo in coda
+        giorni = [g for g in giorni if g.get('giorno') != oggi['giorno']] + [oggi]
+    for g in giorni:
+        da_fv = g.get('wallbox_da_fv_kwh') or 0
+        da_rete = max(0, (g.get('wallbox_kwh') or 0) - da_fv)
+        g['risparmio_eur'] = risparmio_euro(da_fv, da_rete)
+    return giorni
+
+def leggi_sessioni(quante=20):
+    return leggi_json(FILE_SESSIONI, [])[-quante:]
+
 
 def serie_storico(secondi, max_punti=300):
     """Estrae una serie temporale pulita dal buffer: finestra + ORDINAMENTO +
