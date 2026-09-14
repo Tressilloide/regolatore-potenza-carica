@@ -9,6 +9,8 @@ import os
 import asyncio
 import threading
 import queue
+import signal
+import sys
 import io
 import datetime
 from collections import deque
@@ -2879,6 +2881,31 @@ def run_logic(monitor, wallbox):
 # -----------------------------------------------------------
 # THREAD PERIODICO (attivita' cicliche)
 # -----------------------------------------------------------
+def salva_tutto(motivo=""):
+    """Scrive su disco tutto cio' che e' volatile. Idempotente."""
+    try:
+        flush_storico()
+    except Exception as e:
+        log_msg(f"[ARRESTO] Flush storico fallito: {e}")
+    try:
+        if contatori_instance:
+            contatori_instance.salva_stato()
+    except Exception as e:
+        log_msg(f"[ARRESTO] Salvataggio contatori fallito: {e}")
+    if motivo:
+        log_msg(f"[ARRESTO] Stato salvato ({motivo}).")
+
+def gestore_arresto(segnale, frame):
+    """SIGTERM: e' cosi' che systemctl restart/stop ferma il servizio.
+
+    Senza questo il processo veniva ucciso senza salvare, e si perdeva fino a
+    60s di contatori (l'intervallo fra un salvataggio periodico e il
+    successivo). NON spegne la wallbox: un riavvio del servizio non deve
+    interrompere una ricarica in corso.
+    """
+    salva_tutto(f"segnale {segnale}")
+    sys.exit(0)
+
 def thread_periodico(wallbox):
     """Unico thread per tutte le attivita' cicliche.
 
@@ -2991,6 +3018,9 @@ def main():
     tg_thread.daemon = True
     tg_thread.start()
 
+    # systemd ferma il servizio con SIGTERM: intercettarlo per salvare
+    signal.signal(signal.SIGTERM, gestore_arresto)
+
     notifica("✅ SISTEMA AVVIATO.")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -3030,9 +3060,7 @@ def main():
                           "[AVVISO] Nessun pacchetto multicast negli ultimi 30s.", 300)
         except KeyboardInterrupt:
             log_msg("Interruzione richiesta: salvo lo stato...")
-            flush_storico()
-            if contatori_instance:
-                contatori_instance.salva_stato()
+            salva_tutto()
             salva_config()
             wallbox.turn_off(force=True)
             break
