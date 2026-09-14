@@ -71,7 +71,12 @@ CONFIG = {
     'TEMP_PRESA_ALLARME': 70,       # Oltre questa temperatura (C) scatta l'allarme
     'TEMP_PRESA_ATTENZIONE': 60,
     'USA_PCAR': True,               # Usa la potenza auto misurata invece del setpoint
-    'ALG_MANUALE': '2',             # alg=2 (Man): l'unico in cui btn=P<watt> ha effetto     # Ogni quanti secondi rileggere 'tfase' dalla centralina
+    'ALG_MANUALE': '2',
+    # Al riavvio: se l'auto sta gia' caricando, adotta lo stato invece di
+    # spegnerla. Con Restart=always ogni crash costerebbe ~60s di ricarica
+    # (spegnimento + cooldown). Mettere a False per tornare al comportamento
+    # precedente, che forzava sempre uno stato noto spegnendo.
+    'ADOTTA_CARICA_IN_CORSO': True,             # alg=2 (Man): l'unico in cui btn=P<watt> ha effetto     # Ogni quanti secondi rileggere 'tfase' dalla centralina
 
     # --- Limite di ricarica (kWh) --------------------------------------
     # Confermato sul campo leggendo chglimit()/pushed_limit() della centralina
@@ -2082,14 +2087,22 @@ class WallboxController:
             self.update_shared_state()
 
     def turn_on(self):
+        """Accende la wallbox. Ritorna True solo se ha davvero acceso.
+
+        Il valore di ritorno serve al chiamante per non loggare una decisione
+        che in realta' non ha prodotto nulla (durante il cooldown la richiesta
+        viene rifiutata e prima si scriveva comunque 'Accendo' a ogni ciclo).
+        """
         with WALLBOX_LOCK:
             if self.is_on:
-                return
+                return False
             if self.time_turned_off > 0:
                 tempo_trascorso = time.time() - self.time_turned_off
                 if tempo_trascorso < CONFIG['COOLDOWN_ACCENSIONE']:
-                    log_msg(f"[INFO] Attesa cooldown: {CONFIG['COOLDOWN_ACCENSIONE'] - tempo_trascorso:.1f}s prima di accendere")
-                    return
+                    log_throttled('cooldown',
+                                  f"[INFO] Attesa cooldown: "
+                                  f"{CONFIG['COOLDOWN_ACCENSIONE'] - tempo_trascorso:.0f}s prima di accendere", 30)
+                    return False
 
             log_msg("[AZIONE] ACCENSIONE (ON)")
             min_p, _ = self.limiti_potenza()
@@ -2102,6 +2115,8 @@ class WallboxController:
                 self.update_shared_state()
                 if contatori_instance:
                     contatori_instance.inizio_sessione()
+                return True
+            return False
 
     def turn_off(self, force=False):
         with WALLBOX_LOCK:
@@ -2168,13 +2183,39 @@ class WallboxController:
                 log_msg(f"[AVVISO] Centralina non raggiungibile: mantengo la modalita' "
                         f"{'TRIFASE' if self.fase else 'MONOFASE'}.")
 
-            log_msg("1. Metto in OFF (Attesa dati)...")
             self.last_update_time = 0
-            self.turn_off(force=True)
-
             min_p, _ = self.limiti_potenza()
-            log_msg(f"2. Imposto potenza minima ({min_p}W)...")
-            self.set_power(min_p, bypass=True)
+
+            # Se l'auto sta GIA' caricando, si adotta lo stato invece di
+            # spegnere. Con Restart=always ogni crash costerebbe ~60s di
+            # ricarica persa (spegnimento + cooldown di riaccensione), e ormai
+            # lo stato reale della centralina e' leggibile: non serve piu'
+            # forzare uno stato noto spegnendo tutto.
+            try:
+                pcar_ora = float(dati.get('pcar', 0)) if dati else 0.0
+            except (TypeError, ValueError):
+                pcar_ora = 0.0
+
+            if CONFIG.get('ADOTTA_CARICA_IN_CORSO', True) and pcar_ora > 0:
+                try:
+                    potenza_ora = int(float(dati.get('power', min_p)))
+                except (TypeError, ValueError):
+                    potenza_ora = min_p
+                potenza_ora = max(min_p, min(self.limiti_potenza()[1], potenza_ora))
+                log_msg(f"1. Ricarica gia' in corso ({pcar_ora:.0f}W): adotto lo stato "
+                        f"senza interromperla (setpoint {potenza_ora}W).")
+                self.is_on = True
+                self.current_set_power = potenza_ora
+                self.display_power = float(potenza_ora)
+                self.failed_off_attempts = 0
+                self.update_shared_state()
+                if contatori_instance and contatori_instance.inizio_carica is None:
+                    contatori_instance.inizio_sessione()
+            else:
+                log_msg("1. Metto in OFF (Attesa dati)...")
+                self.turn_off(force=True)
+                log_msg(f"2. Imposto potenza minima ({min_p}W)...")
+                self.set_power(min_p, bypass=True)
 
             # NB: qui non si reinvia il limite kWh salvato alla centralina (il
             # comando resta disponibile da UI/Telegram via set_limite_kwh). Per
@@ -2723,8 +2764,12 @@ def run_logic(monitor, wallbox):
 
     if not wallbox.is_on:
         if potenza_esportata > potenza_minima:
-            log_msg(f"[DECISIONE] Export sufficiente. Accendo a {potenza_minima}W.")
-            wallbox.turn_on()
+            # Si logga DOPO, e solo se turn_on ha davvero acceso: durante il
+            # cooldown la richiesta viene rifiutata e prima si scriveva
+            # "Accendo" a ogni ciclo (~6s) senza che accadesse nulla.
+            if wallbox.turn_on():
+                log_msg(f"[DECISIONE] Export sufficiente ({potenza_esportata:.0f}W). "
+                        f"Acceso a {potenza_minima}W.")
         return
 
     if wallbox.is_on:
