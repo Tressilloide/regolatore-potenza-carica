@@ -1770,6 +1770,8 @@ class WallboxController:
         self.ultimo_log_manual_off = 0
         # l'auto e' fisicamente collegata? (da status/desc della centralina)
         self.auto_collegata = False
+        # sta REALMENTE assorbendo? (pcar > 0) - decide i confini della sessione
+        self.in_carica = False
 
     def update_shared_state(self):
         with STATO_LOCK:
@@ -1876,6 +1878,29 @@ class WallboxController:
             desc = dati.get('desc', '?')
             log_msg(f"[CENTRALINA] Stato connessione: {desc}")
             notifica(f"🔌 Wallbox: {desc}", dedup_key='stato_connessione', min_intervallo=120)
+
+        # --- Confini della sessione di ricarica ---------------------------
+        # Si decidono QUI, sulla potenza realmente assorbita, non sui nostri
+        # comandi. L'auto puo' smettere da sola (batteria piena -> status 2
+        # "Fermo") senza che noi spegniamo nulla: prima in quel caso la
+        # sessione restava aperta per sempre e non veniva mai registrata,
+        # cioe' proprio nel modo in cui una ricarica finisce piu' spesso.
+        carica_attiva = num('pcar') > 0
+        if carica_attiva != self.in_carica:
+            self.in_carica = carica_attiva
+            if contatori_instance:
+                if carica_attiva:
+                    if contatori_instance.inizio_carica is None:
+                        contatori_instance.inizio_sessione()
+                        log_msg("[SESSIONE] Avviata.")
+                else:
+                    # NON si tocca is_on: la wallbox resta abilitata, e' l'auto
+                    # che non assorbe. Spegnere e riaccendere qui provocherebbe
+                    # un ciclo inutile a ogni batteria piena.
+                    if contatori_instance.inizio_carica is not None:
+                        log_msg(f"[SESSIONE] L'auto ha smesso di assorbire "
+                                f"({dati.get('desc', '?')}): chiudo la sessione.")
+                        contatori_instance.fine_sessione()
 
         # I limiti dichiarati dalla centralina hanno la precedenza sui valori
         # cablati. ATTENZIONE: la fase va presa dal JSON, non da self.fase:
@@ -2116,8 +2141,8 @@ class WallboxController:
                 self.failed_off_attempts = 0  # Reset contatore quando si accende
                 self.last_update_time = time.time()
                 self.update_shared_state()
-                if contatori_instance:
-                    contatori_instance.inizio_sessione()
+                # La sessione la apre _assorbi_stato quando vede pcar > 0:
+                # un solo produttore, basato sulla potenza reale.
                 return True
             return False
 
@@ -2138,8 +2163,7 @@ class WallboxController:
                 self.time_turned_off = time.time()
                 self.last_update_time = time.time()
                 self.update_shared_state()
-                if era_acceso and contatori_instance:
-                    contatori_instance.fine_sessione()
+                # La sessione la chiude _assorbi_stato quando pcar torna a 0.
                 time.sleep(0.5)
                 min_p, _ = self.limiti_potenza()
                 try:
@@ -2212,8 +2236,6 @@ class WallboxController:
                 self.display_power = float(potenza_ora)
                 self.failed_off_attempts = 0
                 self.update_shared_state()
-                if contatori_instance and contatori_instance.inizio_carica is None:
-                    contatori_instance.inizio_sessione()
             else:
                 log_msg("1. Metto in OFF (Attesa dati)...")
                 self.turn_off(force=True)
