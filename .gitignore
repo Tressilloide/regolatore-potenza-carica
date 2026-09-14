@@ -8,3 +8,4 @@ storico_giornaliero.json
 
 __pycache__/
 *.pyc
+stato_energia.json

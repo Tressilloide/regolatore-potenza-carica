@@ -102,6 +102,7 @@ FILE_CONFIG = os.path.join(DIR_BASE, 'config_utente.json')
 FILE_STORICO = os.path.join(DIR_BASE, 'storico.jsonl')
 FILE_STORICO_GIORNALIERO = os.path.join(DIR_BASE, 'storico_giornaliero.json')
 FILE_SESSIONI = os.path.join(DIR_BASE, 'sessioni.json')
+FILE_STATO_ENERGIA = os.path.join(DIR_BASE, 'stato_energia.json')
 
 # Stato condiviso per la Web UI e Telegram
 SYSTEM_STATE = {
@@ -2316,6 +2317,7 @@ class ContatoriEnergia:
         self.archivia_giorno()
         self.giorno = oggi
         self.azzera()
+        self.salva_stato()
         log_msg(f"[ENERGIA] Nuovo giorno: {oggi}. Contatori azzerati.")
 
     def efficienza_carica(self):
@@ -2412,6 +2414,45 @@ class ContatoriEnergia:
             f"📊 *Efficienza di carica: {eff}*\n"
             f"⏱️ Tempo di carica: {r['minuti_carica']} min\n"
         )
+
+    def salva_stato(self):
+        """Salva i contatori della giornata in corso.
+
+        Senza questo, un riavvio (e con Restart=always capita) azzerava tutti
+        i contatori del giorno: l'energia accumulata fin li' andava persa e il
+        giorno archiviato a mezzanotte risultava incompleto.
+        """
+        return scrivi_json(FILE_STATO_ENERGIA, {
+            'giorno': self.giorno,
+            'solare_wh': self.solare_wh,
+            'rete_importata_wh': self.rete_importata_wh,
+            'rete_esportata_wh': self.rete_esportata_wh,
+            'wallbox_wh': self.wallbox_wh,
+            'wallbox_da_fv_wh': self.wallbox_da_fv_wh,
+            'secondi_carica': self.secondi_carica,
+        })
+
+    def carica_stato(self):
+        """Ripristina i contatori se il file e' della giornata corrente."""
+        dati = leggi_json(FILE_STATO_ENERGIA, {})
+        if not dati or dati.get('giorno') != self.giorno:
+            if dati:
+                log_msg(f"[ENERGIA] Stato salvato del {dati.get('giorno')}: "
+                        f"non e' oggi, riparto da zero.")
+            return
+        try:
+            self.solare_wh = float(dati.get('solare_wh', 0))
+            self.rete_importata_wh = float(dati.get('rete_importata_wh', 0))
+            self.rete_esportata_wh = float(dati.get('rete_esportata_wh', 0))
+            self.wallbox_wh = float(dati.get('wallbox_wh', 0))
+            self.wallbox_da_fv_wh = float(dati.get('wallbox_da_fv_wh', 0))
+            self.secondi_carica = float(dati.get('secondi_carica', 0))
+        except (TypeError, ValueError) as e:
+            log_msg(f"[ENERGIA] Stato salvato illeggibile: {e}. Riparto da zero.")
+            self.azzera()
+            return
+        log_msg(f"[ENERGIA] Ripresi i contatori di oggi: "
+                f"{self.solare_wh/1000:.2f} kWh solari, {self.wallbox_wh/1000:.2f} kWh in auto.")
 
     def archivia_giorno(self):
         """Appende il giorno chiuso a storico_giornaliero.json (retention 90gg)."""
@@ -2868,10 +2909,12 @@ def thread_periodico(wallbox):
                 log_msg(f"[ERRORE] sync_fase: {e}")
                 prossimo_sync = adesso + 60
 
-        # --- Flush storico su disco ogni 60s (salva-SD) ---
+        # --- Flush storico + contatori su disco ogni 60s (salva-SD) ---
         if adesso >= prossimo_flush:
             try:
                 flush_storico()
+                if contatori_instance:
+                    contatori_instance.salva_stato()
             except Exception as e:
                 log_msg(f"[ERRORE] flush storico: {e}")
             prossimo_flush = adesso + CONFIG['STORICO_FLUSH_S']
@@ -2929,6 +2972,7 @@ def main():
 
     monitor = EnergyMonitor()
     contatori_instance = ContatoriEnergia()
+    contatori_instance.carica_stato()   # riprende i contatori di oggi dopo un riavvio
     wallbox_instance = WallboxController()
     wallbox = wallbox_instance
 
@@ -2987,6 +3031,8 @@ def main():
         except KeyboardInterrupt:
             log_msg("Interruzione richiesta: salvo lo stato...")
             flush_storico()
+            if contatori_instance:
+                contatori_instance.salva_stato()
             salva_config()
             wallbox.turn_off(force=True)
             break
