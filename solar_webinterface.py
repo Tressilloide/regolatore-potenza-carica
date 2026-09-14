@@ -2374,13 +2374,17 @@ class ContatoriEnergia:
 
         # La centralina azzera 'energy' a fine sessione, quindi il valore letto
         # per ultimo e' quello buono; se manca si ripiega sulla stima.
-        # WB_ENERGIA_SESSIONE e' gia' in kWh; il flag dice se viene da un
-        # contatore reale o da una stima della centralina. Questa wallbox
-        # riporta valori stimati (energy negativo), quindi in pratica si usa
-        # la nostra integrazione, ma il codice regge anche l'altro caso.
+        # Il contatore della centralina ha la precedenza sulla nostra
+        # integrazione ANCHE quando e' marcato "stimato": quel flag significa
+        # "non omologato", non "inaffidabile", ed e' comunque un conteggio
+        # fatto dall'hardware, piu' fine del nostro campionato ogni 5s.
+        # Si ripiega sulla nostra stima solo se la centralina riporta 0
+        # (ad esempio perche' ha gia' azzerato il contatore di sessione).
         kwh_centralina = SYSTEM_STATE.get('WB_ENERGIA_SESSIONE') or 0.0
-        misurata = bool(SYSTEM_STATE.get('WB_ENERGIA_MISURATA')) and kwh_centralina > 0
-        kwh = kwh_centralina if misurata else kwh_stimati
+        misurata = bool(SYSTEM_STATE.get('WB_ENERGIA_MISURATA'))
+        kwh = kwh_centralina if kwh_centralina > 0 else kwh_stimati
+        origine = ('contatore' if misurata else 'centralina (stima)') \
+            if kwh_centralina > 0 else 'integrazione interna'
         quota_fv = min(100.0, kwh_fv / kwh_stimati * 100.0) if kwh_stimati > 0 else None
 
         sessione = {
@@ -2389,6 +2393,7 @@ class ContatoriEnergia:
             'minuti': round(durata / 60),
             'kwh': round(kwh, 2),
             'kwh_misurati': misurata,
+            'origine_kwh': origine,
             'quota_fv': round(quota_fv, 1) if quota_fv is not None else None,
             'potenza_media': round(kwh * 1000 / (durata / 3600)) if durata > 0 else 0,
             'risparmio_eur': risparmio_euro(kwh * (quota_fv or 0) / 100.0,
@@ -2401,7 +2406,7 @@ class ContatoriEnergia:
         except Exception as e:
             log_msg(f"[SESSIONE] Salvataggio fallito: {e}")
 
-        log_msg(f"[SESSIONE] Terminata: {durata/60:.0f} min, {kwh:.2f} kWh"
+        log_msg(f"[SESSIONE] Terminata: {durata/60:.0f} min, {kwh:.2f} kWh ({origine})"
                 f"{f', {quota_fv:.0f}% da FV' if quota_fv is not None else ''}")
         testo = (f"🔋 *Sessione di carica terminata*\n"
                  f"⏱️ Durata: {durata/60:.0f} min\n"
