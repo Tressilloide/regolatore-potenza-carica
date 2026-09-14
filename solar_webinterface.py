@@ -109,7 +109,8 @@ SYSTEM_STATE = {
     'IMPIANTO_FASE': 0, # 0=Mono, 1=Tri
     'WB_PCAR': None,                # Potenza auto MISURATA dalla centralina (W)
     'WB_PCAR_LETTO_IL': 0,          # Quando e' stata letta (per scartarla se stantia)
-    'WB_ENERGIA_SESSIONE': 0,
+    'WB_ENERGIA_SESSIONE': 0,      # kWh della sessione (gia' convertiti da Wh)
+    'WB_ENERGIA_MISURATA': False,  # True se la centralina ha un contatore reale
     'WB_TEMPO_SESSIONE': 0,
     'WB_TEMP_PRESA': None,
     'WB_TEMP_SCHEDA': None,
@@ -418,6 +419,33 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🛡️ *Protezione:* {protezione} W\n"
         f"🔋 *Limite carica:* {limite} kWh\n"
     )
+    # Dati letti direttamente dalla centralina
+    with STATO_LOCK:
+        desc = SYSTEM_STATE['WB_DESC']
+        pcar = SYSTEM_STATE['WB_PCAR']
+        sessione = SYSTEM_STATE['WB_ENERGIA_SESSIONE']
+        sess_misurata = SYSTEM_STATE['WB_ENERGIA_MISURATA']
+        tempo_sess = SYSTEM_STATE['WB_TEMPO_SESSIONE']
+        temp_presa = SYSTEM_STATE['WB_TEMP_PRESA']
+        alg = SYSTEM_STATE['WB_ALG']
+
+    if desc:
+        msg += f"\n🔎 *Centralina*\n🚙 Auto: {desc}\n"
+        if pcar is not None:
+            msg += f"📏 Potenza misurata: {pcar:.0f} W\n"
+        if sessione:
+            nota = "" if sess_misurata else " (stimata)"
+            msg += f"🔋 Sessione: {sessione:.2f} kWh{nota}"
+            if tempo_sess:
+                msg += f" in {tempo_sess/60:.0f} min"
+            msg += "\n"
+        if temp_presa is not None:
+            msg += f"🌡️ Presa: {temp_presa:.0f} °C\n"
+
+    if alg and alg != CONFIG['ALG_MANUALE']:
+        nomi = {'0': 'Sole', '1': 'Eco', '2': 'Man', '3': 'Fast', '4': 'Alone'}
+        msg += (f"\n⚠️ Centralina in modalità *{nomi.get(alg, alg)}* invece di *Man*: "
+                f"i comandi di potenza non hanno effetto.\n")
     if not centralina_ok:
         msg += "\n⚠️ *Centralina non raggiungibile*\n"
     if not sensore_ok:
@@ -592,7 +620,8 @@ async def cmd_sessioni(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if contatori_instance and contatori_instance.inizio_carica:
         minuti = (time.time() - contatori_instance.inizio_carica) / 60
         kwh = SYSTEM_STATE.get('WB_ENERGIA_SESSIONE') or 0.0
-        corso = f"▶️ *In corso:* {minuti:.0f} min, {kwh:.2f} kWh\n\n"
+        nota = "" if SYSTEM_STATE.get('WB_ENERGIA_MISURATA') else " (stimata)"
+        corso = f"▶️ *In corso:* {minuti:.0f} min, {kwh:.2f} kWh{nota}\n\n"
     else:
         corso = ""
 
@@ -1331,7 +1360,11 @@ async function aggiorna() {
     $('c_desc').textContent = s.wb_desc || '--';
     $('c_set').textContent = num(s.wb_power);
     $('c_pcar').textContent = num(s.wb_pcar);
-    $('c_sess').textContent = (s.wb_energia_sessione === null || s.wb_energia_sessione === undefined) ? '--' : s.wb_energia_sessione;
+    /* La centralina dichiara se l'energia e' misurata o stimata (segno di
+       'energy'): va detto, altrimenti il numero sembra piu' preciso di com'e'. */
+    $('c_sess').textContent = (s.wb_energia_sessione === null || s.wb_energia_sessione === undefined)
+        ? '--'
+        : s.wb_energia_sessione.toFixed(2) + (s.wb_energia_misurata ? '' : ' (stim.)');
     $('c_temp').textContent = (s.wb_temp_presa === null || s.wb_temp_presa === undefined) ? '--' : Math.round(s.wb_temp_presa);
 
     const set = (id, v) => { $(id).textContent = (v === null || v === undefined) ? '--' : v; };
@@ -1504,7 +1537,8 @@ def get_data():
             'wb_desc': SYSTEM_STATE['WB_DESC'],
             'wb_status': SYSTEM_STATE['WB_STATUS'],
             'wb_pcar': SYSTEM_STATE['WB_PCAR'],
-            'wb_energia_sessione': SYSTEM_STATE['WB_ENERGIA_SESSIONE'],
+            'wb_energia_sessione': round(SYSTEM_STATE['WB_ENERGIA_SESSIONE'], 2),
+            'wb_energia_misurata': SYSTEM_STATE['WB_ENERGIA_MISURATA'],
             'wb_tempo_sessione': SYSTEM_STATE['WB_TEMPO_SESSIONE'],
             'wb_temp_presa': SYSTEM_STATE['WB_TEMP_PRESA'],
             'wb_alg': SYSTEM_STATE['WB_ALG'],
@@ -1637,6 +1671,7 @@ def get_sessioni():
         in_corso = {
             'minuti': round((adesso - contatori_instance.inizio_carica) / 60),
             'kwh': round(SYSTEM_STATE.get('WB_ENERGIA_SESSIONE') or 0.0, 2),
+            'misurata': bool(SYSTEM_STATE.get('WB_ENERGIA_MISURATA')),
         }
     return jsonify({'success': True, 'sessioni': sessioni, 'in_corso': in_corso})
 
@@ -1806,7 +1841,16 @@ class WallboxController:
         with STATO_LOCK:
             SYSTEM_STATE['WB_PCAR'] = num('pcar')
             SYSTEM_STATE['WB_PCAR_LETTO_IL'] = time.time()
-            SYSTEM_STATE['WB_ENERGIA_SESSIONE'] = num('energy')
+            # 'energy' e' in Wh (NON kWh) e il SEGNO e' un flag, non un valore:
+            #   energy > 0  -> energia MISURATA da un contatore reale
+            #   energy < 0  -> energia STIMATA, il valore e' il modulo
+            # (dal JS della centralina: if(data.energy>0){stimato=0} else
+            #  {stimato=1; data.energy=-data.energy} ... data.energy+" Wh")
+            # Prima veniva preso cosi' com'era e mostrato come kWh: usciva
+            # "-370 kWh" invece di "0,37 kWh (stimata)".
+            energia_grezza = num('energy')
+            SYSTEM_STATE['WB_ENERGIA_SESSIONE'] = abs(energia_grezza) / 1000.0
+            SYSTEM_STATE['WB_ENERGIA_MISURATA'] = energia_grezza > 0
             SYSTEM_STATE['WB_TEMPO_SESSIONE'] = num('time')
             SYSTEM_STATE['WB_TEMP_PRESA'] = num('tplug')
             SYSTEM_STATE['WB_TEMP_SCHEDA'] = num('tboard')
@@ -2263,9 +2307,13 @@ class ContatoriEnergia:
 
         # La centralina azzera 'energy' a fine sessione, quindi il valore letto
         # per ultimo e' quello buono; se manca si ripiega sulla stima.
-        kwh_reali = SYSTEM_STATE.get('WB_ENERGIA_SESSIONE') or 0.0
-        misurata = kwh_reali > 0
-        kwh = kwh_reali if misurata else kwh_stimati
+        # WB_ENERGIA_SESSIONE e' gia' in kWh; il flag dice se viene da un
+        # contatore reale o da una stima della centralina. Questa wallbox
+        # riporta valori stimati (energy negativo), quindi in pratica si usa
+        # la nostra integrazione, ma il codice regge anche l'altro caso.
+        kwh_centralina = SYSTEM_STATE.get('WB_ENERGIA_SESSIONE') or 0.0
+        misurata = bool(SYSTEM_STATE.get('WB_ENERGIA_MISURATA')) and kwh_centralina > 0
+        kwh = kwh_centralina if misurata else kwh_stimati
         quota_fv = min(100.0, kwh_fv / kwh_stimati * 100.0) if kwh_stimati > 0 else None
 
         sessione = {
@@ -2729,8 +2777,15 @@ def run_logic(monitor, wallbox):
                 # limito alla potenza massima disponibile, la notifica viene gestita
                 # dal blocco di controllo sopra per evitare messaggi ripetuti.
                 nuova_potenza = potenza_massima
+                # Se siamo GIA' al massimo non c'e' nulla da fare: prima si
+                # rimandava btn=P<max> alla centralina ogni ciclo (~6s) e si
+                # scriveva "Aumento" a vuoto, riempiendo log e console.
+                if wallbox.current_set_power >= potenza_massima:
+                    log_throttled('gia_al_massimo',
+                                  f"[DECISIONE] Gia' alla potenza massima ({potenza_massima:.0f}W).", 600)
+                    return
                 wallbox.set_power(nuova_potenza, bypass=True)
-                log_msg(f"[DECISIONE] Aumento a {nuova_potenza:.0f}W")
+                log_msg(f"[DECISIONE] Aumento a {nuova_potenza:.0f}W (massimo)")
                 return
             log_msg(f"[DECISIONE] Aumento a {nuova_potenza:.0f}W")
             wallbox.set_power(nuova_potenza, bypass=False)
