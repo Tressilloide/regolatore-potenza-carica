@@ -770,6 +770,21 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ *Re-inizializzazione completata*\n⚙️ Modalità rilevata: {modalita}", parse_mode='Markdown')
 
+async def gestore_errori_telegram(update, context):
+    """Gestore errori di python-telegram-bot.
+
+    Senza, PTB scrive 'No error handlers are registered' e riversa nel log un
+    traceback completo a ogni singhiozzo di rete (visto: un 502 'Bad Gateway'
+    notturno). Il suo retry loop si riprende da solo, quindi basta una riga.
+    """
+    errore = context.error
+    nome = type(errore).__name__
+    if nome in ('NetworkError', 'TimedOut', 'RetryAfter'):
+        log_throttled(f'telegram_{nome}', f"[TELEGRAM] Problema di rete ({nome}): {errore}. "
+                                          f"Riprovo automaticamente.", 600)
+    else:
+        log_msg(f"[TELEGRAM] Errore non gestito ({nome}): {errore}")
+
 def _registra_comandi(app):
     """Registra gli handler. I nomi con maiuscole sono rifiutati da PTB v20+
     (regex ^[\\da-z_]{1,32}$) e farebbero morire l'intero bot: vengono quindi
@@ -821,6 +836,7 @@ def run_telegram_polling():
         try:
             app = Application.builder().token(API_KEY).build()
             _registra_comandi(app)
+            app.add_error_handler(gestore_errori_telegram)
             log_msg(">>> BOT TELEGRAM ATTIVO. In attesa di comandi... <<<")
             attesa = 5
             # stop_signals=None evita conflitti di segnali con il thread principale
@@ -1676,9 +1692,17 @@ def get_sessioni():
     in_corso = None
     if contatori_instance and contatori_instance.inizio_carica:
         adesso = time.time()
+        # 'kwh' e' l'energia di QUESTA sessione (delta del contatore), coerente
+        # con le sessioni registrate; 'kwh_da_collegamento' e' il totale che la
+        # centralina conta dall'inserimento del cavo, pause comprese.
+        totale = SYSTEM_STATE.get('WB_ENERGIA_SESSIONE') or 0.0
+        delta = totale - contatori_instance.energy_inizio
+        if delta < 0:
+            delta = totale
         in_corso = {
             'minuti': round((adesso - contatori_instance.inizio_carica) / 60),
-            'kwh': round(SYSTEM_STATE.get('WB_ENERGIA_SESSIONE') or 0.0, 2),
+            'kwh': round(max(0.0, delta), 2),
+            'kwh_da_collegamento': round(totale, 2),
             'misurata': bool(SYSTEM_STATE.get('WB_ENERGIA_MISURATA')),
         }
     return jsonify({'success': True, 'sessioni': sessioni, 'in_corso': in_corso})
@@ -2378,13 +2402,24 @@ class ContatoriEnergia:
         # integrazione ANCHE quando e' marcato "stimato": quel flag significa
         # "non omologato", non "inaffidabile", ed e' comunque un conteggio
         # fatto dall'hardware, piu' fine del nostro campionato ogni 5s.
-        # Si ripiega sulla nostra stima solo se la centralina riporta 0
-        # (ad esempio perche' ha gia' azzerato il contatore di sessione).
-        kwh_centralina = SYSTEM_STATE.get('WB_ENERGIA_SESSIONE') or 0.0
+        #
+        # ATTENZIONE: va preso il DELTA, non il valore assoluto. Il contatore
+        # non si azzera fra una pausa e la ripresa della stessa connessione:
+        # conta dal momento in cui il cavo e' stato inserito. Prendendolo
+        # cosi' com'era, ogni sessione ereditava il totale di quelle
+        # precedenti (visto sul campo: 1 minuto di carica registrato come
+        # 3,65 kWh, cioe' 219 kW).
+        energia_ora = SYSTEM_STATE.get('WB_ENERGIA_SESSIONE') or 0.0
         misurata = bool(SYSTEM_STATE.get('WB_ENERGIA_MISURATA'))
-        kwh = kwh_centralina if kwh_centralina > 0 else kwh_stimati
+        delta_centralina = energia_ora - self.energy_inizio
+        if delta_centralina < 0:
+            # Il contatore e' stato azzerato (cavo staccato e reinserito):
+            # il valore attuale e' gia' l'energia di questa sessione.
+            delta_centralina = energia_ora
+
+        kwh = delta_centralina if delta_centralina > 0 else kwh_stimati
         origine = ('contatore' if misurata else 'centralina (stima)') \
-            if kwh_centralina > 0 else 'integrazione interna'
+            if delta_centralina > 0 else 'integrazione interna'
         quota_fv = min(100.0, kwh_fv / kwh_stimati * 100.0) if kwh_stimati > 0 else None
 
         sessione = {
