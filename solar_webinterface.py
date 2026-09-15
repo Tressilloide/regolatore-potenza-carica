@@ -1024,6 +1024,34 @@ HTML_TEMPLATE = """
     <div class="colonne">
         <div>
             <div class="card">
+                <h2>Dettaglio fasi</h2>
+                <div class="colonne" style="gap:22px">
+                    <div>
+                        <div class="riga"><span class="n">L1 rete</span><span class="w"><span id="l1">0</span> W</span></div>
+                        <div class="riga"><span class="n">L2 rete</span><span class="w"><span id="l2">0</span> W</span></div>
+                        <div class="riga"><span class="n">L3 rete</span><span class="w"><span id="l3">0</span> W</span></div>
+                        <div class="tot"><span>Totale rete</span><span class="w"><span id="tot_grid">0</span> W</span></div>
+                    </div>
+                    <div>
+                        <div class="riga"><span class="n">L4 solare</span><span class="w"><span id="l4">0</span> W</span></div>
+                        <div class="riga"><span class="n">L5 solare</span><span class="w"><span id="l5">0</span> W</span></div>
+                        <div class="riga"><span class="n">L6 solare</span><span class="w"><span id="l6">0</span> W</span></div>
+                        <div class="tot"><span>Totale solare</span><span class="w"><span id="tot_solar">0</span> W</span></div>
+                    </div>
+                </div>
+            </div>
+            <div class="card">
+                <h2>Andamento</h2>
+                <div class="intervalli">
+                    <button class="i-btn attivo" data-r="live" onclick="cambiaRange('live')">Live</button>
+                    <button class="i-btn" data-r="1h" onclick="cambiaRange('1h')">1 ora</button>
+                    <button class="i-btn" data-r="6h" onclick="cambiaRange('6h')">6 ore</button>
+                    <button class="i-btn" data-r="24h" onclick="cambiaRange('24h')">24 ore</button>
+                </div>
+                <div class="grafico-box"><canvas id="grafico"></canvas></div>
+            </div>
+
+            <div class="card">
                 <h2>Energia di oggi</h2>
                 <div class="tiles">
                     <div class="tile"><div class="v" id="e_solare">--</div><div class="l">Prodotta (kWh)</div></div>
@@ -1041,17 +1069,6 @@ HTML_TEMPLATE = """
             </div>
 
             <div class="card">
-                <h2>Andamento</h2>
-                <div class="intervalli">
-                    <button class="i-btn attivo" data-r="live" onclick="cambiaRange('live')">Live</button>
-                    <button class="i-btn" data-r="1h" onclick="cambiaRange('1h')">1 ora</button>
-                    <button class="i-btn" data-r="6h" onclick="cambiaRange('6h')">6 ore</button>
-                    <button class="i-btn" data-r="24h" onclick="cambiaRange('24h')">24 ore</button>
-                </div>
-                <div class="grafico-box"><canvas id="grafico"></canvas></div>
-            </div>
-
-            <div class="card">
                 <h2>Ultimi giorni</h2>
                 <div class="grafico-box" style="height:260px"><canvas id="grafico_giorni"></canvas></div>
                 <div class="tiles" style="margin-top:16px">
@@ -1062,23 +1079,6 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
-            <div class="card">
-                <h2>Dettaglio fasi</h2>
-                <div class="colonne" style="gap:22px">
-                    <div>
-                        <div class="riga"><span class="n">L1 rete</span><span class="w"><span id="l1">0</span> W</span></div>
-                        <div class="riga"><span class="n">L2 rete</span><span class="w"><span id="l2">0</span> W</span></div>
-                        <div class="riga"><span class="n">L3 rete</span><span class="w"><span id="l3">0</span> W</span></div>
-                        <div class="tot"><span>Totale rete</span><span class="w"><span id="tot_grid">0</span> W</span></div>
-                    </div>
-                    <div>
-                        <div class="riga"><span class="n">L4 solare</span><span class="w"><span id="l4">0</span> W</span></div>
-                        <div class="riga"><span class="n">L5 solare</span><span class="w"><span id="l5">0</span> W</span></div>
-                        <div class="riga"><span class="n">L6 solare</span><span class="w"><span id="l6">0</span> W</span></div>
-                        <div class="tot"><span>Totale solare</span><span class="w"><span id="tot_solar">0</span> W</span></div>
-                    </div>
-                </div>
-            </div>
         </div>
 
         <div>
