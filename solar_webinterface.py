@@ -29,6 +29,8 @@ from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from flask import Flask, jsonify, request, render_template_string
 
+from regolatore_pid import RegolatorePID
+
 # -----------------------------------------------------------
 # CONFIGURAZIONE WEB & GLOBALE
 # -----------------------------------------------------------
@@ -79,6 +81,18 @@ CONFIG = {
     # (spegnimento + cooldown). Mettere a False per tornare al comportamento
     # precedente, che forzava sempre uno stato noto spegnendo.
     'ADOTTA_CARICA_IN_CORSO': True,             # alg=2 (Man): l'unico in cui btn=P<watt> ha effetto     # Ogni quanti secondi rileggere 'tfase' dalla centralina
+
+    # --- Algoritmo di regolazione (persistito, /algoritmo da Telegram) ---
+    # 'classico': la logica storica di run_logic.
+    # 'pid': regolatore_pid.py, con la stima dello scambio ogni 6 s. Tarato
+    #   con simulatore_regolatore.py sullo storico reale.
+    'ALGORITMO': 'classico',
+    'PID_KP': 0.1,
+    'PID_KI': 0.2,                  # 1/s: a ogni pacchetto (6 s) recupera ~il 100% dell'errore
+    'PID_KD': 0.0,                  # con misure ogni 6 s il derivativo aggiunge solo comandi
+    'PID_MARGINE': 150,             # W di export da tenere come riserva
+    'PID_BANDA_DISCESA': 100,       # si scende appena il PID chiede 100 W in meno (in salita vale POTENZA_PROTEZIONE)
+    'PID_IMPORT_SPEGNIMENTO': 200,  # import medio al minimo oltre cui, dopo TIMER_SPEGNIMENTO, si spegne
 
     # --- Limite di ricarica (kWh) --------------------------------------
     # Confermato sul campo leggendo chglimit()/pushed_limit() della centralina
@@ -145,6 +159,7 @@ WALLBOX_LOCK = threading.RLock()
 # Variabile globale per accedere al controller dalla UI Web e da Telegram
 wallbox_instance = None
 contatori_instance = None
+regolatore_pid_instance = None
 
 load_dotenv()
 API_KEY = os.getenv('API_KEY')
@@ -192,6 +207,12 @@ CHIAVI_PERSISTENTI = {
     'LIMITE_KWH':          (1, 100, int),
     'PREZZO_ACQUISTO':     (0, 5, float),
     'PREZZO_VENDITA':      (0, 5, float),
+    # tupla di stringhe = scelta fra valori ammessi
+    'ALGORITMO':           (None, None, ('classico', 'pid')),
+    'PID_KP':              (0, 5, float),
+    'PID_KI':              (0, 2, float),
+    'PID_KD':              (0, 20, float),
+    'PID_MARGINE':         (0, 3000, int),
 }
 
 def valida_valore(chiave, valore):
@@ -207,6 +228,12 @@ def valida_valore(chiave, valore):
 
     if valore is None:
         return False, None, f"{chiave}: valore mancante"
+
+    if isinstance(tipo, tuple):
+        scelta = str(valore).strip().lower()
+        if scelta in tipo:
+            return True, scelta, None
+        return False, None, f"{chiave}: valori ammessi {', '.join(tipo)} (ricevuto {valore!r})"
 
     if tipo is bool:
         if isinstance(valore, bool):
@@ -396,6 +423,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/setPotenzaPrelevabile <W> - Potenza prelevabile dalla rete\n"
         "/setPotenzaProtezione <W> - Soglia di protezione\n"
         "/limite <kWh> - Energia da caricare (1-100)\n"
+        "/algoritmo [classico|pid] - Algoritmo di regolazione\n"
+        "/pid [kp|ki|kd|margine <valore>] - Stato e taratura del PID\n"
     )
     await update.message.reply_text(msg, parse_mode='Markdown')
 
@@ -551,6 +580,49 @@ async def cmd_limite(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{'✅' if inviato else '⚠️'} *Limite:* {CONFIG['LIMITE_KWH']} kWh\n{dettaglio}", parse_mode='Markdown')
     else:
         await update.message.reply_text(f"✅ *Limite* salvato: {CONFIG['LIMITE_KWH']} kWh", parse_mode='Markdown')
+
+async def cmd_algoritmo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mostra o cambia l'algoritmo di regolazione (classico | pid)."""
+    if not check_auth(update): return
+    if not context.args:
+        await update.message.reply_text(
+            f"🧠 *Algoritmo:* {CONFIG['ALGORITMO']}\n"
+            "Usa: `/algoritmo pid` oppure `/algoritmo classico`", parse_mode='Markdown')
+        return
+    ok, errore = applica_impostazione('ALGORITMO', context.args[0], 'TELEGRAM')
+    if ok:
+        await update.message.reply_text(f"✅ *Algoritmo* impostato a {CONFIG['ALGORITMO']}", parse_mode='Markdown')
+    else:
+        await update.message.reply_text(f"⚠️ {errore}", parse_mode='Markdown')
+
+async def cmd_pid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stato del PID; con argomenti ne cambia un parametro: /pid ki 0.2"""
+    if not check_auth(update): return
+    parametri = {'kp': 'PID_KP', 'ki': 'PID_KI', 'kd': 'PID_KD', 'margine': 'PID_MARGINE'}
+    if len(context.args) == 2:
+        chiave = parametri.get(context.args[0].lower())
+        if chiave is None:
+            await update.message.reply_text("⚠️ Parametri: kp, ki, kd, margine. Esempio: `/pid ki 0.2`",
+                                            parse_mode='Markdown')
+            return
+        ok, errore = applica_impostazione(chiave, context.args[1], 'TELEGRAM')
+        if not ok:
+            await update.message.reply_text(f"⚠️ {errore}", parse_mode='Markdown')
+            return
+
+    msg = (f"🧠 *PID* ({'attivo' if CONFIG['ALGORITMO'] == 'pid' else 'non attivo'})\n"
+           f"Kp {CONFIG['PID_KP']}  Ki {CONFIG['PID_KI']}  Kd {CONFIG['PID_KD']}\n"
+           f"Margine: {CONFIG['PID_MARGINE']} W\n")
+    stima = regolatore_pid_instance.ultima_stima if regolatore_pid_instance else None
+    if stima:
+        segno = "esporto" if stima['scambio'] >= 0 else "importo"
+        msg += (f"\n📐 *Stima* ({time.time() - stima['t']:.0f}s fa)\n"
+                f"Scambio: {segno} {abs(stima['scambio'])} W "
+                f"(correzione {stima['correzione']:+d} W)\n"
+                f"Disponibile per l'auto: {stima['disponibile']} W\n")
+        if stima['tetto_auto'] is not None:
+            msg += f"L'auto assorbe meno del concesso: al massimo {stima['tetto_auto']} W\n"
+    await update.message.reply_text(msg, parse_mode='Markdown')
 
 async def cmd_storico(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Riepilogo degli ultimi giorni + grafico a barre."""
@@ -797,6 +869,8 @@ def _registra_comandi(app):
         (["prelevabile", "setpotenzaprelevabile"], cmd_set_prelevabile),
         (["protezione", "setpotenzaprotezione"], cmd_set_protezione),
         (["limite"], cmd_limite),
+        (["algoritmo"], cmd_algoritmo),
+        (["pid"], cmd_pid),
         (["fase"], cmd_fase),
         (["energia"], cmd_energia),
         (["storico"], cmd_storico),
@@ -1529,6 +1603,7 @@ CAMPI_WEB = {
     'limite':      'LIMITE_KWH',
     'prezzo_acquisto': 'PREZZO_ACQUISTO',
     'prezzo_vendita':  'PREZZO_VENDITA',
+    'algoritmo':       'ALGORITMO',
 }
 
 @app.route('/api/data')
@@ -1575,7 +1650,9 @@ def get_data():
             'limite': CONFIG['LIMITE_KWH'],
             'prezzo_acquisto': CONFIG['PREZZO_ACQUISTO'],
             'prezzo_vendita': CONFIG['PREZZO_VENDITA'],
+            'algoritmo': CONFIG['ALGORITMO'],
         }
+        stato['stima_pid'] = regolatore_pid_instance.ultima_stima if regolatore_pid_instance else None
 
     return jsonify({
         'config': configurazione,
@@ -2731,6 +2808,11 @@ class EnergyMonitor:
         self.fases = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         self.ctrletturefasi = 0
         self.time = None
+        # 'exporting' del pacchetto solar: media dei 6 s precedenti, somma
+        # delle sole fasi che esportano (vedi regolatore_pid.py). Non e' lo
+        # scambio netto: lo usa solo lo stimatore del PID.
+        self.export_now = None
+        self.ultimo_tipo = None     # 'solar' | 'electricity': cosa ha fatto scattare run_logic
 
     def parse_packet(self, data):
         try:
@@ -2759,6 +2841,7 @@ class EnergyMonitor:
                     self.fases = [l1, l2, l3, l4, l5, l6]
 
                     self.ctrletturefasi += 1
+                    self.ultimo_tipo = 'electricity'
                     SYSTEM_STATE['ULTIMA_LETTURA_FASI'] = time.time()
                     SYSTEM_STATE['MONITOR_FASI'] = self.fases
                     SYSTEM_STATE['SENSORE_ONLINE'] = True
@@ -2794,6 +2877,12 @@ class EnergyMonitor:
                     if nodo is None:
                         return None
                     self.solar_now = float(nodo.text)
+                    nodo_exp = curr.find('exporting')
+                    try:
+                        self.export_now = float(nodo_exp.text) if nodo_exp is not None else None
+                    except (TypeError, ValueError):
+                        self.export_now = None
+                    self.ultimo_tipo = 'solar'
                     SYSTEM_STATE['ULTIMA_LETTURA_SOLARE'] = time.time()
                     SYSTEM_STATE['SENSORE_ONLINE'] = True
                     self.time = SYSTEM_STATE['ULTIMA_LETTURA_SOLARE']
@@ -2809,7 +2898,60 @@ class EnergyMonitor:
             log_throttled('parse_generico', f"[ERRORE] Pacchetto scartato: {e}", 300)
         return None
 
+def notifica_potenza_massima(wallbox, potenza_carica, potenza_massima):
+    """Avvisa se la wallbox resta alla potenza massima per almeno 60 s."""
+    now = time.time()
+    if not wallbox.is_on:
+        return
+    if potenza_carica >= potenza_massima:
+        if wallbox.max_reached_start is None:
+            wallbox.max_reached_start = now
+        elif not wallbox.max_notified and now - wallbox.max_reached_start >= 60:
+            if wallbox.fase == 1:
+                notifica(f"⚠️ Potenza massima raggiunta ({potenza_massima:.0f}W).",
+                         dedup_key='max_potenza', min_intervallo=1800)
+            else:
+                notifica(f"⚠️ Potenza massima raggiunta ({potenza_massima:.0f}W). Consiglio: mettere "
+                         f"l'impianto in modalità trifase per sfruttare meglio la potenza disponibile.",
+                         dedup_key='max_potenza', min_intervallo=1800)
+            wallbox.max_notified = True
+    else:
+        # siamo scesi sotto, resettiamo contatori
+        wallbox.max_reached_start = None
+        wallbox.max_notified = False
+
+def regola_pid(monitor, wallbox):
+    """Un passo del regolatore PID, a ogni pacchetto 'solar'."""
+    regolatore = regolatore_pid_instance
+    regolatore.aggiorna_guadagni()      # Kp/Ki/Kd cambiati da Telegram valgono subito
+    # Lock per tutto il passo: legge lo stato della wallbox e decide, e un
+    # comando da Web/Telegram nel mezzo renderebbe la decisione incoerente
+    with WALLBOX_LOCK:
+        regolatore.passo(wallbox, monitor.solar_now, monitor.export_now, monitor.time)
+
+    _, potenza_massima = wallbox.limiti_potenza()
+    notifica_potenza_massima(wallbox, wallbox.current_set_power, potenza_massima)
+
+    stima = regolatore.ultima_stima
+    if stima:
+        log_throttled('stato_pid',
+                      f"[PID] Sole {monitor.solar_now:.0f}W | Scambio stimato {stima['scambio']:+d}W "
+                      f"(corr {stima['correzione']:+d}) | Disponibile {stima['disponibile']}W | "
+                      f"WB: {'ON' if wallbox.is_on else 'OFF'} ({wallbox.current_set_power}W)", 60)
+
 def run_logic(monitor, wallbox):
+    # Il PID osserva sempre, anche quando comanda il classico: al cambio di
+    # algoritmo ha gia' la casa per fase e non deve aspettare 60 s.
+    pid_attivo = CONFIG['ALGORITMO'] == 'pid' and regolatore_pid_instance is not None
+    if regolatore_pid_instance is not None:
+        if monitor.ultimo_tipo == 'electricity':
+            regolatore_pid_instance.aggiorna_fasi(monitor.fases[0:3], monitor.fases[3:6],
+                                                  wallbox.fase == 1, monitor.time)
+        elif not pid_attivo or wallbox.manual_off:
+            # Quando passo() non gira, va comunque registrata la potenza in
+            # vigore al campione (prima di un eventuale comando del classico)
+            regolatore_pid_instance.auto_al_campione = wallbox.current_set_power if wallbox.is_on else 0
+
     # if user has manually requested the wallbox to remain off, skip all automatic decisions
     if getattr(wallbox, 'manual_off', False):
         # Prima questo log usciva a OGNI pacchetto (ogni pochi secondi) e
@@ -2817,6 +2959,13 @@ def run_logic(monitor, wallbox):
         log_throttled('manual_off',
                       "[INFO] Override manuale attivo, wallbox rimane spento fino a comando /accendi",
                       600)
+        return
+
+    if pid_attivo:
+        # Il PID decide solo sui 'solar' (ogni 6 s): gli 'electricity' gli
+        # servono per la casa per fase, gia' passata sopra.
+        if monitor.ultimo_tipo == 'solar':
+            regola_pid(monitor, wallbox)
         return
 
     with STATO_LOCK:
@@ -2841,28 +2990,8 @@ def run_logic(monitor, wallbox):
 
     potenza_minima, potenza_massima = wallbox.limiti_potenza()
 
-    # ------------------------------------------------------------------
     # notifica potenza massima solo se mantenuta per almeno 60s
-    now = time.time()
-    if wallbox.is_on:
-        # verifica se siamo al massimo o sopra
-        if potenza_carica >= potenza_massima:
-            if wallbox.max_reached_start is None:
-                wallbox.max_reached_start = now
-            elif not wallbox.max_notified and now - wallbox.max_reached_start >= 60:
-                if wallbox.fase == 1:
-                    notifica(f"⚠️ Potenza massima raggiunta ({potenza_massima:.0f}W).",
-                             dedup_key='max_potenza', min_intervallo=1800)
-                else:
-                    notifica(f"⚠️ Potenza massima raggiunta ({potenza_massima:.0f}W). Consiglio: mettere "
-                             f"l'impianto in modalità trifase per sfruttare meglio la potenza disponibile.",
-                             dedup_key='max_potenza', min_intervallo=1800)
-                wallbox.max_notified = True
-        else:
-            # siamo scesi sotto, resettiamo contatori
-            wallbox.max_reached_start = None
-            wallbox.max_notified = False
-    # ------------------------------------------------------------------
+    notifica_potenza_massima(wallbox, potenza_carica, potenza_massima)
 
     if potenza_consumata == 0:
         return
@@ -3052,12 +3181,15 @@ def thread_periodico(wallbox):
 # MAIN
 # -----------------------------------------------------------
 def main():
-    global wallbox_instance, contatori_instance
+    global wallbox_instance, contatori_instance, regolatore_pid_instance
 
     # La configurazione va caricata PRIMA di costruire il controller, cosi'
     # initialize() lavora gia' con i valori salvati dall'utente.
     carica_config()
     carica_storico()
+    # Legge CONFIG a ogni passo: le modifiche da Telegram valgono subito
+    regolatore_pid_instance = RegolatorePID(CONFIG, log=log_msg)
+    log_msg(f"[CONFIG] Algoritmo di regolazione: {CONFIG['ALGORITMO']}")
 
     monitor = EnergyMonitor()
     contatori_instance = ContatoriEnergia()

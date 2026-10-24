@@ -78,6 +78,22 @@ sudo systemctl restart solar_web.service && sleep 12
 curl -s http://$IP/api/data | python3 -c "import json,sys; print(json.load(sys.stdin)['config'])"
 cat /home/pi/Desktop/EVR/regolatore-potenza-carica/config_utente.json
 
+### ALGORITMO DI REGOLAZIONE (classico | pid) ##########################
+# Da Telegram: /algoritmo pid, /algoritmo classico, /pid (stato), /pid ki 0.2
+# Dalla shell del Pi (persistito in config_utente.json):
+curl -s -X POST -H 'Content-Type: application/json' -d '{"algoritmo":"pid"}'      http://$IP/api/settings
+curl -s -X POST -H 'Content-Type: application/json' -d '{"algoritmo":"classico"}' http://$IP/api/settings
+# Stima del PID (scambio, correzione, disponibile, tetto auto)
+curl -s http://$IP/api/data | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['config']['algoritmo'], d['status']['stima_pid'])"
+# Solo le decisioni del PID nel log
+sudo journalctl -u solar_web.service -f -o cat | grep --line-buffered "\[PID\]"
+
+# Simulatore (gira anche sul PC, non tocca la wallbox): confronta classico e
+# PID su produzione e consumi reali dello storico
+scp tressilloide@192.168.1.23:solar/regolatore-potenza-carica/storico.jsonl .
+python simulatore_regolatore.py storico.jsonl              # confronto giorno per giorno
+python simulatore_regolatore.py storico.jsonl --taratura   # griglia di Kp/Ki/margine
+
 ### FILE DI STATO ######################################################
 cd /home/pi/Desktop/EVR/regolatore-potenza-carica/
 cat config_utente.json
