@@ -81,16 +81,22 @@ class PID:
         return self.uscita, grezza
 
 
-def quote_auto(potenza, trifase):
+def quote_auto(potenza, trifase, fase_monofase=0):
     """Potenza dell'auto su ciascuna fase.
 
-    In monofase la fase della wallbox non e' nota: si spalma su tre. L'errore
-    resta piccolo perche' la casa per fase viene ricavata con la STESSA
-    ripartizione, quindi all'istante di ogni 'electricity' il modello riproduce
-    esattamente le misure; si sbaglia solo sulle variazioni di potenza
-    successive, fino al pacchetto dopo.
+    In monofase sta tutta sulla fase della wallbox (L1, misurato: con setpoint
+    7360 W la L1 segnava 7116 W e le altre non si muovevano). Spalmarla su tre
+    faceva vedere al modello effetti su fasi che l'auto non tocca: a ogni
+    discesa del setpoint prevedeva piu' export sulle fasi libere, l'export vero
+    non cambiava, la correzione diventava negativa e il PID scendeva ancora
+    (visto sul campo: da 5,2 a 2,3 kW in un minuto). In salita lo stesso
+    meccanismo porterebbe a importare.
     """
-    return [potenza / 3.0] * 3
+    if trifase:
+        return [potenza / 3.0] * 3
+    quote = [0.0, 0.0, 0.0]
+    quote[fase_monofase] = float(potenza)
+    return quote
 
 
 class StimatoreScambio:
@@ -106,7 +112,8 @@ class StimatoreScambio:
     # carica, o limitata ben sotto quanto concesso.
     TOLLERANZA_TETTO = 1500
 
-    def __init__(self):
+    def __init__(self, fase_monofase=0):
+        self.fase_monofase = fase_monofase
         self.casa_fasi = None           # consumo casa per fase (W), dall'ultimo 'electricity'
         self.quote_sole = [1 / 3.0] * 3
         self.tetto_auto = None          # massimo che l'auto puo' star assorbendo, se sotto il setpoint
@@ -134,14 +141,14 @@ class StimatoreScambio:
         mette qualche secondo a salire. La centralina non lo dice (pcar e'
         l'eco del setpoint), ma le fasi si': ognuna consuma almeno la quota
         dell'auto, quindi l'auto non puo' assorbire piu' di 3 x la fase piu'
-        scarica (trifase) o della fase piu' carica (monofase).
+        scarica (trifase) o della sua fase (monofase).
 
         La casa per fase NON viene limitata a >= 0: e' cosi' che il modello
         riproduce esattamente le misure all'istante del campione.
         """
-        tetto = 3 * min(consumi) if trifase else max(consumi)
+        tetto = 3 * min(consumi) if trifase else consumi[self.fase_monofase]
         self.tetto_auto = tetto if setpoint - tetto > self.TOLLERANZA_TETTO else None
-        quote = quote_auto(self.auto_modello(setpoint), trifase)
+        quote = quote_auto(self.auto_modello(setpoint), trifase, self.fase_monofase)
         self.casa_fasi = [c - a for c, a in zip(consumi, quote)]
         totale = sum(soli)
         if totale > 300:   # di notte le quote sarebbero solo rumore
@@ -154,7 +161,7 @@ class StimatoreScambio:
 
     def _bilanci(self, sole, setpoint, trifase):
         soli = [sole * q for q in self.quote_sole]
-        auto = quote_auto(self.auto_modello(setpoint), trifase)
+        auto = quote_auto(self.auto_modello(setpoint), trifase, self.fase_monofase)
         return [s - h - a for s, h, a in zip(soli, self.casa_fasi, auto)]
 
     def scambio(self, sole, setpoint, trifase, exporting, affidabile):
@@ -166,11 +173,13 @@ class StimatoreScambio:
         una retroazione positiva che porta a importare. In quei passi si tiene
         l'ultima correzione affidabile.
         """
-        netto = sum(self._bilanci(sole, setpoint, trifase))
-        # 'exporting' e' la media dell'intervallo: la previsione si fa con il
-        # sole medio (l'ultimo e il precedente), non con quello istantaneo
+        # La produzione istantanea alterna +-500 W da un campione all'altro
+        # (8355, 9449, 8677, 9369...): presa cosi' com'e', il PID la inseguiva
+        # cambiando potenza a ogni pacchetto. La media degli ultimi due elimina
+        # l'alternanza ed e' anche coerente con 'exporting', che e' una media.
         sole_medio = sole if self.sole_precedente is None else (sole + self.sole_precedente) / 2
         self.sole_precedente = sole
+        netto = sum(self._bilanci(sole_medio, setpoint, trifase))
 
         if exporting is not None and affidabile:
             previsto = sum(max(0.0, b) for b in self._bilanci(sole_medio, setpoint, trifase))
@@ -193,12 +202,17 @@ class RegolatorePID:
     # quando assorbe meno del setpoint: abbastanza per accorgersi (al campione
     # successivo) se vuole di piu', poco per non importare se riparte di colpo
     MARGINE_TETTO = 1000
+    # Salita massima per pacchetto (6 s): rete di sicurezza contro gli errori
+    # di stima. Sul campo, con l'auto appena fermata dalla centralina, l'export
+    # improvviso e' sembrato sole libero e il PID e' salito da 5 a 10 kW in
+    # 30 s; se l'auto fosse ripartita lassu' si sarebbe importato parecchio.
+    SALITA_MAX = 1000
 
     def __init__(self, config, log=print):
         self.config = config
         self.log = log
         self.pid = PID(config['PID_KP'], config['PID_KI'], config['PID_KD'])
-        self.stimatore = StimatoreScambio()
+        self.stimatore = StimatoreScambio(config.get('PID_FASE_MONOFASE', 0))
         # Potenza dell'auto quando e' stato preso l'ultimo campione 'solar',
         # PRIMA del comando eventualmente inviato in risposta: e' quella che il
         # successivo 'electricity' (stesso campione) contiene nei consumi.
@@ -255,6 +269,14 @@ class RegolatorePID:
             # bilanciamento celle, riscaldamento batteria) assorbirebbe di colpo
             # tutto il concesso e si importerebbe fino al prossimo campione.
             massimo = max(minimo, min(massimo, int(tetto + self.MARGINE_TETTO)))
+        if wallbox.is_on:
+            salita = self.SALITA_MAX
+            if not getattr(wallbox, 'in_carica', True):
+                # La centralina dice che l'auto non assorbe (pausa, attesa,
+                # batteria piena): l'export che si vede e' l'auto ferma, non
+                # sole libero. Si puo' scendere ma non salire.
+                salita = 0
+            massimo = max(minimo, min(massimo, wallbox.current_set_power + salita))
         self.ultima_stima = {'scambio': round(scambio), 'correzione': round(correzione),
                              'disponibile': round(disponibile),
                              'tetto_auto': None if tetto is None else round(tetto), 't': t}

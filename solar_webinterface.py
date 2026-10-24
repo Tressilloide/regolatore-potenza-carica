@@ -90,9 +90,10 @@ CONFIG = {
     'PID_KP': 0.1,
     'PID_KI': 0.15,                 # 1/s: a ogni pacchetto (6 s) recupera ~il 90% dell'errore
     'PID_KD': 0.0,                  # con misure ogni 6 s il derivativo aggiunge solo comandi
-    'PID_MARGINE': 150,             # W di export da tenere come riserva
+    'PID_MARGINE': 300,             # W di export da tenere come riserva (i carichi su una fase che importa si vedono solo ogni 60 s)
     'PID_BANDA_DISCESA': 100,       # si scende appena il PID chiede 100 W in meno (in salita vale POTENZA_PROTEZIONE)
     'PID_IMPORT_SPEGNIMENTO': 200,  # import medio al minimo oltre cui, dopo TIMER_SPEGNIMENTO, si spegne
+    'PID_FASE_MONOFASE': 0,         # fase della wallbox in monofase: L1 (misurato sul campo)
 
     # --- Limite di ricarica (kWh) --------------------------------------
     # Confermato sul campo leggendo chglimit()/pushed_limit() della centralina

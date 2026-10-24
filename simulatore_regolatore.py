@@ -30,7 +30,7 @@ CONFIG_BASE = {
     'COOLDOWN_ACCENSIONE': 60, 'UPDATE_INTERVAL_S': 5, 'TIMER_SPEGNIMENTO': 60,
     'SMOOTHING_ALPHA': 0.9, 'MAX_DELTA_PER_SEC': 1500,
     'PID_KP': 0.1, 'PID_KI': 0.15, 'PID_KD': 0.0,
-    'PID_MARGINE': 150, 'PID_IMPORT_SPEGNIMENTO': 200, 'PID_BANDA_DISCESA': 100,
+    'PID_MARGINE': 300, 'PID_IMPORT_SPEGNIMENTO': 200, 'PID_BANDA_DISCESA': 100,
 }
 
 
@@ -87,9 +87,10 @@ class Auto:
     """Segue il setpoint della wallbox con un ritardo del primo ordine."""
 
     # Misurato: 7 s dopo un aumento l'auto era a circa l'80% del nuovo valore
-    def __init__(self, massimo, tau_su=3.7, tau_giu=1.5, ritardo=1.0, efficienza=0.97):
+    def __init__(self, massimo, tau_su=3.7, tau_giu=1.5, ritardo=1.0, efficienza=0.97, pause=()):
         self.massimo, self.tau_su, self.tau_giu = massimo, tau_su, tau_giu
         self.ritardo, self.efficienza = ritardo, efficienza
+        self.pause = pause      # [(da, a)] in timestamp: l'auto non assorbe (come la pausa vista sul campo)
         self.potenza = 0.0
         self.coda = []          # (t effettivo, setpoint o None se spenta)
         self.obiettivo = 0.0
@@ -101,6 +102,8 @@ class Auto:
         while self.coda and self.coda[0][0] <= t:
             self.obiettivo = self.coda.pop(0)[1]
         obiettivo = min(self.obiettivo, self.massimo) * self.efficienza
+        if any(a <= t < b for a, b in self.pause):
+            obiettivo = 0.0
         tau = self.tau_su if obiettivo > self.potenza else self.tau_giu
         self.potenza += (obiettivo - self.potenza) * (1 - math.exp(-dt / tau))
         return self.potenza
@@ -129,6 +132,7 @@ class FintaWallbox:
         self.accensioni = 0
         self.pcar = 0           # come la centralina: eco del setpoint
         self.pcar_letto = 0     # ...ma il servizio la rilegge solo ogni 5 s
+        self.in_carica = False  # pcar > 0: la centralina lo sa (status), anche lei ogni 5 s
 
     def limiti_potenza(self):
         if self.fase == 0:
@@ -300,13 +304,23 @@ class AlgoritmoPID:
 # ---------------------------------------------------------------------------
 # Simulazione
 # ---------------------------------------------------------------------------
-def simula(campioni, inizio, fine, algoritmo, cfg, auto_max=11000, seme=1, traccia=None, **auto_opzioni):
+def simula(campioni, inizio, fine, algoritmo, cfg, auto_max=11000, seme=1, traccia=None,
+           monofase=False, rumore_sole=400, pausa_ogni=None, **auto_opzioni):
+    """`monofase`: auto tutta su L1 (come misurato), limiti 1380-7360 W.
+    `rumore_sole`: deviazione (W) della produzione ISTANTANEA nei pacchetti,
+    misurata sul campo (alterna +-500 W fra campioni); 'exporting' e' una
+    media e non ne risente.
+    `pausa_ogni`: secondi fra una pausa di 3 minuti dell'auto e la successiva."""
     t = [inizio]
     orologio = lambda: t[0]
     mondo = Mondo(campioni, inizio, fine, seme)
+    if pausa_ogni:
+        auto_opzioni['pause'] = [(a, a + 180) for a in range(int(inizio) + 1800, int(fine), pausa_ogni)]
     auto = Auto(auto_max, **auto_opzioni)
     wb = FintaWallbox(cfg, auto, orologio)
+    wb.fase = 0 if monofase else 1
     algo = algoritmo(cfg, wb, orologio)
+    rnd = random.Random(seme + 1000)
 
     import_wh = export_wh = auto_wh = ideale_wh = import_base_wh = 0.0
     ultimo_soli = ultimo_case = None
@@ -315,8 +329,8 @@ def simula(campioni, inizio, fine, algoritmo, cfg, auto_max=11000, seme=1, tracc
     while t[0] < fine:
         soli, case = mondo.stato(t[0])
         p_auto = auto.passo(t[0])
-        q = p_auto / 3
-        netto = sum(s - c - q for s, c in zip(soli, case))
+        qq = [p_auto, 0.0, 0.0] if monofase else [p_auto / 3] * 3
+        netto = sum(s - c - q for s, c, q in zip(soli, case, qq))
         import_wh += max(0.0, -netto) / 3600
         export_wh += max(0.0, netto) / 3600
         auto_wh += p_auto / 3600
@@ -331,16 +345,19 @@ def simula(campioni, inizio, fine, algoritmo, cfg, auto_max=11000, seme=1, tracc
         # Lettura di index.json ogni 5 s (INTERVALLO_SYNC_FASE)
         if int(t[0] - inizio) % 5 == 2:
             wb.pcar_letto = wb.pcar
+            wb.in_carica = p_auto > 100
 
         # Il sensore campiona ogni 6 s; 'electricity' ogni 10 campioni, 1 s dopo
-        somma_export += sum(max(0.0, s - c - q) for s, c in zip(soli, case))
+        somma_export += sum(max(0.0, s - c - q) for s, c, q in zip(soli, case, qq))
         if int(t[0] - inizio) % 6 == 0:
             exporting = somma_export / 6
             somma_export = 0.0
-            algo.pacchetto_solar(sum(soli), exporting)
+            errore = rnd.gauss(0, rumore_sole) if sum(soli) > 300 else 0.0
+            soli_misurati = [s + errore * f for s, f in zip(soli, Mondo.QUOTE_SOLE)]
+            algo.pacchetto_solar(sum(soli_misurati), exporting)
             passo_owl += 1
             if passo_owl % 10 == 0:
-                ultimo_soli, ultimo_case = list(soli), [c + q for c in case]
+                ultimo_soli, ultimo_case = soli_misurati, [c + q for c, q in zip(case, qq)]
         elif ultimo_soli is not None:
             algo.pacchetto_electricity(ultimo_case, ultimo_soli)
             ultimo_soli = None

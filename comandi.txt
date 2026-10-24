@@ -84,7 +84,7 @@ cat /home/pi/Desktop/EVR/regolatore-potenza-carica/config_utente.json
 curl -s -X POST -H 'Content-Type: application/json' -d '{"algoritmo":"pid"}'      http://$IP/api/settings
 curl -s -X POST -H 'Content-Type: application/json' -d '{"algoritmo":"classico"}' http://$IP/api/settings
 # Taratura (anche da Telegram: /pid ki 0.15)
-curl -s -X POST -H "Content-Type: application/json" -d "{\"pid_ki\":0.15,\"pid_kp\":0.1,\"pid_margine\":150}" http://$IP/api/settings
+curl -s -X POST -H "Content-Type: application/json" -d "{\"pid_ki\":0.15,\"pid_kp\":0.1,\"pid_margine\":300}" http://$IP/api/settings
 # Stima del PID (scambio, correzione, disponibile, tetto auto)
 curl -s http://$IP/api/data | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['config']['algoritmo'], d['status']['stima_pid'])"
 # Solo le decisioni del PID nel log
