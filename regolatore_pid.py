@@ -220,6 +220,7 @@ class RegolatorePID:
         # Passi 'solar' dall'ultimo comando: 'exporting' e' affidabile solo se
         # l'auto non e' cambiata nei 6 s che copre (vedi StimatoreScambio)
         self.passi_da_comando = 99
+        self._stato_osservato = None
         self.ultimo_inviato = None      # per accorgersi se qualcun altro cambia la potenza
         self.timer_spegnimento = None   # quando il PID ha iniziato a volere meno del minimo
         self.somma_finestra = 0.0       # scambio medio al minimo durante il timer
@@ -235,7 +236,36 @@ class RegolatorePID:
     def aggiorna_fasi(self, consumi, soli, trifase, t):
         self.stimatore.aggiorna_fasi(consumi, soli, self.auto_al_campione, trifase, t)
 
+    def osserva(self, wallbox, sole):
+        """A ogni 'solar' quando comanda il classico: tiene aggiornato lo stato
+        che passo() userebbe, cosi' al passaggio al PID la media della
+        produzione e l'affidabilita' di 'exporting' sono gia' giuste. Senza,
+        il primo passo usava una produzione vecchia di ore e prendeva come
+        riferimento un 'exporting' a cavallo di un comando del classico."""
+        if self._sole_impossibile(sole):
+            return
+        stato = (wallbox.is_on, wallbox.current_set_power)
+        # Il comando del classico parte dopo questa chiamata: lo si vede al
+        # pacchetto successivo, che e' gia' il primo con 'exporting' sporco
+        self.passi_da_comando = 1 if stato != self._stato_osservato else self.passi_da_comando + 1
+        self._stato_osservato = stato
+        self.auto_al_campione = wallbox.current_set_power if wallbox.is_on else 0
+        self.stimatore.sole_precedente = sole
+
+    def _sole_impossibile(self, sole):
+        """La produzione non passa da oltre 1 kW a zero in 6 s: succede solo
+        quando il sensore OWL si riavvia (visto sul campo, insieme a un
+        timestamp di 9 secondi). Preso per buono, faceva crollare la stima."""
+        precedente = self.stimatore.sole_precedente
+        if sole < 50 and precedente is not None and precedente > 1000:
+            self.log(f"[PID] Produzione {sole:.0f}W subito dopo {precedente:.0f}W: "
+                     f"pacchetto scartato (sensore che si riavvia?)")
+            return True
+        return False
+
     def passo(self, wallbox, sole, exporting, t):
+        if self._sole_impossibile(sole):
+            return
         self.passi_da_comando += 1
         prima = (wallbox.is_on, wallbox.current_set_power)
         try:

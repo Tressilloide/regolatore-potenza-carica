@@ -2953,9 +2953,9 @@ def run_logic(monitor, wallbox):
             regolatore_pid_instance.aggiorna_fasi(monitor.fases[0:3], monitor.fases[3:6],
                                                   wallbox.fase == 1, monitor.time)
         elif not pid_attivo or wallbox.manual_off:
-            # Quando passo() non gira, va comunque registrata la potenza in
-            # vigore al campione (prima di un eventuale comando del classico)
-            regolatore_pid_instance.auto_al_campione = wallbox.current_set_power if wallbox.is_on else 0
+            # Quando passo() non gira, il PID osserva comunque (prima di un
+            # eventuale comando del classico in questo stesso pacchetto)
+            regolatore_pid_instance.osserva(wallbox, monitor.solar_now)
 
     # if user has manually requested the wallbox to remain off, skip all automatic decisions
     if getattr(wallbox, 'manual_off', False):
