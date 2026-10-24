@@ -97,8 +97,14 @@ class StimatoreScambio:
     """Stima lo scambio netto con la rete ogni 6 s (vedi docstring del modulo)."""
 
     # Sotto questa differenza fra setpoint e tetto misurato si considera che
-    # l'auto stia seguendo: ritardi di salita e rumore della casa
-    TOLLERANZA_TETTO = 300
+    # l'auto stia seguendo. Non va tenuta stretta: sul campo l'auto assorbe
+    # stabilmente il 10-15% meno del setpoint (~1 kW a 7 kW). Quello scarto lo
+    # assorbe gia' la casa per fase (che viene negativa); trattarlo da tetto
+    # faceva credere al modello che alzare il setpoint non cambiasse nulla,
+    # mentre l'auto saliva davvero: la correzione da 'exporting' oscillava di
+    # +-600 W e il setpoint con lei. Il tetto serve per i casi grossi: auto
+    # carica, o limitata ben sotto quanto concesso.
+    TOLLERANZA_TETTO = 1500
 
     def __init__(self):
         self.casa_fasi = None           # consumo casa per fase (W), dall'ultimo 'electricity'
@@ -234,8 +240,11 @@ class RegolatorePID:
         if not self.stimatore.pronto():
             return   # nessun 'electricity' ancora: senza la casa non si stima nulla
 
+        # 'exporting' copre i 6 s PRIMA di questo pacchetto: se il comando e'
+        # partito al pacchetto precedente, quell'intervallo contiene la salita
+        # o la discesa dell'auto. Serve un intervallo intero senza comandi.
         scambio, correzione = self.stimatore.scambio(
-            sole, auto, trifase, exporting, affidabile=self.passi_da_comando >= 1)
+            sole, auto, trifase, exporting, affidabile=self.passi_da_comando >= 2)
         disponibile = scambio + self.stimatore.auto_modello(auto)
         obiettivo = disponibile + cfg['POTENZA_PRELEVABILE'] - cfg['PID_MARGINE']
         minimo, massimo = wallbox.limiti_potenza()

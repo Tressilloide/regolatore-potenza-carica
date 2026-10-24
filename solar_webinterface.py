@@ -88,7 +88,7 @@ CONFIG = {
     #   con simulatore_regolatore.py sullo storico reale.
     'ALGORITMO': 'classico',
     'PID_KP': 0.1,
-    'PID_KI': 0.2,                  # 1/s: a ogni pacchetto (6 s) recupera ~il 100% dell'errore
+    'PID_KI': 0.15,                 # 1/s: a ogni pacchetto (6 s) recupera ~il 90% dell'errore
     'PID_KD': 0.0,                  # con misure ogni 6 s il derivativo aggiunge solo comandi
     'PID_MARGINE': 150,             # W di export da tenere come riserva
     'PID_BANDA_DISCESA': 100,       # si scende appena il PID chiede 100 W in meno (in salita vale POTENZA_PROTEZIONE)
@@ -1604,6 +1604,10 @@ CAMPI_WEB = {
     'prezzo_acquisto': 'PREZZO_ACQUISTO',
     'prezzo_vendita':  'PREZZO_VENDITA',
     'algoritmo':       'ALGORITMO',
+    'pid_kp':          'PID_KP',
+    'pid_ki':          'PID_KI',
+    'pid_kd':          'PID_KD',
+    'pid_margine':     'PID_MARGINE',
 }
 
 @app.route('/api/data')
