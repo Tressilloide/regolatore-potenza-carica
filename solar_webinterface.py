@@ -2297,11 +2297,14 @@ class WallboxController:
                                   f"{CONFIG['COOLDOWN_ACCENSIONE'] - tempo_trascorso:.0f}s prima di accendere", 30)
                     return False
 
-            log_msg("[AZIONE] ACCENSIONE (ON)")
             min_p, _ = self.limiti_potenza()
             self.set_power(min_p, bypass=True)
 
             if self.send_command({'btn': 'i'}):
+                # Si logga solo l'accensione riuscita: con la colonnina spenta
+                # il tentativo si ripete a ogni pacchetto (~6 s) e prima
+                # riempiva il journal (4338 righe "ACCENSIONE" in tre giorni)
+                log_msg("[AZIONE] ACCENSIONE (ON)")
                 self.is_on = True
                 self.failed_off_attempts = 0  # Reset contatore quando si accende
                 self.last_update_time = time.time()
@@ -2309,6 +2312,8 @@ class WallboxController:
                 # La sessione la apre _assorbi_stato quando vede pcar > 0:
                 # un solo produttore, basato sulla potenza reale.
                 return True
+            log_throttled('accensione_fallita',
+                          "[AVVISO] Accensione non riuscita: centralina non raggiungibile?", 300)
             return False
 
     def turn_off(self, force=False):
