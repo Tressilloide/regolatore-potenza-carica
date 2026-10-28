@@ -30,6 +30,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from flask import Flask, jsonify, request, render_template_string
 
 from regolatore_pid import RegolatorePID
+from ponte_mqtt import PonteMQTT
 
 # -----------------------------------------------------------
 # CONFIGURAZIONE WEB & GLOBALE
@@ -161,6 +162,7 @@ WALLBOX_LOCK = threading.RLock()
 wallbox_instance = None
 contatori_instance = None
 regolatore_pid_instance = None
+ponte_mqtt_instance = None
 
 load_dotenv()
 API_KEY = os.getenv('API_KEY')
@@ -2460,9 +2462,13 @@ class ContatoriEnergia:
 
         dt = ora - self.ultimo_t
         self.ultimo_t = ora
-        # dt <= 0: orologio all'indietro (sync NTP). dt > 60: buco nei pacchetti.
-        # In entrambi i casi non si inventa energia.
-        if dt <= 0 or dt > 60:
+        # dt <= 0: orologio all'indietro (sync NTP). dt > 150: mancano almeno
+        # due pacchetti, buco. In entrambi i casi non si inventa energia.
+        # Il limite era 60 s, ma 'electricity' arriva proprio ogni 60 s: con un
+        # minimo ritardo (il ciclo occupato con la centralina) l'intervallo
+        # veniva scartato. Il 28/10 alle 16:40 il Pi contava 34,6 kWh prodotti
+        # contro i 40,2 del contatore del sensore OWL (-14%).
+        if dt <= 0 or dt > 150:
             return
 
         self._controlla_rollover()
@@ -2577,6 +2583,8 @@ class ContatoriEnergia:
             scrivi_json(FILE_SESSIONI, elenco[-200:])   # retention: ultime 200
         except Exception as e:
             log_msg(f"[SESSIONE] Salvataggio fallito: {e}")
+        if ponte_mqtt_instance:
+            ponte_mqtt_instance.pubblica_sessione(sessione)
 
         log_msg(f"[SESSIONE] Terminata: {durata/60:.0f} min, {kwh:.2f} kWh ({origine})"
                 f"{f', {quota_fv:.0f}% da FV' if quota_fv is not None else ''}")
@@ -2860,6 +2868,14 @@ def ruota_storico():
         log_msg(f"[STORICO] Rotazione fallita: {e}")
 
 
+def numero(testo):
+    """Testo di un nodo XML -> float, None se manca o non e' un numero."""
+    try:
+        return float(testo)
+    except (TypeError, ValueError):
+        return None
+
+
 class EnergyMonitor:
     def __init__(self):
         self.solar_now = 0.0
@@ -2873,6 +2889,9 @@ class EnergyMonitor:
         # scambio netto: lo usa solo lo stimatore del PID.
         self.export_now = None
         self.ultimo_tipo = None     # 'solar' | 'electricity': cosa ha fatto scattare run_logic
+        # Contatori del giorno del sensore OWL (Wh), integrati da lui: vanno
+        # solo nell'archivio sul server, come riferimento per le analisi.
+        self.owl_giorno = {}
 
     def parse_packet(self, data):
         try:
@@ -2895,6 +2914,10 @@ class EnergyMonitor:
 
                     l1, l2, l3 = p.get('0',0), p.get('1',0), p.get('2',0)
                     l4, l5, l6 = p.get('3',0), p.get('4',0), p.get('5',0)
+                    giorno = {c.get('id'): numero(c.findtext('day')) for c in channels.findall('chan')}
+                    if all(giorno.get(str(i)) is not None for i in range(6)):
+                        self.owl_giorno['owl_consumo_wh'] = round(sum(giorno[str(i)] for i in range(3)), 1)
+                        self.owl_giorno['owl_solare_wh'] = round(sum(giorno[str(i)] for i in range(3, 6)), 1)
 
                     self.total_grid_load = l1 + l2 + l3
                     self.solar_now = l4 + l5 + l6
@@ -2927,6 +2950,13 @@ class EnergyMonitor:
                     if contatori_instance:
                         contatori_instance.aggiorna(self.solar_now, self.total_grid_load,
                                                     wb_power, self.house_load, self.time)
+                    # Try a parte: un errore qui non deve far scartare il
+                    # pacchetto, cioe' saltare la regolazione di questo minuto
+                    if ponte_mqtt_instance and ponte_mqtt_instance.attivo:
+                        try:
+                            ponte_mqtt_instance.pubblica_minuto(dati_minuto(self, wb_power))
+                        except Exception as e:
+                            log_throttled('mqtt_minuto', f"[MQTT] Record del minuto non pubblicato: {e}", 600)
 
                     return "TRIGGER"
 
@@ -2942,6 +2972,13 @@ class EnergyMonitor:
                         self.export_now = float(nodo_exp.text) if nodo_exp is not None else None
                     except (TypeError, ValueError):
                         self.export_now = None
+                    for chiave, percorso in (('owl_generato_wh', 'day/generated'),
+                                             ('owl_esportato_wh', 'day/exported')):
+                        valore = numero(root.findtext(percorso))
+                        if valore is not None:
+                            self.owl_giorno[chiave] = valore
+                    if ponte_mqtt_instance:
+                        ponte_mqtt_instance.campione_solare(self.solar_now)
                     self.ultimo_tipo = 'solar'
                     SYSTEM_STATE['ULTIMA_LETTURA_SOLARE'] = time.time()
                     SYSTEM_STATE['SENSORE_ONLINE'] = True
@@ -2957,6 +2994,40 @@ class EnergyMonitor:
             SYSTEM_STATE['ERRORI_PARSING'] += 1
             log_throttled('parse_generico', f"[ERRORE] Pacchetto scartato: {e}", 300)
         return None
+
+def dati_minuto(monitor, auto_w):
+    """Il record al minuto per Home Assistant e l'archivio sul server (vedi
+    ponte_mqtt.py). Valori istantanei del pacchetto 'electricity' appena
+    letto, piu' i contatori del giorno."""
+    with STATO_LOCK:
+        acceso = SYSTEM_STATE['WALLBOX_STATUS']
+        dati = {
+            'ts': int(monitor.time),
+            'produzione_w': round(monitor.solar_now),
+            'consumo_w': round(monitor.total_grid_load),
+            'prelievo_w': round(monitor.total_grid_load - monitor.solar_now),
+            'auto_w': round(auto_w),
+            'setpoint_w': SYSTEM_STATE['WALLBOX_POWER'] if acceso else 0,
+            'pcar_w': SYSTEM_STATE['WB_PCAR'],
+            'colonnina': (SYSTEM_STATE['WB_DESC'] or '').replace('_', ' ') or None,
+            'fase': 'trifase' if SYSTEM_STATE['IMPIANTO_FASE'] == 1 else 'monofase',
+            'algoritmo': CONFIG['ALGORITMO'],
+            'prelevabile_w': CONFIG['POTENZA_PRELEVABILE'],
+            'fasi_w': [round(x) for x in monitor.fases],
+            'sessione_kwh': SYSTEM_STATE['WB_ENERGIA_SESSIONE'],
+        }
+    if contatori_instance:
+        r = contatori_instance.riepilogo()
+        dati.update({
+            'oggi_prodotta_kwh': r['solare_kwh'],
+            'oggi_prelevata_kwh': r['rete_importata_kwh'],
+            'oggi_immessa_kwh': r['rete_esportata_kwh'],
+            'oggi_auto_kwh': r['wallbox_kwh'],
+            'oggi_auto_sole_kwh': r['wallbox_da_fv_kwh'],
+            'oggi_minuti_carica': r['minuti_carica'],
+        })
+    dati.update(monitor.owl_giorno)
+    return dati
 
 def notifica_potenza_massima(wallbox, potenza_carica, potenza_massima):
     """Avvisa se la wallbox resta alla potenza massima per almeno 60 s."""
@@ -3155,6 +3226,8 @@ def gestore_arresto(segnale, frame):
     interrompere una ricarica in corso.
     """
     salva_tutto(f"segnale {segnale}")
+    if ponte_mqtt_instance:
+        ponte_mqtt_instance.chiudi()
     sys.exit(0)
 
 def thread_periodico(wallbox):
@@ -3241,7 +3314,7 @@ def thread_periodico(wallbox):
 # MAIN
 # -----------------------------------------------------------
 def main():
-    global wallbox_instance, contatori_instance, regolatore_pid_instance
+    global wallbox_instance, contatori_instance, regolatore_pid_instance, ponte_mqtt_instance
 
     # La configurazione va caricata PRIMA di costruire il controller, cosi'
     # initialize() lavora gia' con i valori salvati dall'utente.
@@ -3254,6 +3327,9 @@ def main():
     monitor = EnergyMonitor()
     contatori_instance = ContatoriEnergia()
     contatori_instance.carica_stato()   # riprende i contatori di oggi dopo un riavvio
+    # Dati per Home Assistant e per l'archivio sul server (vedi ponte_mqtt.py)
+    ponte_mqtt_instance = PonteMQTT(os.getenv('MQTT_HOST'), os.getenv('MQTT_PORT', 1883),
+                                    os.getenv('MQTT_USER'), os.getenv('MQTT_PASSWORD'), log=log_msg)
     wallbox_instance = WallboxController()
     wallbox = wallbox_instance
 
