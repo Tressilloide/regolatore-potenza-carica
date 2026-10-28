@@ -267,6 +267,10 @@ class RegolatorePID:
             return True
         return False
 
+    def _apri_finestra(self, t):
+        self.timer_spegnimento = t
+        self.somma_finestra, self.campioni_finestra = 0.0, 0
+
     def passo(self, wallbox, sole, exporting, t):
         if self._sole_impossibile(sole):
             return
@@ -349,27 +353,45 @@ class RegolatorePID:
         uscita, grezza = self.pid.passo(errore, t, minimo, massimo)
 
         # --- Spegnimento: il PID vuole meno del minimo -----------------------
-        if grezza < minimo:
-            if self.timer_spegnimento is None:
-                self.timer_spegnimento = t
-                self.somma_finestra, self.campioni_finestra = 0.0, 0
-                self.log(f"[PID] Sole insufficiente ({disponibile:.0f}W disponibili): "
-                         f"minimo, spengo tra {cfg['TIMER_SPEGNIMENTO']}s se continua")
+        # Si decide sulla media dell'intera finestra, non campione per
+        # campione: al limite del minimo il disponibile oscilla attorno alla
+        # soglia e il timer, annullato al primo campione buono, ripartiva ogni
+        # 12-18 s (sul campo il 28/10: oltre 60 righe di log in un quarto
+        # d'ora) senza arrivare mai a decidere, anche con l'import medio oltre
+        # la soglia.
+        if self.timer_spegnimento is None and grezza < minimo:
+            self._apri_finestra(t)
+            self.log(f"[PID] Sole insufficiente ({disponibile:.0f}W disponibili): "
+                     f"minimo, spengo tra {cfg['TIMER_SPEGNIMENTO']}s se continua")
+        if self.timer_spegnimento is not None:
             # scambio che si avrebbe alla potenza minima
             self.somma_finestra += obiettivo - minimo
             self.campioni_finestra += 1
-            if t - self.timer_spegnimento >= cfg['TIMER_SPEGNIMENTO']:
+            if self.somma_finestra >= 0 and uscita - minimo >= cfg['POTENZA_PROTEZIONE']:
+                # Il PID e' gia' risalito e la finestra non e' piu' in import.
+                # Il solo salto dell'uscita non basta: con il sole che oscilla
+                # di 1-2 kW il termine proporzionale la alza per un campione.
+                self.log(f"[PID] Sole tornato ({disponibile:.0f}W disponibili): annullo lo spegnimento")
+                self.timer_spegnimento = None
+            elif t - self.timer_spegnimento >= cfg['TIMER_SPEGNIMENTO']:
                 medio = self.somma_finestra / max(self.campioni_finestra, 1)
                 self.timer_spegnimento = None
-                if medio < -cfg['PID_IMPORT_SPEGNIMENTO'] or sole + cfg['POTENZA_PRELEVABILE'] < minimo:
+                oltre_soglia = medio < -cfg['PID_IMPORT_SPEGNIMENTO'] or sole + cfg['POTENZA_PRELEVABILE'] < minimo
+                if grezza >= minimo and medio >= 0:
+                    self.log(f"[PID] Sole tornato ({disponibile:.0f}W disponibili): annullo lo spegnimento")
+                elif grezza < minimo and oltre_soglia:
                     self.log(f"[PID] Al minimo si importerebbero in media {-medio:.0f}W: spengo")
                     wallbox.turn_off(force=True)
                     self.ultimo_inviato = None
                     return
-                self.log(f"[PID] Al minimo import medio {max(-medio, 0):.0f}W, sotto soglia: continuo")
-        elif self.timer_spegnimento is not None:
-            self.log(f"[PID] Sole tornato ({disponibile:.0f}W disponibili): annullo lo spegnimento")
-            self.timer_spegnimento = None
+                else:
+                    # Ancora al limite: nuova finestra, senza riannunciarla. Con
+                    # l'import oltre soglia ma il PID che ora vuole almeno il
+                    # minimo, la nuvola e' appena passata: non si spegne per un
+                    # import ormai finito.
+                    self._apri_finestra(t)
+                    motivo = "ma il sole e' appena tornato" if oltre_soglia else "sotto soglia"
+                    self.log(f"[PID] Al minimo import medio {max(-medio, 0):.0f}W, {motivo}: continuo")
 
         # --- Invio: banda morta ASIMMETRICA -----------------------------------
         # Si sale solo per variazioni oltre la soglia di protezione (meno
