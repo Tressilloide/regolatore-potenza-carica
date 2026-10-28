@@ -82,6 +82,7 @@ class PonteMQTT:
         self.attivo = mqtt is not None and bool(host)
         self._soli = []              # produzione dei pacchetti 'solar' dell'ultimo minuto
         self._errore_segnalato = False
+        self._chiuso = False
         if not self.attivo:
             if host and mqtt is None:
                 log("[MQTT] paho-mqtt non installato: niente dati verso Home Assistant")
@@ -124,6 +125,8 @@ class PonteMQTT:
         self._segnala(f"[MQTT] {self.host} non raggiungibile: riprovo, i dati restano in coda")
 
     def _disconnesso(self, client, userdata, flags, reason_code, properties):
+        if self._chiuso:
+            return     # l'abbiamo chiesta noi all'arresto: non si riprova
         self._segnala(f"[MQTT] Disconnesso da {self.host} ({reason_code}): riprovo, i dati restano in coda")
 
     def _segnala(self, messaggio):
@@ -170,5 +173,6 @@ class PonteMQTT:
             self.client.publish(T_ONLINE, 'offline', qos=1, retain=True).wait_for_publish(2)
         except Exception:
             pass   # broker gia' irraggiungibile: ci pensera' il Last Will
+        self._chiuso = True
         self.client.disconnect()
         self.client.loop_stop()
