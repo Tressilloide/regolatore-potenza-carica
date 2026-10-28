@@ -221,6 +221,9 @@ class RegolatorePID:
         # l'auto non e' cambiata nei 6 s che copre (vedi StimatoreScambio)
         self.passi_da_comando = 99
         self._stato_osservato = None
+        # Wallbox accesa alla fine dell'ultimo passo: se al passo dopo e' accesa
+        # e non l'abbiamo accesa noi, il controller ha adottato una carica
+        self.acceso = False
         self.ultimo_inviato = None      # per accorgersi se qualcun altro cambia la potenza
         self.timer_spegnimento = None   # quando il PID ha iniziato a volere meno del minimo
         self.somma_finestra = 0.0       # scambio medio al minimo durante il timer
@@ -249,6 +252,7 @@ class RegolatorePID:
         # pacchetto successivo, che e' gia' il primo con 'exporting' sporco
         self.passi_da_comando = 1 if stato != self._stato_osservato else self.passi_da_comando + 1
         self._stato_osservato = stato
+        self.acceso = wallbox.is_on
         self.auto_al_campione = wallbox.current_set_power if wallbox.is_on else 0
         self.stimatore.sole_precedente = sole
 
@@ -266,6 +270,16 @@ class RegolatorePID:
     def passo(self, wallbox, sole, exporting, t):
         if self._sole_impossibile(sole):
             return
+        if wallbox.is_on and not self.acceso:
+            # Accesa senza di noi: carica gia' in corso adottata (colonnina
+            # riaccesa, riavvio del servizio). L'ultimo 'electricity' e' stato
+            # letto con l'auto a 0 nel modello, quindi la casa per fase contiene
+            # anche l'auto: ora che e' nel modello verrebbe contata due volte, il
+            # disponibile crollerebbe di 4 kW e partirebbe il timer di
+            # spegnimento. Si aspetta il prossimo 'electricity'.
+            self.stimatore.casa_fasi = None
+            self.log(f"[PID] Carica in corso adottata a {wallbox.current_set_power}W: "
+                     f"attendo il prossimo campione delle fasi per regolare")
         self.passi_da_comando += 1
         prima = (wallbox.is_on, wallbox.current_set_power)
         try:
@@ -275,6 +289,7 @@ class RegolatorePID:
                 # All'accensione l'auto ci mette qualche secondo a partire:
                 # due intervalli non affidabili invece di uno
                 self.passi_da_comando = -1 if wallbox.is_on and not prima[0] else 0
+            self.acceso = wallbox.is_on
 
     def _passo(self, wallbox, sole, exporting, t):
         cfg = self.config

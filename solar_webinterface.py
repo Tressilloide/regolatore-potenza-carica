@@ -2092,6 +2092,8 @@ class WallboxController:
                          dedup_key='centralina_offline', min_intervallo=1800)
             return 'errore'
 
+        self.adotta_carica_esterna(dati)
+
         nuova_fase = 1 if str(dati.get("tfase")) == "1" else 0
 
         if nuova_fase == self.fase:
@@ -2122,6 +2124,63 @@ class WallboxController:
         notifica(f"⚙️ Impianto ora in modalità *{modalita}*.\nNuovi limiti: {min_p}-{max_p} W",
                  dedup_key='cambio_fase', min_intervallo=60)
         return 'cambiata'
+
+    def _adotta_carica(self, dati):
+        """Prende per buona la carica in corso sulla centralina invece di
+        spegnerla: accesa, al setpoint che la centralina sta usando. Ritorna
+        quel setpoint. Va chiamata con WALLBOX_LOCK."""
+        # Limiti della fase letta ADESSO dal JSON: self.fase puo' essere
+        # ancora quella vecchia se la colonnina e' ripartita in un'altra fase
+        fase = 1 if str(dati.get('tfase')) == '1' else 0
+        min_p, max_p = self.limiti_potenza(fase)
+        try:
+            potenza = int(float(dati.get('power', min_p)))
+        except (TypeError, ValueError):
+            potenza = min_p
+        potenza = max(min_p, min(max_p, potenza))
+        self.is_on = True
+        self.current_set_power = potenza
+        self.display_power = float(potenza)
+        self.failed_off_attempts = 0
+        self.update_shared_state()
+        return potenza
+
+    def adotta_carica_esterna(self, dati):
+        """La centralina carica ma per noi e' spenta: si adotta la carica.
+
+        Succede quando la colonnina viene accesa (o torna la corrente) con il
+        servizio gia' avviato: appena alimentata riparte da sola a caricare
+        alla sua potenza minima. Per il regolatore pero' restava spenta, e da
+        spenta si riaccende solo se l'export supera il minimo; ma l'export che
+        vede e' gia' al netto dell'auto, quindi non lo superava quasi mai e la
+        carica restava bloccata al minimo (4140 W in trifase) anche importando
+        dalla rete (visto il 25 e il 28/10). Il reset dall'interfaccia la
+        sbloccava perche' initialize() adotta la carica in corso: qui si fa lo
+        stesso a ogni lettura della centralina, senza reset.
+        """
+        if self.is_on or not CONFIG.get('ADOTTA_CARICA_IN_CORSO', True):
+            return
+        try:
+            pcar = float(dati.get('pcar', 0))
+        except (TypeError, ValueError):
+            return
+        if pcar <= 0:
+            return
+        if self.manual_off:
+            log_throttled('carica_con_override',
+                          f"[AVVISO] La centralina sta caricando ({pcar:.0f}W) ma l'override "
+                          f"manuale e' attivo: non la regolo finche' non arriva /accendi.", 600)
+            return
+        # Dopo un nostro OFF la centralina impiega qualche secondo a fermarsi:
+        # in quella finestra pcar e' ancora > 0 e non e' una ripartenza
+        if time.time() - self.time_turned_off < CONFIG['COOLDOWN_ACCENSIONE']:
+            return
+        with WALLBOX_LOCK:
+            if self.is_on:
+                return
+            potenza = self._adotta_carica(dati)
+        log_msg(f"[CENTRALINA] Sta caricando ({pcar:.0f}W) ma risultava spenta "
+                f"(colonnina riaccesa?): adotto la carica a {potenza}W e riprendo a regolare.")
 
     def set_limite_kwh(self, kwh):
         """Imposta l'energia da caricare (0-100 kWh) sulla centralina.
@@ -2330,18 +2389,9 @@ class WallboxController:
                 pcar_ora = 0.0
 
             if CONFIG.get('ADOTTA_CARICA_IN_CORSO', True) and pcar_ora > 0:
-                try:
-                    potenza_ora = int(float(dati.get('power', min_p)))
-                except (TypeError, ValueError):
-                    potenza_ora = min_p
-                potenza_ora = max(min_p, min(self.limiti_potenza()[1], potenza_ora))
+                potenza_ora = self._adotta_carica(dati)
                 log_msg(f"1. Ricarica gia' in corso ({pcar_ora:.0f}W): adotto lo stato "
                         f"senza interromperla (setpoint {potenza_ora}W).")
-                self.is_on = True
-                self.current_set_power = potenza_ora
-                self.display_power = float(potenza_ora)
-                self.failed_off_attempts = 0
-                self.update_shared_state()
             else:
                 log_msg("1. Metto in OFF (Attesa dati)...")
                 self.turn_off(force=True)
