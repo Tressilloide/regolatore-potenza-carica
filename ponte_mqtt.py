@@ -1,14 +1,20 @@
-"""Pubblica i dati del fotovoltaico e della ricarica su MQTT, per Home
-Assistant e per l'archivio al minuto sul server di casa (192.168.1.36).
+"""Pubblica i dati della ricarica (e del fotovoltaico visto dal Pi) su MQTT,
+per Home Assistant e per l'archivio al minuto sul server di casa
+(192.168.1.36).
 
 Topic, tutti con QoS 1:
   solare/pi/online    'online' / 'offline' (retained, Last Will)
   solare/pi/stato     un JSON al minuto, subito dopo il pacchetto 'electricity'
                       del sensore (retained: HA lo ritrova dopo un suo riavvio)
   solare/pi/sessione  l'ultima sessione di ricarica chiusa (retained)
-  homeassistant/device/solare_pi/config
+  homeassistant/device/colonnina_pi/config
                       MQTT Discovery: HA crea da solo il dispositivo
-                      "Fotovoltaico" con i sensori di SENSORI
+                      "Colonnina" con i sensori di SENSORI
+
+In Home Assistant vanno solo i dati della ricarica: sole e rete li pubblica il
+demone owl-fotovoltaico sul server, che ascolta lo stesso sensore OWL e cosi'
+la dashboard Energia funziona anche a Pi spento. Nel JSON al minuto restano
+anche sole e rete come li vede il Pi, per l'archivio.
 
 Con QoS 1 paho tiene in RAM i messaggi finche' il broker non risponde (fino a
 CODA_MAX, una settimana di minuti) e li consegna alla riconnessione: un
@@ -24,7 +30,7 @@ try:
 except ImportError:          # simulatore e prove sul PC
     mqtt = None
 
-NODO = 'solare_pi'
+NODO = 'colonnina_pi'
 T_ONLINE = 'solare/pi/online'
 T_STATO = 'solare/pi/stato'
 T_SESSIONE = 'solare/pi/sessione'
@@ -47,23 +53,13 @@ def _sensore(chiave, nome, campo, **opzioni):
             'expire_after': SCADENZA_S, **opzioni}
 
 
-# Gli entity_id vengono dal nome: sensor.fotovoltaico_prodotta_oggi, ...
+# Gli entity_id vengono dal nome: sensor.colonnina_in_auto_oggi, ...
 SENSORI = {
-    'produzione': _sensore('produzione', 'Produzione', 'produzione_w', **POTENZA),
-    'consumo': _sensore('consumo', 'Consumo', 'consumo_w', icon='mdi:home-lightning-bolt', **POTENZA),
-    # positivo = prelievo, negativo = immissione
-    'prelievo': _sensore('prelievo', 'Prelievo dalla rete', 'prelievo_w',
-                         icon='mdi:transmission-tower', **POTENZA),
-    'auto': _sensore('auto', 'Ricarica auto', 'auto_w', icon='mdi:car-electric', **POTENZA),
-    'colonnina': _sensore('colonnina', 'Colonnina', 'colonnina', icon='mdi:ev-station'),
+    'potenza': _sensore('potenza', 'Potenza', 'auto_w', icon='mdi:car-electric', **POTENZA),
+    'stato': _sensore('stato', 'Stato', 'colonnina', icon='mdi:ev-station'),
     'algoritmo': _sensore('algoritmo', 'Algoritmo', 'algoritmo', icon='mdi:tune',
                           entity_category='diagnostic'),
-    'prodotta_oggi': _sensore('prodotta_oggi', 'Prodotta oggi', 'oggi_prodotta_kwh',
-                              icon='mdi:solar-power', **ENERGIA),
-    'prelevata_oggi': _sensore('prelevata_oggi', 'Prelevata oggi', 'oggi_prelevata_kwh',
-                               icon='mdi:transmission-tower-import', **ENERGIA),
-    'immessa_oggi': _sensore('immessa_oggi', 'Immessa oggi', 'oggi_immessa_kwh',
-                             icon='mdi:transmission-tower-export', **ENERGIA),
+    # in auto oggi (la dashboard Energia lo usa come consumo dell'auto)
     'auto_oggi': _sensore('auto_oggi', 'In auto oggi', 'oggi_auto_kwh',
                           icon='mdi:car-electric', **ENERGIA),
     'auto_sole_oggi': _sensore('auto_sole_oggi', 'In auto dal sole oggi', 'oggi_auto_sole_kwh',
@@ -113,8 +109,8 @@ class PonteMQTT:
         self._errore_segnalato = False
         self.log(f"[MQTT] Connesso a {self.host}")
         configurazione = {
-            'dev': {'ids': [NODO], 'name': 'Fotovoltaico', 'mf': 'regolatore-potenza-carica',
-                    'mdl': 'Raspberry Pi, sensore OWL e colonnina'},
+            'dev': {'ids': [NODO], 'name': 'Colonnina', 'mf': 'regolatore-potenza-carica',
+                    'mdl': 'Raspberry Pi e colonnina EVR'},
             'o': {'name': 'regolatore-potenza-carica'},
             'state_topic': T_STATO,
             'availability_topic': T_ONLINE,
