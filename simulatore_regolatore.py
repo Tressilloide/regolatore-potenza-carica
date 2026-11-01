@@ -278,6 +278,8 @@ class AlgoritmoClassico:
             else:
                 wallbox.set_power(nuova_potenza, bypass=False)
         else:
+            if potenza_casa < -1500:
+                return
             nuova_potenza = potenza_carica + abs(potenza_generata - potenza_consumata) - 100
             delta_potenza = nuova_potenza - potenza_carica
             if potenza_casa + delta_potenza > potenza_generata or nuova_potenza + potenza_casa > potenza_generata:

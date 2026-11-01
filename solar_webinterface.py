@@ -3183,14 +3183,18 @@ def run_logic(monitor, wallbox):
                 wallbox.set_power(nuova_potenza, bypass=False)
 
         else: 
+            # Qui c'era "if nuova_potenza > potenza_generata: return", che
+            # equivale a "casa sotto -100 W". pcar e' il setpoint e l'auto ne
+            # assorbe il 10-15% in meno, quindi la casa calcolata scende sotto
+            # zero quasi sempre: il 1/11 ha bloccato 921 aumenti su 1011, e alle
+            # 11:10 l'auto e' rimasta a 6 kW con 11-13 kW di sole per 4 minuti.
+            # L'idea era giusta con piu' tolleranza (come il PID): oltre 1,5 kW
+            # l'auto e' al suo massimo (11 kW) e alzare non serve. Senza
+            # controllo il setpoint arrivava a 22 kW, e al primo calo di sole
+            # servivano 4-5 passi prima che l'auto rallentasse davvero.
+            if potenza_casa < -1500:
+                return
             nuova_potenza = potenza_carica + abs(potenza_generata-potenza_consumata)- 100
-            # Qui c'era "if nuova_potenza > potenza_generata: return". Equivale a
-            # potenza_carica > potenza_consumata + 100, che succede quasi sempre
-            # con la casa scarica: pcar e' il setpoint e l'auto ne assorbe il
-            # 10-15% in meno, quindi supera il consumo misurato. Il 1/11 ha
-            # bloccato 921 aumenti su 1011: alle 11:10 l'auto e' rimasta a 6 kW
-            # con 11-13 kW di sole per 4 minuti. Il controllo qui sotto basta:
-            # dopo un aumento aspetta il consumo aggiornato.
             delta_potenza = nuova_potenza - potenza_carica
             if potenza_casa + delta_potenza >potenza_generata or nuova_potenza + potenza_casa > potenza_generata:
                 return
