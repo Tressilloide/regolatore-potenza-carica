@@ -268,7 +268,10 @@ class AlgoritmoClassico:
             nuova_potenza = potenza_generata - potenza_casa - 200
             wallbox.set_power(nuova_potenza, bypass=False)
         if potenza_carica > (potenza_generata - potenza_casa) or potenza_esportata < 0:
-            nuova_potenza = potenza_carica - abs(potenza_esportata)
+            if potenza_esportata < 0:
+                nuova_potenza = potenza_carica - abs(potenza_esportata)
+            else:
+                nuova_potenza = potenza_generata - potenza_casa - 100
             if nuova_potenza < potenza_minima or potenza_generata < potenza_minima:
                 wallbox.set_power(potenza_minima, bypass=True)
                 wallbox.pending_off_until = now + cfg['TIMER_SPEGNIMENTO']
@@ -276,8 +279,6 @@ class AlgoritmoClassico:
                 wallbox.set_power(nuova_potenza, bypass=False)
         else:
             nuova_potenza = potenza_carica + abs(potenza_generata - potenza_consumata) - 100
-            if nuova_potenza > potenza_generata:
-                return
             delta_potenza = nuova_potenza - potenza_carica
             if potenza_casa + delta_potenza > potenza_generata or nuova_potenza + potenza_casa > potenza_generata:
                 return

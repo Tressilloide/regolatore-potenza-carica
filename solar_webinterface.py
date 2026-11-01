@@ -3166,7 +3166,14 @@ def run_logic(monitor, wallbox):
             log_msg(f"[DECISIONE]2 Diminuisco a {nuova_potenza:.0f}W")
             wallbox.set_power(nuova_potenza, bypass=False)
         if potenza_carica > (potenza_generata - potenza_casa) or potenza_esportata < 0:
-            nuova_potenza = potenza_carica - abs(potenza_esportata)
+            if potenza_esportata < 0:
+                nuova_potenza = potenza_carica - abs(potenza_esportata)
+            else:
+                # L'auto supera il disponibile ma l'export e' positivo: il
+                # consumo e' di prima dell'ultimo aumento (arriva ogni 60 s).
+                # Togliere l'export, come si faceva, scendeva troppo: il 1/11
+                # alle 11:10 da 8543 a 5866 W quando ne bastavano 8046.
+                nuova_potenza = potenza_generata - potenza_casa - 100
             if nuova_potenza < potenza_minima or potenza_generata < potenza_minima:
                 log_msg(f"[DECISIONE] Sole insufficiente. Minimo per {CONFIG['TIMER_SPEGNIMENTO']}s.")
                 wallbox.set_power(potenza_minima, bypass=True)
@@ -3177,8 +3184,13 @@ def run_logic(monitor, wallbox):
 
         else: 
             nuova_potenza = potenza_carica + abs(potenza_generata-potenza_consumata)- 100
-            if nuova_potenza > potenza_generata:
-                return
+            # Qui c'era "if nuova_potenza > potenza_generata: return". Equivale a
+            # potenza_carica > potenza_consumata + 100, che succede quasi sempre
+            # con la casa scarica: pcar e' il setpoint e l'auto ne assorbe il
+            # 10-15% in meno, quindi supera il consumo misurato. Il 1/11 ha
+            # bloccato 921 aumenti su 1011: alle 11:10 l'auto e' rimasta a 6 kW
+            # con 11-13 kW di sole per 4 minuti. Il controllo qui sotto basta:
+            # dopo un aumento aspetta il consumo aggiornato.
             delta_potenza = nuova_potenza - potenza_carica
             if potenza_casa + delta_potenza >potenza_generata or nuova_potenza + potenza_casa > potenza_generata:
                 return
