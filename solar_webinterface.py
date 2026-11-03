@@ -30,6 +30,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from flask import Flask, jsonify, request, render_template_string
 
 from regolatore_pid import RegolatorePID
+from protezione_contatore import ProtezioneContatore, prelevabile_effettivo, limite_regolazione
 from ponte_mqtt import PonteMQTT
 
 # -----------------------------------------------------------
@@ -44,7 +45,15 @@ CONFIG = {
     'TRIFASE_MIN_POWER': 4140,
     'TRIFASE_MAX_POWER': 22000,
     'POTENZA_PROTEZIONE': 300,      # Modificabile da Web e Telegram (persistito)
-    'POTENZA_PRELEVABILE': 0,       # Modificabile da Web e Telegram (persistito)
+    'POTENZA_PRELEVABILE': 0,       # Quanto l'AUTO puo' prendere dalla rete, oltre alla casa (Web e Telegram, persistito)
+    # --- Contatore di casa (protezione_contatore.py) ---
+    # Oltre LIMITE_CONTATORE di prelievo (sole escluso, auto compresa) il
+    # contatore stacca: 6 kW di contratto + 10%. I regolatori non puntano mai
+    # oltre LIMITE - MARGINE (il margine copre l'errore del sensore e il
+    # ritardo dell'auto); se il prelievo lo supera comunque, l'auto viene
+    # ridotta o spenta subito. 0 = protezione disattivata.
+    'LIMITE_CONTATORE': 6600,
+    'MARGINE_CONTATORE': 300,
     'LIMITE_KWH': 100,              # Energia da caricare, 1-100 kWh (persistito)
     'COOLDOWN_ACCENSIONE': 60,
     'UPDATE_INTERVAL_S': 5,
@@ -162,6 +171,7 @@ WALLBOX_LOCK = threading.RLock()
 wallbox_instance = None
 contatori_instance = None
 regolatore_pid_instance = None
+protezione_instance = None
 ponte_mqtt_instance = None
 
 load_dotenv()
@@ -423,7 +433,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/spegni - Forza lo spegnimento della Wallbox\n"
         "/reset - Re-inizializza la centralina\n\n"
         "*Impostazioni*\n"
-        "/setPotenzaPrelevabile <W> - Potenza prelevabile dalla rete\n"
+        "/setPotenzaPrelevabile <W> - Quanto l'auto può prendere dalla rete, oltre alla casa\n"
         "/setPotenzaProtezione <W> - Soglia di protezione\n"
         "/limite <kWh> - Energia da caricare (1-100)\n"
         "/algoritmo [classico|pid] - Algoritmo di regolazione\n"
@@ -455,7 +465,8 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔌 *Rete:* {tot_grid:.0f} W\n"
         f"🚗 *Wallbox:* {wb_status} ({wb_power:.0f} W)\n"
         f"⚙️ *Modalità:* {modalita}\n"
-        f"🛠️ *Prelevabile:* {prelevabile} W\n"
+        f"🛠️ *Prelevabile per l'auto:* {prelevabile} W\n"
+        f"⚡ *Limite contatore:* {CONFIG['LIMITE_CONTATORE']} W\n"
         f"🛡️ *Protezione:* {protezione} W\n"
         f"🔋 *Limite carica:* {limite} kWh\n"
     )
@@ -1163,8 +1174,11 @@ HTML_TEMPLATE = """
                 <h2>Impostazioni</h2>
 
                 <div class="campo">
-                    <label for="prelevabile">Potenza prelevabile dalla rete (W)</label>
+                    <label for="prelevabile">Potenza prelevabile dalla rete per l'auto (W)</label>
                     <input type="number" id="prelevabile" min="0" max="20000" oninput="marcaSporco(event)">
+                    <div class="nota">In aggiunta a quello che preleva la casa. In tutto si resta sotto
+                        <span id="limite_contatore">--</span> W (limite del contatore): se la casa
+                        consuma di più, l'auto rallenta o si spegne.</div>
                 </div>
 
                 <div class="campo">
@@ -1480,6 +1494,7 @@ async function aggiorna() {
         : 'Quota di ricarica coperta dal fotovoltaico. Valori stimati: la centralina non riporta la potenza misurata.';
 
     setCampo('prelevabile', c.prelevabile);
+    $('limite_contatore').textContent = c.limite_contatore || '--';
     setCampo('protezione', c.protezione);
     setCampo('limite', c.limite);
     setCampo('prezzo_acquisto', c.prezzo_acquisto);
@@ -1653,6 +1668,7 @@ def get_data():
         }
         configurazione = {
             'prelevabile': CONFIG['POTENZA_PRELEVABILE'],
+            'limite_contatore': CONFIG['LIMITE_CONTATORE'],
             'protezione': CONFIG['POTENZA_PROTEZIONE'],
             'limite': CONFIG['LIMITE_KWH'],
             'prezzo_acquisto': CONFIG['PREZZO_ACQUISTO'],
@@ -1880,6 +1896,9 @@ class WallboxController:
         self.auto_collegata = False
         # sta REALMENTE assorbendo? (pcar > 0) - decide i confini della sessione
         self.in_carica = False
+        # Setpoint massimo dopo un intervento per il limite del contatore,
+        # fino al campione delle fasi successivo (protezione_contatore.py)
+        self.tetto_contatore = None
 
     def update_shared_state(self):
         with STATO_LOCK:
@@ -2235,6 +2254,10 @@ class WallboxController:
 
     def _set_power(self, watts, bypass):
         min_p, max_p = self.limiti_potenza()
+        if self.tetto_contatore is not None:
+            max_p = max(min_p, min(max_p, self.tetto_contatore))
+            if self.is_on and int(watts) > max_p and self.current_set_power == max_p:
+                return      # gia' al tetto della protezione: niente comandi doppi
         requested = int(max(min_p, min(max_p, int(watts))))
 
         now = time.time()
@@ -2318,10 +2341,13 @@ class WallboxController:
                           "[AVVISO] Accensione non riuscita: centralina non raggiungibile?", 300)
             return False
 
-    def turn_off(self, force=False):
+    def turn_off(self, force=False, urgente=False):
+        """`urgente`: limite del contatore superato, si spegne anche se un
+        comando e' appena partito (di norma si aspettano UPDATE_INTERVAL_S)."""
         with WALLBOX_LOCK:
             now = time.time()
-            if force and self.last_update_time != 0 and (now - self.last_update_time < CONFIG['UPDATE_INTERVAL_S']):
+            if (force and not urgente and self.last_update_time != 0
+                    and (now - self.last_update_time < CONFIG['UPDATE_INTERVAL_S'])):
                 return
 
             if not (self.is_on or force):
@@ -3083,6 +3109,19 @@ def run_logic(monitor, wallbox):
             # eventuale comando del classico in questo stesso pacchetto)
             regolatore_pid_instance.osserva(wallbox, monitor.solar_now)
 
+    # Limite del contatore: prima di qualunque algoritmo, e anche durante i
+    # loro timer. Se interviene, questo pacchetto e' gia' stato corretto.
+    if protezione_instance is not None:
+        with WALLBOX_LOCK:
+            if monitor.ultimo_tipo == 'electricity':
+                protezione_instance.aggiorna_fasi(
+                    monitor.fases[0:3], wallbox.current_set_power if wallbox.is_on else 0,
+                    wallbox.fase == 1)
+            if protezione_instance.controlla(wallbox, monitor.solar_now):
+                if regolatore_pid_instance is not None:
+                    regolatore_pid_instance.comando_esterno()
+                return
+
     # if user has manually requested the wallbox to remain off, skip all automatic decisions
     if getattr(wallbox, 'manual_off', False):
         # Prima questo log usciva a OGNI pacchetto (ogni pochi secondi) e
@@ -3099,8 +3138,12 @@ def run_logic(monitor, wallbox):
             regola_pid(monitor, wallbox)
         return
 
-    with STATO_LOCK:
-        POTENZA_PRELEVABILE = CONFIG['POTENZA_PRELEVABILE']
+    if wallbox.tetto_contatore is not None:
+        # La protezione del contatore e' appena intervenuta: il consumo che il
+        # classico vede e' di prima, con l'auto di prima, e ricorreggerlo a
+        # ogni 'solar' portava l'auto al minimo. Si riparte dal campione
+        # delle fasi successivo; intanto il sole lo segue la protezione.
+        return
 
     potenza_generata = monitor.solar_now
     potenza_consumata = monitor.total_grid_load
@@ -3113,11 +3156,15 @@ def run_logic(monitor, wallbox):
     else:
         potenza_carica = wallbox.display_power if wallbox.is_on else 0
     potenza_casa = monitor.house_load
-    potenza_generata += POTENZA_PRELEVABILE
+    # Prelievo totale concesso: la quota dell'auto piu' quello che preleva gia'
+    # la casa, entro il limite del contatore (vedi protezione_contatore.py)
+    with STATO_LOCK:
+        prelevabile = prelevabile_effettivo(CONFIG, potenza_casa - monitor.solar_now)
+    potenza_generata += prelevabile
     potenza_esportata = potenza_generata - potenza_consumata
 
-    log_msg(f"[INFO] Gen: {potenza_generata:.0f}W  | Casa: {potenza_casa:.0f}W | Esp: {potenza_esportata:.0f}W | "
-            f"WB: {'ON' if wallbox.is_on else 'OFF'} ({potenza_carica:.0f}W)")
+    log_msg(f"[INFO] Gen: {potenza_generata:.0f}W (prel {prelevabile:.0f}W) | Casa: {potenza_casa:.0f}W | "
+            f"Esp: {potenza_esportata:.0f}W | WB: {'ON' if wallbox.is_on else 'OFF'} ({potenza_carica:.0f}W)")
 
     potenza_minima, potenza_massima = wallbox.limiti_potenza()
 
@@ -3330,7 +3377,7 @@ def thread_periodico(wallbox):
 # MAIN
 # -----------------------------------------------------------
 def main():
-    global wallbox_instance, contatori_instance, regolatore_pid_instance, ponte_mqtt_instance
+    global wallbox_instance, contatori_instance, regolatore_pid_instance, ponte_mqtt_instance, protezione_instance
 
     # La configurazione va caricata PRIMA di costruire il controller, cosi'
     # initialize() lavora gia' con i valori salvati dall'utente.
@@ -3339,6 +3386,14 @@ def main():
     # Legge CONFIG a ogni passo: le modifiche da Telegram valgono subito
     regolatore_pid_instance = RegolatorePID(CONFIG, log=log_msg)
     log_msg(f"[CONFIG] Algoritmo di regolazione: {CONFIG['ALGORITMO']}")
+    protezione_instance = ProtezioneContatore(
+        CONFIG, log=log_msg,
+        avvisa=lambda messaggio: notifica(messaggio, dedup_key='limite_contatore', min_intervallo=900))
+    if limite_regolazione(CONFIG) is None:
+        log_msg("[CONFIG] Limite del contatore disattivato (LIMITE_CONTATORE = 0)")
+    else:
+        log_msg(f"[CONFIG] Limite del contatore {CONFIG['LIMITE_CONTATORE']}W: si regola entro "
+                f"{limite_regolazione(CONFIG)}W; prelevabile per l'auto {CONFIG['POTENZA_PRELEVABILE']}W")
 
     monitor = EnergyMonitor()
     contatori_instance = ContatoriEnergia()

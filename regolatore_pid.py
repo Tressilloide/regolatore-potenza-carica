@@ -33,6 +33,8 @@ vecchio conteneva ancora la potenza dell'auto PRIMA dell'ultimo comando: per
 o saliva al massimo (oscillazione da integratore con misura ritardata).
 """
 
+from protezione_contatore import prelevabile_effettivo
+
 
 class PID:
     """PID in forma incrementale (velocity form).
@@ -256,6 +258,11 @@ class RegolatorePID:
         self.auto_al_campione = wallbox.current_set_power if wallbox.is_on else 0
         self.stimatore.sole_precedente = sole
 
+    def comando_esterno(self):
+        """Un comando e' partito fuori da passo() (la protezione del contatore):
+        il prossimo 'exporting' mescola prima e dopo, come dopo un nostro."""
+        self.passi_da_comando = 0
+
     def _sole_impossibile(self, sole):
         """La produzione non passa da oltre 1 kW a zero in 6 s: succede solo
         quando il sensore OWL si riavvia (visto sul campo, insieme a un
@@ -309,7 +316,10 @@ class RegolatorePID:
         scambio, correzione = self.stimatore.scambio(
             sole, auto, trifase, exporting, affidabile=self.passi_da_comando >= 2)
         disponibile = scambio + self.stimatore.auto_modello(auto)
-        obiettivo = disponibile + cfg['POTENZA_PRELEVABILE'] - cfg['PID_MARGINE']
+        # Prelievo totale concesso: la quota dell'auto piu' quello che preleva
+        # gia' la casa, entro il limite del contatore (protezione_contatore.py)
+        prelevabile = prelevabile_effettivo(cfg, -disponibile)
+        obiettivo = disponibile + prelevabile - cfg['PID_MARGINE']
         minimo, massimo = wallbox.limiti_potenza()
         tetto = self.stimatore.tetto_auto
         if tetto is not None:
@@ -376,7 +386,7 @@ class RegolatorePID:
             elif t - self.timer_spegnimento >= cfg['TIMER_SPEGNIMENTO']:
                 medio = self.somma_finestra / max(self.campioni_finestra, 1)
                 self.timer_spegnimento = None
-                oltre_soglia = medio < -cfg['PID_IMPORT_SPEGNIMENTO'] or sole + cfg['POTENZA_PRELEVABILE'] < minimo
+                oltre_soglia = medio < -cfg['PID_IMPORT_SPEGNIMENTO'] or sole + prelevabile < minimo
                 if grezza >= minimo and medio >= 0:
                     self.log(f"[PID] Sole tornato ({disponibile:.0f}W disponibili): annullo lo spegnimento")
                 elif grezza < minimo and oltre_soglia:

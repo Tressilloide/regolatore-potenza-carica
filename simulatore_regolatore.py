@@ -22,6 +22,7 @@ import sys
 import datetime
 
 from regolatore_pid import RegolatorePID
+from protezione_contatore import ProtezioneContatore, prelevabile_effettivo
 
 CONFIG_BASE = {
     'MONOFASE_MIN_POWER': 1380, 'MONOFASE_MAX_POWER': 7360,
@@ -31,6 +32,9 @@ CONFIG_BASE = {
     'SMOOTHING_ALPHA': 0.9, 'MAX_DELTA_PER_SEC': 1500,
     'PID_KP': 0.1, 'PID_KI': 0.15, 'PID_KD': 0.0,
     'PID_MARGINE': 300, 'PID_IMPORT_SPEGNIMENTO': 200, 'PID_BANDA_DISCESA': 100,
+    'PID_FASE_MONOFASE': 0,
+    'LIMITE_CONTATORE': 6600, 'MARGINE_CONTATORE': 300,
+    'PROTEZIONE_VELOCE': True,      # solo simulatore: False = solo il tetto sul prelevabile
 }
 
 
@@ -133,6 +137,7 @@ class FintaWallbox:
         self.pcar = 0           # come la centralina: eco del setpoint
         self.pcar_letto = 0     # ...ma il servizio la rilegge solo ogni 5 s
         self.in_carica = False  # pcar > 0: la centralina lo sa (status), anche lei ogni 5 s
+        self.tetto_contatore = None
 
     def limiti_potenza(self):
         if self.fase == 0:
@@ -161,6 +166,10 @@ class FintaWallbox:
 
     def _set_power(self, watts, bypass):
         min_p, max_p = self.limiti_potenza()
+        if self.tetto_contatore is not None:
+            max_p = max(min_p, min(max_p, self.tetto_contatore))
+            if self.is_on and int(watts) > max_p and self.current_set_power == max_p:
+                return
         requested = int(max(min_p, min(max_p, int(watts))))
         now = self.ora()
         if not bypass:
@@ -205,9 +214,10 @@ class FintaWallbox:
         self.last_update_time = self.ora()
         return True
 
-    def turn_off(self, force=False):
+    def turn_off(self, force=False, urgente=False):
         now = self.ora()
-        if force and self.last_update_time != 0 and (now - self.last_update_time < self.cfg['UPDATE_INTERVAL_S']):
+        if (force and not urgente and self.last_update_time != 0
+                and (now - self.last_update_time < self.cfg['UPDATE_INTERVAL_S'])):
             return
         if not (self.is_on or force):
             return
@@ -222,12 +232,25 @@ class FintaWallbox:
 # ---------------------------------------------------------------------------
 # Vecchio algoritmo: copia di EnergyMonitor + run_logic
 # ---------------------------------------------------------------------------
+def nuova_protezione(cfg):
+    if not cfg.get('PROTEZIONE_VELOCE', True):
+        return None
+    return ProtezioneContatore(cfg, log=lambda m: None)
+
+
+def protezione_fasi(protezione, wallbox, consumi):
+    if protezione is not None:
+        protezione.aggiorna_fasi(consumi, wallbox.current_set_power if wallbox.is_on else 0,
+                                 wallbox.fase == 1)
+
+
 class AlgoritmoClassico:
     def __init__(self, cfg, wallbox, orologio):
         self.cfg, self.wb, self.ora = cfg, wallbox, orologio
         self.solar_now = 0.0
         self.total_grid_load = 0.0
         self.house_load = 0.0
+        self.protezione = nuova_protezione(cfg)
 
     def pacchetto_solar(self, sole, exporting):
         self.solar_now = sole
@@ -237,14 +260,19 @@ class AlgoritmoClassico:
         self.total_grid_load = sum(consumi)
         self.solar_now = sum(soli)
         self.house_load = self.total_grid_load - self.wb.potenza_reale()
+        protezione_fasi(self.protezione, self.wb, consumi)
         self.run_logic()
 
     def run_logic(self):
         wallbox, cfg = self.wb, self.cfg
-        potenza_generata = self.solar_now + cfg['POTENZA_PRELEVABILE']
+        if self.protezione is not None and self.protezione.controlla(wallbox, self.solar_now):
+            return
+        if wallbox.tetto_contatore is not None:
+            return
+        potenza_casa = self.house_load
+        potenza_generata = self.solar_now + prelevabile_effettivo(cfg, potenza_casa - self.solar_now)
         potenza_consumata = self.total_grid_load
         potenza_carica = wallbox.potenza_reale() if wallbox.is_on else 0
-        potenza_casa = self.house_load
         potenza_esportata = potenza_generata - potenza_consumata
         potenza_minima, potenza_massima = wallbox.limiti_potenza()
         now = self.ora()
@@ -296,12 +324,22 @@ class AlgoritmoPID:
     def __init__(self, cfg, wallbox, orologio):
         self.wb, self.ora = wallbox, orologio
         self.reg = RegolatorePID(cfg, log=lambda m: None)
+        self.protezione = nuova_protezione(cfg)
+
+    def _protetto(self, sole):
+        if self.protezione is not None and self.protezione.controlla(self.wb, sole):
+            self.reg.comando_esterno()
+            return True
+        return False
 
     def pacchetto_solar(self, sole, exporting):
-        self.reg.passo(self.wb, sole, exporting, self.ora())
+        if not self._protetto(sole):
+            self.reg.passo(self.wb, sole, exporting, self.ora())
 
     def pacchetto_electricity(self, consumi, soli):
         self.reg.aggiorna_fasi(consumi, soli, self.wb.fase == 1, self.ora())
+        protezione_fasi(self.protezione, self.wb, consumi)
+        self._protetto(sum(soli))
 
 
 # ---------------------------------------------------------------------------
