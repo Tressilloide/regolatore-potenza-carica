@@ -441,6 +441,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(msg, parse_mode='Markdown')
 
+def descrizione_limite():
+    """Il limite kWh com'e' davvero sulla centralina (letto ogni 5 s)."""
+    letto = SYSTEM_STATE.get('LIMITE_KWH_CENTRALINA')
+    if letto is None:
+        return f"sconosciuto, centralina non raggiungibile (salvato: {CONFIG['LIMITE_KWH']} kWh)"
+    return f"attivo, {letto} kWh" if letto > 0 else "nessuno"
+
 async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_auth(update): return
     with STATO_LOCK:
@@ -452,7 +459,7 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sensore_ok = SYSTEM_STATE['SENSORE_ONLINE']
         prelevabile = CONFIG['POTENZA_PRELEVABILE']
         protezione = CONFIG['POTENZA_PROTEZIONE']
-        limite = CONFIG['LIMITE_KWH']
+        limite = descrizione_limite()
 
     tot_grid = sum(fasi[0:3])
     tot_solar = sum(fasi[3:6])
@@ -468,7 +475,7 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🛠️ *Prelevabile per l'auto:* {prelevabile} W\n"
         f"⚡ *Limite contatore:* {CONFIG['LIMITE_CONTATORE']} W\n"
         f"🛡️ *Protezione:* {protezione} W\n"
-        f"🔋 *Limite carica:* {limite} kWh\n"
+        f"🔋 *Limite carica:* {limite}\n"
     )
     # Dati letti direttamente dalla centralina
     with STATO_LOCK:
@@ -573,10 +580,7 @@ async def cmd_limite(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Imposta l'energia da caricare in kWh (slider 'Limite' della centralina)."""
     if not check_auth(update): return
     if not context.args:
-        letto = SYSTEM_STATE.get('LIMITE_KWH_CENTRALINA')
-        msg = f"🔋 *Limite di carica:* {CONFIG['LIMITE_KWH']} kWh\n"
-        if letto is not None:
-            msg += f"_Letto dalla centralina: {letto}_\n"
+        msg = f"🔋 *Limite sulla centralina:* {descrizione_limite()}\n"
         if not CONFIG['CMD_LIMITE_TEMPLATE']:
             msg += "\n⚠️ _Comando non ancora configurato: il valore è salvato ma non inviato alla centralina._\n"
         msg += "\nUsa: `/limite 50`"
@@ -1509,14 +1513,19 @@ async function aggiorna() {
 
     /* Stato reale del limite: sempre quello letto dalla centralina
        (campo 'limit' > 0 = attivo), mai un flag locale che potrebbe
-       disallinearsi da quanto l'hardware ricorda per conto suo. */
-    const limiteAttivo = Number(s.limite_kwh_centralina) > 0;
+       disallinearsi da quanto l'hardware ricorda per conto suo.
+       null = colonnina spenta o irraggiungibile: il limite non si conosce. */
+    const limiteIgnoto = s.limite_kwh_centralina === null || s.limite_kwh_centralina === undefined;
+    const limiteAttivo = !limiteIgnoto && Number(s.limite_kwh_centralina) > 0;
     const btn = $('btn_limite_toggle');
-    $('limite_stato').textContent = limiteAttivo ? 'attivo' : 'disattivo';
-    $('c_limite').textContent = limiteAttivo ? s.limite_kwh_centralina + ' kWh' : 'nessuno';
-    btn.textContent = limiteAttivo ? 'Disattiva limite' : 'Attiva limite';
+    $('limite_stato').textContent = limiteIgnoto ? 'sconosciuto: colonnina non raggiungibile'
+        : (limiteAttivo ? 'attivo' : 'disattivo');
+    $('c_limite').textContent = limiteIgnoto ? 'sconosciuto'
+        : (limiteAttivo ? s.limite_kwh_centralina + ' kWh' : 'nessuno');
+    btn.textContent = limiteIgnoto ? 'Colonnina non raggiungibile'
+        : (limiteAttivo ? 'Disattiva limite' : 'Attiva limite');
     btn.dataset.attivo = limiteAttivo ? '1' : '0';
-    btn.disabled = !s.limite_supportato;
+    btn.disabled = !s.limite_supportato || limiteIgnoto;
 
     const cons = $('console');
     const giu = cons.scrollHeight - cons.clientHeight <= cons.scrollTop + 6;
@@ -1913,6 +1922,11 @@ class WallboxController:
         # Setpoint massimo dopo un intervento per il limite del contatore,
         # fino al campione delle fasi successivo (protezione_contatore.py)
         self.tetto_contatore = None
+        # Limite kWh: ultimo valore letto dalla centralina (resta anche a
+        # colonnina spenta, per confrontarlo alla riaccensione) e ultimo
+        # inviato da noi (la sua rilettura non e' una novita')
+        self.limite_noto = None
+        self.limite_inviato = None
 
     def update_shared_state(self):
         with STATO_LOCK:
@@ -1949,8 +1963,7 @@ class WallboxController:
             if risposta.status_code != 200:
                 log_throttled('centralina_codice',
                               f"[CENTRALINA] Risposta inattesa: codice {risposta.status_code}", 300)
-                SYSTEM_STATE['CENTRALINA_ONLINE'] = False
-                self.sync_falliti += 1
+                self._lettura_fallita()
                 return None
             dati = risposta.json()
             SYSTEM_STATE['CENTRALINA_ONLINE'] = True
@@ -1963,14 +1976,22 @@ class WallboxController:
             return dati
         except requests.exceptions.RequestException as e:
             log_throttled('centralina_connessione', f"[CENTRALINA] Errore di connessione: {e}", 300)
-            SYSTEM_STATE['CENTRALINA_ONLINE'] = False
-            self.sync_falliti += 1
+            self._lettura_fallita()
             return None
         except ValueError:
             log_throttled('centralina_json', "[CENTRALINA] La risposta non e' un JSON valido.", 300)
-            SYSTEM_STATE['CENTRALINA_ONLINE'] = False
-            self.sync_falliti += 1
+            self._lettura_fallita()
             return None
+
+    def _lettura_fallita(self):
+        SYSTEM_STATE['CENTRALINA_ONLINE'] = False
+        self.sync_falliti += 1
+        if self.sync_falliti >= 2:
+            # Colonnina spenta o irraggiungibile: il limite che ha adesso non
+            # lo sappiamo. Prima restava l'ultimo letto, e l'interfaccia lo
+            # mostrava "attivo" anche a colonnina spenta. Due errori di fila,
+            # per non far lampeggiare la pagina a ogni errore isolato.
+            SYSTEM_STATE['LIMITE_KWH_CENTRALINA'] = None
 
     def _assorbi_stato(self, dati):
         """Estrae dal JSON della centralina tutto cio' che ci serve.
@@ -2009,8 +2030,16 @@ class WallboxController:
             SYSTEM_STATE['WB_DESC'] = str(dati.get('desc', ''))
             SYSTEM_STATE['WB_ALG'] = str(dati.get('alg', ''))
             chiave_limite = CONFIG.get('CHIAVE_LIMITE_JSON')
+            limite_letto = None
             if chiave_limite and chiave_limite in dati:
-                SYSTEM_STATE['LIMITE_KWH_CENTRALINA'] = dati[chiave_limite]
+                try:
+                    limite_letto = int(float(dati[chiave_limite]))
+                except (TypeError, ValueError):
+                    limite_letto = None
+                SYSTEM_STATE['LIMITE_KWH_CENTRALINA'] = limite_letto
+
+        if limite_letto is not None:
+            self._sincronizza_limite(limite_letto)
 
         # L'auto e' collegata? status "0" = Non collegata.
         collegata = str(dati.get('status', '0')) != '0'
@@ -2091,6 +2120,40 @@ class WallboxController:
             notifica(f"⚠️ La centralina è in modalità *{nomi.get(alg, alg)}*, non *Man*: "
                      f"la regolazione automatica della potenza non ha effetto.",
                      dedup_key='alg_non_manuale', min_intervallo=3600)
+
+    def _sincronizza_limite(self, letto):
+        """Il limite vero e' quello della centralina, letto ogni 5 s.
+
+        Puo' cambiare senza di noi: dal pannello della colonnina, o quando
+        viene spenta e riaccesa. Se e' attivo con un valore diverso da quello
+        salvato lo si adotta, cosi' lo slider della pagina e "Salva
+        impostazioni" non lo riportano al valore vecchio. Se un limite attivo
+        sparisce senza un nostro comando, lo si dice su Telegram: l'auto
+        caricherebbe senza tetto.
+        """
+        precedente = self.limite_noto
+        self.limite_noto = letto
+        if letto == precedente:
+            return
+        if letto == self.limite_inviato:
+            return      # e' la rilettura di un nostro comando, gia' loggato
+        self.limite_inviato = None
+        if precedente is None:
+            log_msg(f"[LIMITE] Sulla centralina: "
+                    f"{f'attivo, {letto} kWh' if letto > 0 else 'nessun limite'}")
+        else:
+            testo = lambda v: f"{v} kWh" if v else "nessuno"
+            log_msg(f"[LIMITE] Cambiato sulla centralina, non da qui: "
+                    f"{testo(precedente)} -> {testo(letto)}")
+            if precedente > 0 and letto == 0:
+                notifica(f"🔋 Il limite di carica di {precedente} kWh non c'è più sulla "
+                         f"centralina (spenta e riaccesa?): l'auto carica senza limite.",
+                         dedup_key='limite_sparito', min_intervallo=600)
+        if 1 <= letto <= 100 and letto != CONFIG['LIMITE_KWH']:
+            with STATO_LOCK:
+                CONFIG['LIMITE_KWH'] = letto
+            salva_config()
+            log_msg(f"[LIMITE] Adottato il valore della centralina: {letto} kWh")
 
     def potenza_reale(self):
         """Potenza assorbita dall'auto, misurata dalla centralina.
@@ -2245,6 +2308,7 @@ class WallboxController:
         if not ok:
             return False, "Comando non accettato dalla centralina."
 
+        self.limite_inviato = kwh
         log_msg(f"[LIMITE] {'Disattivato' if kwh == 0 else f'Impostato a {kwh} kWh'}")
 
         # Verifica: rileggo e confronto. E' il modo piu' rapido per capire se
@@ -2453,7 +2517,7 @@ class WallboxController:
             # carica dimenticato acceso.
             if CONFIG.get('CMD_LIMITE_TEMPLATE'):
                 limite_letto = SYSTEM_STATE.get('LIMITE_KWH_CENTRALINA')
-                if limite_letto not in (None, 0, '0'):
+                if limite_letto:
                     log_msg(f"[LIMITE] Trovato limite attivo ereditato ({limite_letto} kWh): lo disattivo.")
                     self.set_limite_kwh(0)
 
