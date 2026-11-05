@@ -1219,6 +1219,10 @@ HTML_TEMPLATE = """
                     l'acquisto ma rinuncia alla vendita.
                 </div>
 
+                <div id="non_salvate" class="esito ko" hidden>
+                    Modifiche non salvate: il regolatore usa ancora i valori di prima.
+                    Premi "Salva impostazioni".
+                </div>
                 <button class="b-primario" onclick="salva()">Salva impostazioni</button>
                 <button class="b-secondario" onclick="reinit()">Re-inizializza wallbox</button>
                 <div id="esito" class="esito" hidden></div>
@@ -1255,7 +1259,8 @@ const num = v => (v === null || v === undefined) ? '--' : Math.round(v).toLocale
 /* I campi non vanno sovrascritti dal polling se l'utente ci sta scrivendo
    (activeElement) o ha gia' modificato senza salvare (sporchi). */
 const sporchi = new Set();
-function marcaSporco(e) { sporchi.add(e.target.id); }
+function mostraSporchi() { $('non_salvate').hidden = sporchi.size === 0; }
+function marcaSporco(e) { sporchi.add(e.target.id); mostraSporchi(); }
 
 function setCampo(id, valore) {
     const el = $(id);
@@ -1521,6 +1526,7 @@ async function aggiorna() {
     if (range === 'live') disegna(d.history || []);
 }
 
+/* Ritorna true se il Pi ha salvato (serve a toggleLimite) */
 async function salva() {
     const payload = {}, errori = [];
     const leggi = (id, etichetta) => {
@@ -1542,7 +1548,7 @@ async function salva() {
     };
     prezzo('prezzo_acquisto', 'Prezzo acquisto');
     prezzo('prezzo_vendita', 'Prezzo vendita');
-    if (errori.length) { esito('Correggi:\\n' + errori.join('\\n'), false); return; }
+    if (errori.length) { esito('Correggi:\\n' + errori.join('\\n'), false); return false; }
 
     try {
         const r = await fetch('/api/settings', {
@@ -1552,17 +1558,24 @@ async function salva() {
         const res = await r.json().catch(() => ({}));
         if (!r.ok || !res.success) {
             esito('Salvataggio non riuscito:\\n' + (res.errori || ['errore sconosciuto']).join('\\n'), false);
-            return;
+            return false;
         }
         sporchi.clear();
+        mostraSporchi();
         esito('Impostazioni salvate.', true);
         aggiorna();
-    } catch (e) { esito('Errore di rete: ' + e, false); }
+        return true;
+    } catch (e) { esito('Errore di rete: ' + e, false); return false; }
 }
 
 async function toggleLimite() {
     const btn = $('btn_limite_toggle');
     const nuovoStato = btn.dataset.attivo !== '1';
+    /* Prima le altre modifiche in sospeso. Il 5/11 il prelevabile scritto nel
+       campo restava solo nella pagina: questo bottone inviava il solo limite,
+       rispondeva "Limite impostato" e il regolatore, ancora a prelevabile 0,
+       di notte ha spento la carica. */
+    if ([...sporchi].some(id => id !== 'limite') && !(await salva())) return;
     btn.disabled = true;
     /* Attivando si manda il valore ATTUALE dello slider (anche se non ancora
        salvato): altrimenti si riattiverebbe silenziosamente un valore vecchio. */
@@ -1579,6 +1592,7 @@ async function toggleLimite() {
             return;
         }
         sporchi.delete('limite');
+        mostraSporchi();
         esito(res.messaggio || 'Fatto.', true);
     } catch (e) {
         esito('Errore di rete: ' + e, false);
