@@ -7,6 +7,11 @@ Topic, tutti con QoS 1:
   solare/pi/stato     un JSON al minuto, subito dopo il pacchetto 'electricity'
                       del sensore (retained: HA lo ritrova dopo un suo riavvio)
   solare/pi/sessione  l'ultima sessione di ricarica chiusa (retained)
+  solare/pi/controlli modalita', prelevabile, boost, obiettivo (retained), a
+                      ogni cambio e ogni minuto
+  solare/pi/cmd/<nome> comandi da Home Assistant (NON retained): modalita
+                      (sole|misto|veloce), prelevabile (W), boost (minuti,
+                      0 = annulla), obiettivo ('<kWh> <HH:MM>' o 'off')
   homeassistant/device/colonnina_pi/config
                       MQTT Discovery: HA crea da solo il dispositivo
                       "Colonnina" con i sensori di SENSORI
@@ -34,6 +39,9 @@ NODO = 'colonnina_pi'
 T_ONLINE = 'solare/pi/online'
 T_STATO = 'solare/pi/stato'
 T_SESSIONE = 'solare/pi/sessione'
+T_CONTROLLI = 'solare/pi/controlli'
+T_COMANDI = 'solare/pi/cmd/'
+COMANDI = ('modalita', 'prelevabile', 'boost', 'obiettivo')
 T_DISCOVERY = f'homeassistant/device/{NODO}/config'
 CODA_MAX = 7 * 24 * 60
 # Senza un nuovo 'stato' per 5 minuti i sensori diventano "non disponibili":
@@ -68,6 +76,32 @@ SENSORI = {
                                    'oggi_minuti_carica', icon='mdi:timer-outline',
                                    device_class='duration', unit_of_measurement='min',
                                    state_class='total_increasing'),
+    # --- Controlli: Home Assistant comanda la carica ---------------------
+    # Lo stato viene da T_CONTROLLI, pubblicato subito dopo ogni comando:
+    # quello al minuto farebbe tornare indietro il selettore per un minuto.
+    'modalita': {'p': 'select', 'name': 'Modalità', 'unique_id': f'{NODO}_modalita',
+                 'icon': 'mdi:car-cog', 'options': ['sole', 'misto', 'veloce'],
+                 'command_topic': T_COMANDI + 'modalita', 'state_topic': T_CONTROLLI,
+                 'value_template': '{{ value_json.modalita }}'},
+    'prelevabile': {'p': 'number', 'name': 'Prelevabile per l\'auto',
+                    'unique_id': f'{NODO}_prelevabile', 'icon': 'mdi:transmission-tower-import',
+                    'min': 0, 'max': 6600, 'step': 100, 'mode': 'box',
+                    'unit_of_measurement': 'W', 'device_class': 'power',
+                    'command_topic': T_COMANDI + 'prelevabile', 'state_topic': T_CONTROLLI,
+                    'value_template': '{{ value_json.prelevabile_w }}'},
+    'boost': {'p': 'button', 'name': 'Boost 1 ora', 'unique_id': f'{NODO}_boost',
+              'icon': 'mdi:lightning-bolt', 'command_topic': T_COMANDI + 'boost',
+              'payload_press': '60'},
+    'boost_annulla': {'p': 'button', 'name': 'Annulla boost', 'unique_id': f'{NODO}_boost_annulla',
+                      'icon': 'mdi:lightning-bolt-outline', 'command_topic': T_COMANDI + 'boost',
+                      'payload_press': '0'},
+    'modalita_attiva': {'p': 'sensor', 'name': 'Modalità attiva', 'unique_id': f'{NODO}_modalita_attiva',
+                        'icon': 'mdi:car-clock', 'state_topic': T_CONTROLLI,
+                        'value_template': '{{ value_json.modalita_effettiva }}',
+                        'json_attributes_topic': T_CONTROLLI},
+    'obiettivo': {'p': 'sensor', 'name': 'Obiettivo caricato', 'unique_id': f'{NODO}_obiettivo',
+                  'icon': 'mdi:target', 'state_topic': T_CONTROLLI, 'unit_of_measurement': 'kWh',
+                  'value_template': '{{ value_json.obiettivo.fatti if value_json.obiettivo else 0 }}'},
     'ultima_sessione': {'p': 'sensor', 'name': 'Ultima sessione', 'unique_id': f'{NODO}_ultima_sessione',
                         'state_topic': T_SESSIONE, 'value_template': '{{ value_json.kwh }}',
                         'json_attributes_topic': T_SESSIONE, 'icon': 'mdi:ev-plug-type2',
@@ -83,6 +117,8 @@ class PonteMQTT:
         self._soli = []              # produzione dei pacchetti 'solar' dell'ultimo minuto
         self._errore_segnalato = False
         self._chiuso = False
+        self._comandi = None         # funzione(nome, valore) -> (ok, messaggio)
+        self._ultimi_controlli = None
         if not self.attivo:
             if host and mqtt is None:
                 log("[MQTT] paho-mqtt non installato: niente dati verso Home Assistant")
@@ -97,6 +133,7 @@ class PonteMQTT:
         c.on_connect = self._connesso
         c.on_connect_fail = self._connessione_fallita
         c.on_disconnect = self._disconnesso
+        c.on_message = self._messaggio
         # Asincrono: se il server e' spento il regolatore parte lo stesso, e
         # il thread di paho continua a riprovare da solo.
         c.connect_async(host, int(porta), keepalive=60)
@@ -120,6 +157,40 @@ class PonteMQTT:
         }
         client.publish(T_DISCOVERY, json.dumps(configurazione), qos=1, retain=True)
         client.publish(T_ONLINE, 'online', qos=1, retain=True)
+        if self._ultimi_controlli is not None:
+            self._pubblica(T_CONTROLLI, self._ultimi_controlli)
+        # Ad ogni (ri)connessione: la sottoscrizione non sopravvive a una
+        # sessione pulita del broker
+        client.subscribe(T_COMANDI + '#', qos=1)
+
+    def imposta_comandi(self, funzione):
+        """`funzione(nome, valore)` esegue un comando arrivato da Home
+        Assistant e ritorna (ok, messaggio)."""
+        self._comandi = funzione
+
+    def _messaggio(self, client, userdata, msg):
+        """Comandi da Home Assistant. Gira nel thread di paho: non deve mai
+        sollevare eccezioni, ne' bloccarsi a lungo."""
+        try:
+            nome = msg.topic[len(T_COMANDI):] if msg.topic.startswith(T_COMANDI) else None
+            if msg.retain:
+                # Un comando retained verrebbe rieseguito a ogni riconnessione
+                self.log(f"[MQTT] Comando retained su {msg.topic} ignorato")
+                return
+            if nome not in COMANDI or self._comandi is None:
+                return
+            valore = msg.payload.decode('utf-8', errors='replace')[:64]
+            ok, messaggio = self._comandi(nome, valore)
+            self.log(f"[MQTT] Comando {nome}={valore!r}: {messaggio}")
+        except Exception as e:
+            self.log(f"[MQTT] Comando su {msg.topic} non eseguito: {e}")
+
+    def pubblica_controlli(self, stato):
+        """Stato dei controlli: subito dopo un comando e ogni minuto (retained)."""
+        if not self.attivo:
+            return
+        self._ultimi_controlli = stato
+        self._pubblica(T_CONTROLLI, stato)
 
     def _connessione_fallita(self, client, userdata):
         self._segnala(f"[MQTT] {self.host} non raggiungibile: riprovo, i dati restano in coda")

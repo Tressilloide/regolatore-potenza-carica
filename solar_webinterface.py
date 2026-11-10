@@ -30,7 +30,10 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from flask import Flask, jsonify, request, render_template_string
 
 from regolatore_pid import RegolatorePID
-from protezione_contatore import ProtezioneContatore, prelevabile_effettivo, limite_regolazione
+from regolatore_classico import RegolatoreClassico
+from protezione_contatore import ProtezioneContatore, limite_regolazione
+from pianificatore import (Pianificatore, MODALITA, NOMI_MODALITA, prossima_scadenza,
+                           interpreta_orario)
 from ponte_mqtt import PonteMQTT
 
 # -----------------------------------------------------------
@@ -46,6 +49,10 @@ CONFIG = {
     'TRIFASE_MAX_POWER': 22000,
     'POTENZA_PROTEZIONE': 300,      # Modificabile da Web e Telegram (persistito)
     'POTENZA_PRELEVABILE': 0,       # Quanto l'AUTO puo' prendere dalla rete, oltre alla casa (Web e Telegram, persistito)
+    # Modalita' di carica (pianificatore.py, persistita): 'sole' = solo il
+    # sole in piu', 'misto' = sole + POTENZA_PRELEVABILE, 'veloce' = quanto il
+    # contatore permette. Boost a tempo e obiettivo kWh stanno in FILE_PIANO.
+    'MODALITA': 'misto',
     # --- Contatore di casa (protezione_contatore.py) ---
     # Oltre LIMITE_CONTATORE di prelievo (sole escluso, auto compresa) il
     # contatore stacca: 6 kW di contratto + 10%. I regolatori non puntano mai
@@ -118,6 +125,7 @@ CONFIG = {
     'STORICO_RETENTION_GIORNI': 7,
     'STORICO_FLUSH_S': 60,          # Scrittura su disco a blocchi (salva-SD)
     'WATCHDOG_SENSORE_S': 300,      # Nessun pacchetto da >5 min => allarme
+    'SESSIONE_OFFLINE_S': 600,      # Centralina muta da 10 min mentre caricava => sessione chiusa
     'ORA_RIEPILOGO': 23,            # Ora del riepilogo giornaliero Telegram
 }
 
@@ -130,6 +138,7 @@ FILE_STORICO = os.path.join(DIR_BASE, 'storico.jsonl')
 FILE_STORICO_GIORNALIERO = os.path.join(DIR_BASE, 'storico_giornaliero.json')
 FILE_SESSIONI = os.path.join(DIR_BASE, 'sessioni.json')
 FILE_STATO_ENERGIA = os.path.join(DIR_BASE, 'stato_energia.json')
+FILE_PIANO = os.path.join(DIR_BASE, 'pianificazione.json')
 
 # Stato condiviso per la Web UI e Telegram
 SYSTEM_STATE = {
@@ -171,6 +180,8 @@ WALLBOX_LOCK = threading.RLock()
 wallbox_instance = None
 contatori_instance = None
 regolatore_pid_instance = None
+classico_instance = None
+pianificatore_instance = None
 protezione_instance = None
 ponte_mqtt_instance = None
 
@@ -217,6 +228,7 @@ CHIAVI_PERSISTENTI = {
     # chiave: (minimo, massimo, tipo)
     'POTENZA_PRELEVABILE': (0, 20000, int),
     'POTENZA_PROTEZIONE':  (50, 5000, int),
+    'MODALITA':            (None, None, MODALITA),
     'LIMITE_KWH':          (1, 100, int),
     'PREZZO_ACQUISTO':     (0, 5, float),
     'PREZZO_VENDITA':      (0, 5, float),
@@ -432,9 +444,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/accendi - Forza l'accensione della Wallbox\n"
         "/spegni - Forza lo spegnimento della Wallbox\n"
         "/reset - Re-inizializza la centralina\n\n"
+        "*Carica*\n"
+        "/modalita [sole|misto|veloce] - Solo sole, sole + rete, massima\n"
+        "/boost [minuti|off] - Veloce per un po' (default 60 min)\n"
+        "/obiettivo <kWh> <HH:MM> - Pronta entro un orario (off per annullare)\n\n"
         "*Impostazioni*\n"
-        "/setPotenzaPrelevabile <W> - Quanto l'auto può prendere dalla rete, oltre alla casa\n"
-        "/setPotenzaProtezione <W> - Soglia di protezione\n"
+        "/prelevabile <W> - Quanto l'auto può prendere dalla rete, oltre alla casa\n"
+        "/protezione <W> - Soglia di protezione\n"
         "/limite <kWh> - Energia da caricare (1-100)\n"
         "/algoritmo [classico|pid] - Algoritmo di regolazione\n"
         "/pid [kp|ki|kd|margine <valore>] - Stato e taratura del PID\n"
@@ -471,7 +487,8 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"☀️ *Solare:* {tot_solar:.0f} W\n"
         f"🔌 *Rete:* {tot_grid:.0f} W\n"
         f"🚗 *Wallbox:* {wb_status} ({wb_power:.0f} W)\n"
-        f"⚙️ *Modalità:* {modalita}\n"
+        f"⚙️ *Impianto:* {modalita}\n"
+        f"🚦 *Carica:* {pianificatore_instance.descrizione() if pianificatore_instance else '?'}\n"
         f"🛠️ *Prelevabile per l'auto:* {prelevabile} W\n"
         f"⚡ *Limite contatore:* {CONFIG['LIMITE_CONTATORE']} W\n"
         f"🛡️ *Protezione:* {protezione} W\n"
@@ -548,6 +565,92 @@ def applica_impostazione(chiave, valore, origine):
     log_msg(f"[{origine}] {chiave} impostata a {pulito}")
     return True, None
 
+def esegui_comando(nome, valore, origine):
+    """Unico punto per i comandi di carica, da Web, Telegram e Home Assistant
+    (MQTT): stessa validazione e stesso effetto da qualunque parte arrivino.
+
+    nome: 'modalita' | 'prelevabile' | 'boost' (minuti, 0 = annulla) |
+          'obiettivo' ('<kWh> <HH:MM>' oppure 'off')
+    Ritorna (ok, messaggio).
+    """
+    valore = '' if valore is None else str(valore).strip()
+    if nome == 'modalita':
+        ok, errore = applica_impostazione('MODALITA', valore, origine)
+        esito = (ok, f"Modalità: {NOMI_MODALITA[CONFIG['MODALITA']]}" if ok else errore)
+    elif nome == 'prelevabile':
+        ok, errore = applica_impostazione('POTENZA_PRELEVABILE', valore, origine)
+        esito = (ok, f"Prelevabile per l'auto: {CONFIG['POTENZA_PRELEVABILE']} W" if ok else errore)
+    elif pianificatore_instance is None:
+        esito = (False, "Pianificatore non pronto")
+    elif nome == 'boost':
+        esito = pianificatore_instance.imposta_boost(0 if valore.lower() in ('off', 'no', '') else valore)
+    elif nome == 'obiettivo':
+        esito = imposta_obiettivo_da_testo(valore)
+    else:
+        esito = (False, f"Comando sconosciuto: {nome}")
+    if esito[0] and nome in ('boost', 'obiettivo'):
+        log_msg(f"[{origine}] {esito[1]}")
+    if esito[0] and ponte_mqtt_instance and pianificatore_instance:
+        ponte_mqtt_instance.pubblica_controlli(stato_controlli())
+    return esito
+
+def imposta_obiettivo_da_testo(testo):
+    """'15 7:30' -> 15 kWh entro le 7:30 (oggi, o domani se gia' passate).
+    'off' -> annulla."""
+    parti = testo.replace(',', '.').split()
+    if not parti or parti[0].lower() in ('off', 'no', 'annulla', '0'):
+        return pianificatore_instance.annulla_obiettivo()
+    if len(parti) != 2:
+        return False, "Formato: <kWh> <HH:MM>, per esempio 15 7:30"
+    orario = interpreta_orario(parti[1])
+    if orario is None:
+        return False, f"Orario non valido: {parti[1]}"
+    try:
+        kwh = float(parti[0].lower().replace('kwh', ''))
+    except ValueError:
+        return False, f"Energia non valida: {parti[0]}"
+    return pianificatore_instance.imposta_obiettivo(kwh, prossima_scadenza(*orario))
+
+def stato_controlli():
+    """Modalita', prelevabile, boost e obiettivo: per pagina web e Home Assistant."""
+    stato = pianificatore_instance.stato() if pianificatore_instance else {}
+    stato['prelevabile_w'] = CONFIG['POTENZA_PRELEVABILE']
+    return stato
+
+async def cmd_modalita(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/modalita [sole|misto|veloce]"""
+    if not check_auth(update): return
+    if not context.args:
+        await update.message.reply_text(
+            f"⚙️ *Modalità:* {pianificatore_instance.descrizione() if pianificatore_instance else '?'}\n\n"
+            "`/modalita sole` - solo il sole in più rispetto alla casa\n"
+            f"`/modalita misto` - sole + {CONFIG['POTENZA_PRELEVABILE']} W dalla rete\n"
+            "`/modalita veloce` - quanto il contatore permette", parse_mode='Markdown')
+        return
+    ok, messaggio = esegui_comando('modalita', context.args[0], 'TELEGRAM')
+    await update.message.reply_text(f"{'✅' if ok else '⚠️'} {messaggio}")
+
+async def cmd_boost(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/boost [minuti|off]: carica veloce per un po', poi torna alla modalita'."""
+    if not check_auth(update): return
+    valore = context.args[0] if context.args else '60'
+    ok, messaggio = esegui_comando('boost', valore, 'TELEGRAM')
+    await update.message.reply_text(f"{'⚡' if ok else '⚠️'} {messaggio}"
+                                    + ("" if ok else "\nUsa: /boost 90 (minuti) oppure /boost off"))
+
+async def cmd_obiettivo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/obiettivo <kWh> <HH:MM> | off"""
+    if not check_auth(update): return
+    if not context.args:
+        await update.message.reply_text(
+            f"🎯 {pianificatore_instance.descrizione() if pianificatore_instance else '?'}\n\n"
+            "Usa: `/obiettivo 15 7:30` (15 kWh entro le 7:30) oppure `/obiettivo off`.\n"
+            "Si carica col sole finché basta; se non basta per finire in tempo, "
+            "si integra con la rete quanto serve.", parse_mode='Markdown')
+        return
+    ok, messaggio = esegui_comando('obiettivo', ' '.join(context.args), 'TELEGRAM')
+    await update.message.reply_text(f"{'🎯' if ok else '⚠️'} {messaggio}")
+
 async def cmd_set_prelevabile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_auth(update): return
     if not context.args:
@@ -555,10 +658,12 @@ async def cmd_set_prelevabile(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"🛠️ *Potenza Prelevabile* attuale: {CONFIG['POTENZA_PRELEVABILE']} W\n"
             "Usa: `/prelevabile 1000`", parse_mode='Markdown')
         return
-    ok, errore = applica_impostazione('POTENZA_PRELEVABILE', context.args[0], 'TELEGRAM')
+    ok, errore = esegui_comando('prelevabile', context.args[0], 'TELEGRAM')
     if ok:
+        nota = ("" if CONFIG['MODALITA'] == 'misto' else
+                f"\n_Vale nella modalità Sole + rete (ora: {NOMI_MODALITA[CONFIG['MODALITA']]})._")
         await update.message.reply_text(
-            f"✅ *Potenza Prelevabile* impostata a {CONFIG['POTENZA_PRELEVABILE']} W", parse_mode='Markdown')
+            f"✅ *Potenza Prelevabile* impostata a {CONFIG['POTENZA_PRELEVABILE']} W{nota}", parse_mode='Markdown')
     else:
         await update.message.reply_text(f"⚠️ {errore}\nEsempio: `/prelevabile 1000`", parse_mode='Markdown')
 
@@ -717,8 +822,8 @@ async def cmd_sessioni(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if contatori_instance and contatori_instance.inizio_carica:
         minuti = (time.time() - contatori_instance.inizio_carica) / 60
-        kwh = SYSTEM_STATE.get('WB_ENERGIA_SESSIONE') or 0.0
-        nota = "" if SYSTEM_STATE.get('WB_ENERGIA_MISURATA') else " (stimata)"
+        kwh = contatori_instance.kwh_sessione()
+        nota = "" if contatori_instance.sessione.get('misurata') else " (stimata)"
         corso = f"▶️ *In corso:* {minuti:.0f} min, {kwh:.2f} kWh{nota}\n\n"
     else:
         corso = ""
@@ -888,6 +993,9 @@ def _registra_comandi(app):
         (["protezione", "setpotenzaprotezione"], cmd_set_protezione),
         (["limite"], cmd_limite),
         (["algoritmo"], cmd_algoritmo),
+        (["modalita"], cmd_modalita),
+        (["boost"], cmd_boost),
+        (["obiettivo"], cmd_obiettivo),
         (["pid"], cmd_pid),
         (["fase"], cmd_fase),
         (["energia"], cmd_energia),
@@ -953,7 +1061,7 @@ HTML_TEMPLATE = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="color-scheme" content="light dark">
     <title>Solar Controller</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <style>
         :root {
             --sfondo:#f1f5f9; --superficie:#fff; --superficie2:#f8fafc; --bordo:#e2e8f0;
@@ -1029,10 +1137,10 @@ HTML_TEMPLATE = """
 
         .campo { margin-bottom:15px; }
         .campo label { display:block; font-size:.82rem; font-weight:550; color:var(--testo2); margin-bottom:6px; }
-        input[type=number], input[type=range] { width:100%; font-family:inherit; font-size:.95rem; }
-        input[type=number] { padding:9px 11px; border:1px solid var(--bordo); border-radius:9px;
+        input[type=number], input[type=range], input[type=time] { width:100%; font-family:inherit; font-size:.95rem; }
+        input[type=number], input[type=time] { padding:9px 11px; border:1px solid var(--bordo); border-radius:9px;
                              background:var(--superficie2); color:var(--testo); font-variant-numeric:tabular-nums; }
-        input[type=number]:focus { outline:none; border-color:var(--auto);
+        input[type=number]:focus, input[type=time]:focus { outline:none; border-color:var(--auto);
                                    box-shadow:0 0 0 3px color-mix(in srgb,var(--auto) 18%,transparent); }
         input[type=range] { accent-color:var(--auto); cursor:pointer; margin:4px 0; }
 
@@ -1048,6 +1156,15 @@ HTML_TEMPLATE = """
                     color:var(--testo); border-color:var(--bordo); }
         .b-limite[data-attivo="1"] { background:var(--sole); color:#fff; border-color:var(--sole); }
 
+        .segmenti { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; margin-bottom:8px; }
+        .segmenti button { background:var(--superficie2); color:var(--testo); border-color:var(--bordo);
+                           padding:10px 6px; font-size:.84rem; }
+        .segmenti button.attivo { background:var(--auto); color:#fff; border-color:var(--auto); }
+        .segmenti button.boost { background:var(--avviso); color:#fff; border-color:var(--avviso); }
+        .due { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+        .obiettivo-box { margin-top:12px; padding:12px; border-radius:10px; background:var(--superficie2);
+                         border:1px solid var(--bordo); font-size:.86rem; }
+        .obiettivo-box .barra { margin:8px 0; }
         .nota { font-size:.76rem; color:var(--testo2); margin-top:6px; }
         .esito { margin-top:13px; padding:10px 13px; border-radius:9px; font-size:.84rem; white-space:pre-line; }
         .esito.ok { background:color-mix(in srgb,var(--ok) 14%,transparent); color:var(--ok); }
@@ -1105,7 +1222,7 @@ HTML_TEMPLATE = """
             <div class="nodo sole"><div class="ico">&#9728;&#65039;</div><div class="val"><span id="f_sole">0</span><span class="um">W</span></div><div class="lab">Produzione</div></div>
             <div class="nodo casa"><div class="ico">&#127968;</div><div class="val"><span id="f_casa">0</span><span class="um">W</span></div><div class="lab">Casa</div></div>
             <div class="nodo auto"><div class="ico">&#128663;</div><div class="val"><span id="f_auto">0</span><span class="um">W</span></div><div class="lab" id="f_auto_lab">Wallbox</div></div>
-            <div class="nodo rete"><div class="ico">&#9889;</div><div class="val"><span id="f_rete">0</span><span class="um">W</span></div><div class="lab">Rete</div></div>
+            <div class="nodo rete"><div class="ico">&#9889;</div><div class="val"><span id="f_rete">0</span><span class="um">W</span></div><div class="lab" id="f_rete_lab">Rete</div></div>
         </div>
         <div class="meta">
             <span>Fasi: <span id="last_fasi">--</span> <span id="sec_fasi"></span></span>
@@ -1174,6 +1291,38 @@ HTML_TEMPLATE = """
         </div>
 
         <div>
+            <div class="card">
+                <h2>Carica</h2>
+                <div class="segmenti" id="seg_modalita">
+                    <button type="button" data-m="sole" onclick="comando('modalita','sole')">Solo sole</button>
+                    <button type="button" data-m="misto" onclick="comando('modalita','misto')">Sole + rete</button>
+                    <button type="button" data-m="veloce" onclick="comando('modalita','veloce')">Veloce</button>
+                </div>
+                <div class="nota" id="nota_modalita">--</div>
+                <div class="due" style="margin-top:12px">
+                    <button type="button" class="b-secondario" style="margin-top:0" onclick="comando('boost', 60)">Boost 1 ora</button>
+                    <button type="button" class="b-secondario" style="margin-top:0" id="btn_boost_off" onclick="comando('boost', 0)" disabled>Annulla boost</button>
+                </div>
+
+                <div class="campo" style="margin:16px 0 0">
+                    <label>Obiettivo: kWh in auto entro un orario</label>
+                    <div class="due">
+                        <input type="number" id="ob_kwh" min="1" max="100" step="1" placeholder="kWh" aria-label="kWh">
+                        <input type="time" id="ob_ora" value="07:30" aria-label="Entro le">
+                    </div>
+                    <button type="button" class="b-secondario" onclick="impostaObiettivo()">Imposta obiettivo</button>
+                    <div class="nota">Si carica col sole finché basta; se non basta per finire in tempo,
+                        si integra con la rete quanto serve, sempre entro il limite del contatore.</div>
+                </div>
+                <div class="obiettivo-box" id="box_obiettivo" hidden>
+                    <div id="ob_testo">--</div>
+                    <div class="barra"><i id="ob_barra"></i></div>
+                    <div class="nota" id="ob_nota" style="margin-top:0">--</div>
+                    <button type="button" class="b-secondario" onclick="comando('obiettivo','off')">Annulla obiettivo</button>
+                </div>
+                <div id="esito_carica" class="esito" hidden></div>
+            </div>
+
             <div class="card">
                 <h2>Impostazioni</h2>
 
@@ -1272,8 +1421,8 @@ function setCampo(id, valore) {
     if (el.type === 'checkbox') el.checked = !!valore; else el.value = valore;
 }
 
-function esito(testo, ok) {
-    const b = $('esito');
+function esito(testo, ok, id) {
+    const b = $(id || 'esito');
     b.textContent = testo;
     b.className = 'esito ' + (ok ? 'ok' : 'ko');
     b.hidden = false;
@@ -1469,7 +1618,9 @@ async function aggiorna() {
     $('f_sole').textContent = num(solare);
     $('f_casa').textContent = num(Math.max(0, (s.grid_total || 0) - wbW));
     $('f_auto').textContent = num(wbW);
-    $('f_rete').textContent = num(Math.abs((s.grid_total || 0) - solare));
+    const scambio = (s.grid_total || 0) - solare;
+    $('f_rete').textContent = num(Math.abs(scambio));
+    $('f_rete_lab').textContent = scambio >= 0 ? 'Prelievo dalla rete' : 'Immissione in rete';
     $('f_auto_lab').textContent = misurata ? 'Wallbox (misurata)' : 'Wallbox (stimata)';
 
     $('last_fasi').textContent = oraDi(s.last_fasi);
@@ -1531,6 +1682,8 @@ async function aggiorna() {
     const giu = cons.scrollHeight - cons.clientHeight <= cons.scrollTop + 6;
     cons.textContent = (d.logs || []).join('\\n');   /* textContent: niente markup interpretato */
     if (giu) cons.scrollTop = cons.scrollHeight;
+
+    mostraPiano(d.piano, c);
 
     if (range === 'live') disegna(d.history || []);
 }
@@ -1607,6 +1760,63 @@ async function toggleLimite() {
         esito('Errore di rete: ' + e, false);
     } finally {
         aggiorna();   /* rilegge lo stato reale e riabilita il bottone */
+    }
+}
+
+const NOMI_MODALITA = { sole: 'Solo sole', misto: 'Sole + rete', veloce: 'Veloce' };
+const oraBreve = ts => new Date(ts * 1000).toLocaleTimeString('it-IT', {hour:'2-digit', minute:'2-digit'});
+
+async function comando(nome, valore) {
+    try {
+        const r = await fetch('/api/comando', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ nome: nome, valore: valore })
+        });
+        const res = await r.json().catch(() => ({}));
+        esito(res.messaggio || res.error || 'Errore sconosciuto', r.ok && res.success, 'esito_carica');
+        return r.ok && res.success;
+    } catch (e) {
+        esito('Errore di rete: ' + e, false, 'esito_carica');
+        return false;
+    } finally {
+        aggiorna();
+    }
+}
+
+async function impostaObiettivo() {
+    const kwh = $('ob_kwh').value.trim(), ora = $('ob_ora').value;
+    if (!kwh || !ora) { esito('Indica i kWh e l’orario.', false, 'esito_carica'); return; }
+    if (await comando('obiettivo', kwh + ' ' + ora)) $('ob_kwh').value = '';
+}
+
+function mostraPiano(p, c) {
+    if (!p) return;
+    document.querySelectorAll('#seg_modalita button').forEach(b => {
+        b.classList.toggle('attivo', b.dataset.m === p.modalita && p.modalita_effettiva === p.modalita);
+        b.classList.toggle('boost', p.boost_fino && b.dataset.m === 'veloce');
+    });
+    let nota;
+    if (p.boost_fino) nota = 'Boost: veloce fino alle ' + oraBreve(p.boost_fino) + ' (' + p.boost_minuti_rimasti
+        + ' min), poi ' + NOMI_MODALITA[p.modalita] + '.';
+    else if (p.modalita === 'sole') nota = 'Solo il sole in più rispetto alla casa: niente rete per l’auto.';
+    else if (p.modalita === 'misto') nota = 'Sole + fino a ' + num(p.prelevabile_w) + ' W dalla rete (campo Prelevabile qui sotto).';
+    else nota = 'Quanto il contatore permette: fino a ' + num(c.limite_contatore) + ' W di prelievo in tutto.';
+    if (p.quota_w !== null && p.quota_w !== undefined)
+        nota += ' Quota di rete per l’auto adesso: ' + num(Math.min(p.quota_w, c.limite_contatore || p.quota_w)) + ' W.';
+    $('nota_modalita').textContent = nota;
+    $('btn_boost_off').disabled = !p.boost_fino;
+
+    const ob = p.obiettivo;
+    $('box_obiettivo').hidden = !ob;
+    if (ob) {
+        const perc = Math.min(100, ob.fatti / ob.kwh * 100);
+        $('ob_testo').textContent = ob.fatti.toFixed(1) + ' di ' + ob.kwh + ' kWh entro le '
+            + oraBreve(ob.entro) + ' (' + Math.floor(ob.minuti_rimasti / 60) + ' h ' + (ob.minuti_rimasti % 60) + ' min)';
+        $('ob_barra').style.width = perc + '%';
+        $('ob_nota').textContent = ob.in_recupero
+            ? 'Il sole non basta: integro con la rete, ' + num(ob.potenza_necessaria) + ' W medi.'
+            : 'Per ora niente rete: servirebbero ' + num(ob.potenza_necessaria)
+              + ' W medi, si integra quando arrivano al minimo della colonnina.';
     }
 }
 
@@ -1691,6 +1901,7 @@ def get_data():
         }
         configurazione = {
             'prelevabile': CONFIG['POTENZA_PRELEVABILE'],
+            'modalita': CONFIG['MODALITA'],
             'limite_contatore': CONFIG['LIMITE_CONTATORE'],
             'protezione': CONFIG['POTENZA_PROTEZIONE'],
             'limite': CONFIG['LIMITE_KWH'],
@@ -1699,11 +1910,13 @@ def get_data():
             'algoritmo': CONFIG['ALGORITMO'],
         }
         stato['stima_pid'] = regolatore_pid_instance.ultima_stima if regolatore_pid_instance else None
+    piano = stato_controlli() if pianificatore_instance else None
 
     return jsonify({
         'config': configurazione,
         'status': stato,
         'energia': contatori_instance.riepilogo() if contatori_instance else {},
+        'piano': piano,
         'history': history,
         'logs': list(SYSTEM_STATE['LOGS'])
     })
@@ -1751,11 +1964,25 @@ def update_settings():
     salva_config()
     log_msg("[WEB] Parametri aggiornati: " + ", ".join(f"{k}={v}" for k, v in puliti.items()))
 
+    if ponte_mqtt_instance and pianificatore_instance:
+        ponte_mqtt_instance.pubblica_controlli(stato_controlli())
+
     # Il limite kWh va anche inoltrato alla centralina
     if 'LIMITE_KWH' in puliti and wallbox_instance:
         wallbox_instance.set_limite_kwh(puliti['LIMITE_KWH'])
 
     return jsonify({'success': True, 'applicati': puliti})
+
+@app.route('/api/comando', methods=['POST'])
+def api_comando():
+    """Comandi di carica dalla pagina: {nome: modalita|prelevabile|boost|obiettivo,
+    valore: ...}. Stessa funzione di Telegram e Home Assistant."""
+    dati = request.get_json(silent=True)
+    if not isinstance(dati, dict) or not isinstance(dati.get('nome'), str):
+        return jsonify({'success': False, 'error': 'Corpo della richiesta non valido'}), 400
+    ok, messaggio = esegui_comando(dati['nome'], dati.get('valore'), 'WEB')
+    return jsonify({'success': ok, 'messaggio': messaggio,
+                    'piano': stato_controlli()}), (200 if ok else 400)
 
 @app.route('/api/limite_toggle', methods=['POST'])
 def toggle_limite():
@@ -1819,12 +2046,9 @@ def get_sessioni():
         # con le sessioni registrate; 'kwh_da_collegamento' e' il totale che la
         # centralina conta dall'inserimento del cavo, pause comprese.
         totale = SYSTEM_STATE.get('WB_ENERGIA_SESSIONE') or 0.0
-        delta = totale - contatori_instance.energy_inizio
-        if delta < 0:
-            delta = totale
         in_corso = {
             'minuti': round((adesso - contatori_instance.inizio_carica) / 60),
-            'kwh': round(max(0.0, delta), 2),
+            'kwh': round(contatori_instance.kwh_sessione(), 2),
             'kwh_da_collegamento': round(totale, 2),
             'misurata': bool(SYSTEM_STATE.get('WB_ENERGIA_MISURATA')),
         }
@@ -1927,6 +2151,10 @@ class WallboxController:
         # inviato da noi (la sua rilettura non e' una novita')
         self.limite_noto = None
         self.limite_inviato = None
+        # Ultima lettura con pcar > 0, e da quando la centralina non risponde:
+        # per chiudere la sessione se la colonnina viene spenta mentre carica
+        self.ultima_carica_vista = None
+        self.offline_dal = None
 
     def update_shared_state(self):
         with STATO_LOCK:
@@ -1968,14 +2196,21 @@ class WallboxController:
             dati = risposta.json()
             SYSTEM_STATE['CENTRALINA_ONLINE'] = True
             if self.sync_falliti >= 3:
-                log_msg("[CENTRALINA] Comunicazione ripristinata.")
+                minuti = (time.time() - self.offline_dal) / 60 if self.offline_dal else 0
+                log_msg(f"[CENTRALINA] Comunicazione ripristinata dopo {minuti:.0f} min.")
                 reset_dedup('centralina_offline')
                 notifica("🔌 Centralina di nuovo raggiungibile.")
             self.sync_falliti = 0
+            self.offline_dal = None
             self._assorbi_stato(dati)
             return dati
         except requests.exceptions.RequestException as e:
-            log_throttled('centralina_connessione', f"[CENTRALINA] Errore di connessione: {e}", 300)
+            # Una riga all'inizio dell'interruzione, non una ogni 5 minuti per
+            # tutta la notte (la colonnina la sera viene spenta: 350 righe in
+            # 72 h). Il ritorno lo segnala "Comunicazione ripristinata".
+            if self.sync_falliti == 0:
+                log_msg(f"[CENTRALINA] Errore di connessione: {type(e).__name__}. "
+                        f"Riprovo in silenzio finche' non torna.")
             self._lettura_fallita()
             return None
         except ValueError:
@@ -1985,7 +2220,20 @@ class WallboxController:
 
     def _lettura_fallita(self):
         SYSTEM_STATE['CENTRALINA_ONLINE'] = False
+        if self.sync_falliti == 0:
+            self.offline_dal = time.time()
         self.sync_falliti += 1
+        # Colonnina sparita mentre caricava (la sera la si spegne dal
+        # quadro): pcar non torna mai a 0 e la sessione restava aperta fino
+        # al giorno dopo (sessioni da 1148 e 1334 minuti). Dopo 10 minuti la
+        # si chiude all'ultima volta che la si e' vista caricare.
+        if (self.in_carica and self.offline_dal
+                and time.time() - self.offline_dal > CONFIG['SESSIONE_OFFLINE_S']):
+            self.in_carica = False
+            if contatori_instance and contatori_instance.sessione is not None:
+                log_msg("[SESSIONE] Centralina irraggiungibile da "
+                        f"{(time.time() - self.offline_dal) / 60:.0f} min: chiudo la sessione.")
+                contatori_instance.fine_sessione(fine=self.ultima_carica_vista)
         if self.sync_falliti >= 2:
             # Colonnina spenta o irraggiungibile: il limite che ha adesso non
             # lo sappiamo. Prima restava l'ultimo letto, e l'interfaccia lo
@@ -2041,13 +2289,27 @@ class WallboxController:
         if limite_letto is not None:
             self._sincronizza_limite(limite_letto)
 
+        # Energia caricata dall'ultima lettura: alla sessione e all'obiettivo
+        if contatori_instance:
+            incremento = contatori_instance.energia_centralina(
+                abs(energia_grezza) / 1000.0, energia_grezza > 0)
+            if incremento > 0 and pianificatore_instance:
+                pianificatore_instance.aggiungi_energia(incremento)
+
         # L'auto e' collegata? status "0" = Non collegata.
         collegata = str(dati.get('status', '0')) != '0'
         if collegata != self.auto_collegata:
+            era_collegata = self.auto_collegata
             self.auto_collegata = collegata
             desc = dati.get('desc', '?')
             log_msg(f"[CENTRALINA] Stato connessione: {desc}")
             notifica(f"🔌 Wallbox: {desc}", dedup_key='stato_connessione', min_intervallo=120)
+            # Auto staccata: l'obiettivo era per quella carica. Solo sulla
+            # transizione, cosi' lo si puo' impostare anche prima di attaccarla.
+            if era_collegata and not collegata and pianificatore_instance \
+                    and pianificatore_instance.obiettivo is not None:
+                pianificatore_instance.annulla_obiettivo("annullato: auto scollegata")
+                notifica("🎯 Auto scollegata: obiettivo di carica annullato.")
 
         # --- Confini della sessione di ricarica ---------------------------
         # Si decidono QUI, sulla potenza realmente assorbita, non sui nostri
@@ -2056,6 +2318,8 @@ class WallboxController:
         # sessione restava aperta per sempre e non veniva mai registrata,
         # cioe' proprio nel modo in cui una ricarica finisce piu' spesso.
         carica_attiva = num('pcar') > 0
+        if carica_attiva:
+            self.ultima_carica_vista = time.time()
         if carica_attiva != self.in_carica:
             self.in_carica = carica_attiva
             if contatori_instance:
@@ -2170,6 +2434,8 @@ class WallboxController:
             return None
         eta = time.time() - SYSTEM_STATE.get('WB_PCAR_LETTO_IL', 0)
         if eta > CONFIG.get('MAX_ETA_PCAR', 20):
+            if not self.is_on:
+                return None     # a colonnina spenta non interessa a nessuno
             log_throttled('pcar_stantia',
                           f"[INFO] Potenza misurata vecchia di {eta:.0f}s: uso il setpoint.", 300)
             return None
@@ -2340,9 +2606,10 @@ class WallboxController:
 
         now = time.time()
 
-        if not bypass:#bypasso sia il filtro che la sogli a di protezione
+        if not bypass:   # bypass salta filtri e soglia di protezione
+            # Variazione sotto la soglia: niente comando. Senza log: usciva a
+            # quasi ogni pacchetto (10079 righe in 72 h) e copriva il resto.
             if abs(requested - self.current_set_power) < CONFIG['POTENZA_PROTEZIONE'] and self.is_on:
-                log_msg(f"[INFO] Variazione potenza ({requested}W) inferiore alla soglia di protezione ({CONFIG['POTENZA_PROTEZIONE']}W). Nessun cambiamento.")
                 return
             elapsed = now - (self.last_power_cmd_time or now)
             allowed_delta = self.max_delta_per_sec * max(elapsed, 0.01)
@@ -2367,10 +2634,10 @@ class WallboxController:
                 self.update_shared_state()
                 return
 
-            log_msg(f"[AZIONE] CAMBIO POTENZA -> richiesta={requested}W limited={limited}W invio={send_value}W")
-        else: 
-                send_value = requested
-                smoothed = float(send_value)
+            # Il cambio lo logga chi l'ha deciso (regolatore_classico._imposta)
+        else:
+            send_value = requested
+            smoothed = float(send_value)
 
         # NOTA: qui prima veniva appeso un campione sintetico allo storico, in
         # aggiunta a quello di parse_packet. Risultato: punti duplicati nel
@@ -2466,12 +2733,12 @@ class WallboxController:
                 else:
                     log_msg(f"[AVVISO] Comando OFF fallito ({self.failed_off_attempts}/{max_attempts} tentativi). Riproverò...")
 
-    def initialize(self):
+    def initialize(self, avvio=False):
         """Reset completo: rilegge la fase E forza lo spegnimento.
 
-        Usata al boot, dal bottone web e da /reset. NON va chiamata
-        periodicamente: per il controllo ciclico della fase esiste sync_fase(),
-        che non spegne nulla.
+        Usata al boot (avvio=True), dal bottone web e da /reset. NON va
+        chiamata periodicamente: per il controllo ciclico della fase esiste
+        sync_fase(), che non spegne nulla.
         """
         with WALLBOX_LOCK:
             log_msg("=== INIZIALIZZAZIONE SISTEMA ===")
@@ -2509,15 +2776,17 @@ class WallboxController:
                 log_msg(f"2. Imposto potenza minima ({min_p}W)...")
                 self.set_power(min_p, bypass=True)
 
-            # NB: qui non si reinvia il limite kWh salvato alla centralina (il
-            # comando resta disponibile da UI/Telegram via set_limite_kwh). Per
-            # sicurezza pero' si forza SEMPRE lo spegnimento del limite se la
-            # centralina ne ricorda uno ancora attivo da una sessione precedente:
-            # cosi' un riavvio/reset non eredita mai silenziosamente un tetto di
-            # carica dimenticato acceso.
+            # Limite kWh. Con il reset esplicito (pagina web, /reset) un limite
+            # rimasto attivo si spegne, come sempre: chi resetta vuole uno stato
+            # pulito. All'avvio del servizio invece resta: prima ogni deploy o
+            # riavvio lo cancellava, e andava rimesso a mano. Non e' piu' un
+            # tetto "nascosto": pagina, /info e /limite mostrano sempre quello
+            # letto dalla colonnina.
             if CONFIG.get('CMD_LIMITE_TEMPLATE'):
                 limite_letto = SYSTEM_STATE.get('LIMITE_KWH_CENTRALINA')
-                if limite_letto:
+                if limite_letto and avvio:
+                    log_msg(f"[LIMITE] Sulla centralina c'e' un limite di {limite_letto} kWh: lo lascio.")
+                elif limite_letto:
                     log_msg(f"[LIMITE] Trovato limite attivo ereditato ({limite_letto} kWh): lo disattivo.")
                     self.set_limite_kwh(0)
 
@@ -2544,10 +2813,14 @@ class ContatoriEnergia:
         self.giorno = time.strftime('%Y-%m-%d')
         self.ultimo_t = None
         self.azzera()
-        self.inizio_carica = None
-        self.wh_inizio_sessione = 0.0
-        self.fv_inizio_sessione = 0.0
-        self.energy_inizio = 0.0
+        # Sessione di ricarica in corso: accumula per conto suo. Prima la si
+        # ricavava come differenza dei contatori del giorno, che a mezzanotte
+        # si azzerano: le sessioni notturne uscivano con la quota dal sole a
+        # None o negativa (-9,6% il 5/11).
+        self.sessione = None
+        # Ultima lettura del contatore 'energy' della centralina (kWh)
+        self._energia_letta = None
+        self._energia_letta_t = None
 
     def azzera(self):
         self.solare_wh = 0.0
@@ -2603,7 +2876,11 @@ class ContatoriEnergia:
             # giorno da 70 kWh prodotti).
             casa_reale = max(0.0, casa_w)
             disponibile_fv = max(0.0, min(solare_w, solare_w - casa_reale))
-            self.wallbox_da_fv_wh += min(wallbox_w, disponibile_fv) * ore
+            da_fv_wh = min(wallbox_w, disponibile_fv) * ore
+            self.wallbox_da_fv_wh += da_fv_wh
+            if self.sessione is not None:
+                self.sessione['wh_stimati'] += wallbox_w * ore
+                self.sessione['wh_fv'] += da_fv_wh
 
     def _controlla_rollover(self):
         oggi = time.strftime('%Y-%m-%d')
@@ -2621,53 +2898,74 @@ class ContatoriEnergia:
             return None
         return min(100.0, self.wallbox_da_fv_wh / self.wallbox_wh * 100.0)
 
+    @property
+    def inizio_carica(self):
+        return self.sessione['inizio'] if self.sessione else None
+
     def inizio_sessione(self):
-        self.inizio_carica = time.time()
-        self.wh_inizio_sessione = self.wallbox_wh
-        self.fv_inizio_sessione = self.wallbox_da_fv_wh
-        # Contatore della centralina a inizio sessione: e' una misura reale,
-        # a differenza dei nostri Wh integrati dal setpoint.
-        self.energy_inizio = SYSTEM_STATE.get('WB_ENERGIA_SESSIONE') or 0.0
+        self.sessione = {'inizio': time.time(), 'wh_stimati': 0.0, 'wh_fv': 0.0,
+                         'kwh_centralina': 0.0, 'misurata': False}
 
-    def fine_sessione(self):
-        """Chiude la sessione, la salva su disco e notifica."""
-        if self.inizio_carica is None:
+    def energia_centralina(self, kwh_letti, misurata):
+        """A ogni lettura di 'energy' della centralina (kWh dall'inserimento del
+        cavo). Ritorna l'incremento dalla lettura precedente, gia' sommato alla
+        sessione in corso.
+
+        Il contatore non si azzera fra una pausa e la ripresa (prima ogni
+        sessione ereditava il totale delle precedenti: 1 minuto registrato
+        come 3,65 kWh) ma si azzera quando si stacca il cavo o la colonnina
+        viene spenta: allora la lettura nuova e' gia' tutta energia nuova.
+        Sommando gli incrementi, entrambi i casi tornano giusti."""
+        adesso = time.time()
+        precedente, t_prec = self._energia_letta, self._energia_letta_t
+        self._energia_letta, self._energia_letta_t = kwh_letti, adesso
+        if precedente is None:
+            return 0.0      # prima lettura dopo l'avvio: nessun riferimento
+        incremento = kwh_letti - precedente if kwh_letti >= precedente else kwh_letti
+        # Piu' di quanto 22 kW possono caricare nel frattempo: lettura
+        # sballata o contatore ripartito con un valore vecchio. Si scarta.
+        massimo = 22.0 * (adesso - t_prec) / 3600.0 + 0.05
+        if incremento <= 0 or incremento > massimo:
+            return 0.0
+        if self.sessione is not None:
+            self.sessione['kwh_centralina'] += incremento
+            self.sessione['misurata'] = misurata
+        return incremento
+
+    def kwh_sessione(self):
+        """kWh della sessione in corso: il contatore della centralina, oppure
+        la nostra integrazione se la centralina non ha contato nulla."""
+        s = self.sessione
+        if s is None:
+            return 0.0
+        return s['kwh_centralina'] if s['kwh_centralina'] > 0 else s['wh_stimati'] / 1000.0
+
+    def fine_sessione(self, fine=None):
+        """Chiude la sessione, la salva su disco e notifica. `fine`: quando
+        l'auto ha smesso davvero (se la colonnina e' sparita, l'ultima volta
+        che la si e' vista caricare)."""
+        s = self.sessione
+        if s is None:
             return
-        fine = time.time()
-        durata = fine - self.inizio_carica
-        kwh_stimati = (self.wallbox_wh - self.wh_inizio_sessione) / 1000.0
-        kwh_fv = (self.wallbox_da_fv_wh - self.fv_inizio_sessione) / 1000.0
-        inizio = self.inizio_carica
-        self.inizio_carica = None
-
+        self.sessione = None
+        fine = fine or time.time()
+        inizio = s['inizio']
+        durata = max(0.0, fine - inizio)
         if durata < 60:
             return   # sessioni lampo: non vale la pena registrarle
 
-        # La centralina azzera 'energy' a fine sessione, quindi il valore letto
-        # per ultimo e' quello buono; se manca si ripiega sulla stima.
+        kwh_stimati = s['wh_stimati'] / 1000.0
         # Il contatore della centralina ha la precedenza sulla nostra
         # integrazione ANCHE quando e' marcato "stimato": quel flag significa
         # "non omologato", non "inaffidabile", ed e' comunque un conteggio
-        # fatto dall'hardware, piu' fine del nostro campionato ogni 5s.
-        #
-        # ATTENZIONE: va preso il DELTA, non il valore assoluto. Il contatore
-        # non si azzera fra una pausa e la ripresa della stessa connessione:
-        # conta dal momento in cui il cavo e' stato inserito. Prendendolo
-        # cosi' com'era, ogni sessione ereditava il totale di quelle
-        # precedenti (visto sul campo: 1 minuto di carica registrato come
-        # 3,65 kWh, cioe' 219 kW).
-        energia_ora = SYSTEM_STATE.get('WB_ENERGIA_SESSIONE') or 0.0
-        misurata = bool(SYSTEM_STATE.get('WB_ENERGIA_MISURATA'))
-        delta_centralina = energia_ora - self.energy_inizio
-        if delta_centralina < 0:
-            # Il contatore e' stato azzerato (cavo staccato e reinserito):
-            # il valore attuale e' gia' l'energia di questa sessione.
-            delta_centralina = energia_ora
-
-        kwh = delta_centralina if delta_centralina > 0 else kwh_stimati
-        origine = ('contatore' if misurata else 'centralina (stima)') \
-            if delta_centralina > 0 else 'integrazione interna'
-        quota_fv = min(100.0, kwh_fv / kwh_stimati * 100.0) if kwh_stimati > 0 else None
+        # fatto dall'hardware, piu' fine del nostro campionato ogni 60 s.
+        if s['kwh_centralina'] > 0:
+            kwh = s['kwh_centralina']
+            misurata = s['misurata']
+            origine = 'contatore' if misurata else 'centralina (stima)'
+        else:
+            kwh, misurata, origine = kwh_stimati, False, 'integrazione interna'
+        quota_fv = min(100.0, s['wh_fv'] / s['wh_stimati'] * 100.0) if s['wh_stimati'] > 0 else None
 
         sessione = {
             'inizio': inizio,
@@ -3059,6 +3357,7 @@ class EnergyMonitor:
                     if ponte_mqtt_instance and ponte_mqtt_instance.attivo:
                         try:
                             ponte_mqtt_instance.pubblica_minuto(dati_minuto(self, wb_power))
+                            ponte_mqtt_instance.pubblica_controlli(stato_controlli())
                         except Exception as e:
                             log_throttled('mqtt_minuto', f"[MQTT] Record del minuto non pubblicato: {e}", 600)
 
@@ -3131,29 +3430,14 @@ def dati_minuto(monitor, auto_w):
             'oggi_minuti_carica': r['minuti_carica'],
         })
     dati.update(monitor.owl_giorno)
+    if pianificatore_instance:
+        piano = pianificatore_instance.stato()
+        dati['modalita'] = piano['modalita_effettiva']
+        dati['quota_rete_auto_w'] = piano['quota_w']
+        if piano['obiettivo']:
+            dati['obiettivo_kwh'] = piano['obiettivo']['kwh']
+            dati['obiettivo_fatti_kwh'] = piano['obiettivo']['fatti']
     return dati
-
-def notifica_potenza_massima(wallbox, potenza_carica, potenza_massima):
-    """Avvisa se la wallbox resta alla potenza massima per almeno 60 s."""
-    now = time.time()
-    if not wallbox.is_on:
-        return
-    if potenza_carica >= potenza_massima:
-        if wallbox.max_reached_start is None:
-            wallbox.max_reached_start = now
-        elif not wallbox.max_notified and now - wallbox.max_reached_start >= 60:
-            if wallbox.fase == 1:
-                notifica(f"⚠️ Potenza massima raggiunta ({potenza_massima:.0f}W).",
-                         dedup_key='max_potenza', min_intervallo=1800)
-            else:
-                notifica(f"⚠️ Potenza massima raggiunta ({potenza_massima:.0f}W). Consiglio: mettere "
-                         f"l'impianto in modalità trifase per sfruttare meglio la potenza disponibile.",
-                         dedup_key='max_potenza', min_intervallo=1800)
-            wallbox.max_notified = True
-    else:
-        # siamo scesi sotto, resettiamo contatori
-        wallbox.max_reached_start = None
-        wallbox.max_notified = False
 
 def regola_pid(monitor, wallbox):
     """Un passo del regolatore PID, a ogni pacchetto 'solar'."""
@@ -3165,7 +3449,7 @@ def regola_pid(monitor, wallbox):
         regolatore.passo(wallbox, monitor.solar_now, monitor.export_now, monitor.time)
 
     _, potenza_massima = wallbox.limiti_potenza()
-    notifica_potenza_massima(wallbox, wallbox.current_set_power, potenza_massima)
+    classico_instance.notifica_potenza_massima(wallbox, wallbox.current_set_power, potenza_massima)
 
     stima = regolatore.ultima_stima
     if stima:
@@ -3223,123 +3507,7 @@ def run_logic(monitor, wallbox):
         # delle fasi successivo; intanto il sole lo segue la protezione.
         return
 
-    potenza_generata = monitor.solar_now
-    potenza_consumata = monitor.total_grid_load
-    # Potenza in carica: si preferisce la misura reale della centralina (pcar).
-    # Con il solo setpoint, se l'auto assorbe meno di quanto concesso il
-    # regolatore crede di erogare piu' di quanto faccia e continua ad alzare.
-    _misurata = wallbox.potenza_reale()
-    if _misurata is not None and wallbox.is_on:
-        potenza_carica = _misurata
-    else:
-        potenza_carica = wallbox.display_power if wallbox.is_on else 0
-    potenza_casa = monitor.house_load
-    # Prelievo totale concesso: la quota dell'auto piu' quello che preleva gia'
-    # la casa, entro il limite del contatore (vedi protezione_contatore.py)
-    with STATO_LOCK:
-        prelevabile = prelevabile_effettivo(CONFIG, potenza_casa - monitor.solar_now)
-    potenza_generata += prelevabile
-    potenza_esportata = potenza_generata - potenza_consumata
-
-    log_msg(f"[INFO] Gen: {potenza_generata:.0f}W (prel {prelevabile:.0f}W) | Casa: {potenza_casa:.0f}W | "
-            f"Esp: {potenza_esportata:.0f}W | WB: {'ON' if wallbox.is_on else 'OFF'} ({potenza_carica:.0f}W)")
-
-    potenza_minima, potenza_massima = wallbox.limiti_potenza()
-
-    # notifica potenza massima solo se mantenuta per almeno 60s
-    notifica_potenza_massima(wallbox, potenza_carica, potenza_massima)
-
-    if potenza_consumata == 0:
-        return
-
-    if not wallbox.is_on:
-        if potenza_esportata > potenza_minima:
-            # Si logga DOPO, e solo se turn_on ha davvero acceso: durante il
-            # cooldown la richiesta viene rifiutata e prima si scriveva
-            # "Accendo" a ogni ciclo (~6s) senza che accadesse nulla.
-            if wallbox.turn_on():
-                log_msg(f"[DECISIONE] Export sufficiente ({potenza_esportata:.0f}W). "
-                        f"Acceso a {potenza_minima}W.")
-        return
-
-    if wallbox.is_on:
-        now = time.time()
-        if wallbox.pending_off_until > 0:
-            if now < wallbox.pending_off_until:
-                restante = wallbox.pending_off_until - now
-                log_msg(f"[INFO] Timer minimo attivo: {restante:.0f}s restanti (attendo la scadenza)...")
-                return
-            else:
-                wallbox.pending_off_until = 0
-                if potenza_generata < potenza_minima or potenza_esportata < -200:#spengo se continuo ad importare piu di 200w
-                    log_msg(f"[DECISIONE] Sole insufficiente. Spengo.")
-                    consiglio = ("Consiglio: mettere l'impianto in modalità monofase per sfruttare "
-                                 "meglio la potenza disponibile." if wallbox.fase == 1
-                                 else "Consiglio: staccare la macchina.")
-                    notifica(f"⚠️ Potenza insufficiente ({potenza_generata:.0f}W), consumo casa "
-                             f"({potenza_casa:.0f}W). Spengo wallbox.\n{consiglio}",
-                             dedup_key='sole_insufficiente', min_intervallo=900)
-                    wallbox.turn_off(force=True)
-                    return
-                else:
-                    log_msg(f"[DECISIONE] Generazione sufficiente. Continuo.")
-                    wallbox.set_power(potenza_minima, bypass=True)
-                    return
-
-        if potenza_consumata > potenza_generata:
-            nuova_potenza = potenza_generata - potenza_casa - 200#200W evito on/off
-            log_msg(f"[DECISIONE]2 Diminuisco a {nuova_potenza:.0f}W")
-            wallbox.set_power(nuova_potenza, bypass=False)
-        if potenza_carica > (potenza_generata - potenza_casa) or potenza_esportata < 0:
-            if potenza_esportata < 0:
-                nuova_potenza = potenza_carica - abs(potenza_esportata)
-            else:
-                # L'auto supera il disponibile ma l'export e' positivo: il
-                # consumo e' di prima dell'ultimo aumento (arriva ogni 60 s).
-                # Togliere l'export, come si faceva, scendeva troppo: il 1/11
-                # alle 11:10 da 8543 a 5866 W quando ne bastavano 8046.
-                nuova_potenza = potenza_generata - potenza_casa - 100
-            if nuova_potenza < potenza_minima or potenza_generata < potenza_minima:
-                log_msg(f"[DECISIONE] Sole insufficiente. Minimo per {CONFIG['TIMER_SPEGNIMENTO']}s.")
-                wallbox.set_power(potenza_minima, bypass=True)
-                wallbox.pending_off_until = now + CONFIG['TIMER_SPEGNIMENTO']
-            else:
-                log_msg(f"[DECISIONE] Diminuisco a {nuova_potenza:.0f}W")
-                wallbox.set_power(nuova_potenza, bypass=False)
-
-        else: 
-            # Qui c'era "if nuova_potenza > potenza_generata: return", che
-            # equivale a "casa sotto -100 W". pcar e' il setpoint e l'auto ne
-            # assorbe il 10-15% in meno, quindi la casa calcolata scende sotto
-            # zero quasi sempre: il 1/11 ha bloccato 921 aumenti su 1011, e alle
-            # 11:10 l'auto e' rimasta a 6 kW con 11-13 kW di sole per 4 minuti.
-            # L'idea era giusta con piu' tolleranza (come il PID): oltre 1,5 kW
-            # l'auto e' al suo massimo (11 kW) e alzare non serve. Senza
-            # controllo il setpoint arrivava a 22 kW, e al primo calo di sole
-            # servivano 4-5 passi prima che l'auto rallentasse davvero.
-            if potenza_casa < -1500:
-                return
-            nuova_potenza = potenza_carica + abs(potenza_generata-potenza_consumata)- 100
-            delta_potenza = nuova_potenza - potenza_carica
-            if potenza_casa + delta_potenza >potenza_generata or nuova_potenza + potenza_casa > potenza_generata:
-                return
-            
-            if nuova_potenza > potenza_massima:
-                # limito alla potenza massima disponibile, la notifica viene gestita
-                # dal blocco di controllo sopra per evitare messaggi ripetuti.
-                nuova_potenza = potenza_massima
-                # Se siamo GIA' al massimo non c'e' nulla da fare: prima si
-                # rimandava btn=P<max> alla centralina ogni ciclo (~6s) e si
-                # scriveva "Aumento" a vuoto, riempiendo log e console.
-                if wallbox.current_set_power >= potenza_massima:
-                    log_throttled('gia_al_massimo',
-                                  f"[DECISIONE] Gia' alla potenza massima ({potenza_massima:.0f}W).", 600)
-                    return
-                wallbox.set_power(nuova_potenza, bypass=True)
-                log_msg(f"[DECISIONE] Aumento a {nuova_potenza:.0f}W (massimo)")
-                return
-            log_msg(f"[DECISIONE] Aumento a {nuova_potenza:.0f}W")
-            wallbox.set_power(nuova_potenza, bypass=False)
+    classico_instance.passo(wallbox, monitor.solar_now, monitor.total_grid_load, monitor.house_load)
 
 # -----------------------------------------------------------
 # THREAD PERIODICO (attivita' cicliche)
@@ -3431,6 +3599,13 @@ def thread_periodico(wallbox):
                 log_msg(f"[ERRORE] watchdog: {e}")
             prossimo_watchdog = adesso + 60
 
+        # --- Scadenze di boost e obiettivo (anche senza pacchetti) ---
+        try:
+            if pianificatore_instance:
+                pianificatore_instance.controlla()
+        except Exception as e:
+            log_msg(f"[ERRORE] pianificatore: {e}")
+
         # --- Rotazione storico ogni ora ---
         if adesso >= prossima_rotazione:
             try:
@@ -3455,7 +3630,7 @@ def thread_periodico(wallbox):
 # MAIN
 # -----------------------------------------------------------
 def main():
-    global wallbox_instance, contatori_instance, regolatore_pid_instance, ponte_mqtt_instance, protezione_instance
+    global wallbox_instance, contatori_instance, regolatore_pid_instance, ponte_mqtt_instance, protezione_instance, classico_instance, pianificatore_instance
 
     # La configurazione va caricata PRIMA di costruire il controller, cosi'
     # initialize() lavora gia' con i valori salvati dall'utente.
@@ -3463,6 +3638,9 @@ def main():
     carica_storico()
     # Legge CONFIG a ogni passo: le modifiche da Telegram valgono subito
     regolatore_pid_instance = RegolatorePID(CONFIG, log=log_msg)
+    classico_instance = RegolatoreClassico(
+        CONFIG, log=log_msg, log_raro=log_throttled,
+        avvisa=lambda messaggio, chiave=None, intervallo=300: notifica(messaggio, chiave, intervallo))
     log_msg(f"[CONFIG] Algoritmo di regolazione: {CONFIG['ALGORITMO']}")
     protezione_instance = ProtezioneContatore(
         CONFIG, log=log_msg,
@@ -3481,6 +3659,17 @@ def main():
                                     os.getenv('MQTT_USER'), os.getenv('MQTT_PASSWORD'), log=log_msg)
     wallbox_instance = WallboxController()
     wallbox = wallbox_instance
+
+    # Modalita', boost e obiettivo: decidono la quota di rete per l'auto
+    # (prelevabile_effettivo la chiede a CONFIG['PIANIFICATORE'])
+    pianificatore_instance = Pianificatore(
+        CONFIG, minimo_colonnina=lambda: wallbox.limiti_potenza()[0], log=log_msg,
+        avvisa=notifica, salva=lambda stato: scrivi_json(FILE_PIANO, stato))
+    pianificatore_instance.importa(leggi_json(FILE_PIANO, {}))
+    CONFIG['PIANIFICATORE'] = pianificatore_instance
+    log_msg(f"[PIANO] Carica: {pianificatore_instance.descrizione()}")
+    ponte_mqtt_instance.imposta_comandi(
+        lambda nome, valore: esegui_comando(nome, valore, 'HOME ASSISTANT'))
 
     # 0. AVVIO WORKER NOTIFICHE (prima di tutto: cosi' anche gli errori
     #    di avvio degli altri thread possono essere notificati)
@@ -3517,7 +3706,7 @@ def main():
         logging.critical(f"Errore Rete (Bind): {e}")
         return
 
-    wallbox.initialize()
+    wallbox.initialize(avvio=True)
 
     # 3. AVVIO THREAD PERIODICO (dopo initialize, per non sovrapporre un
     #    sync_fase alla inizializzazione di avvio)

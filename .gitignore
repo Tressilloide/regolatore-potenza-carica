@@ -9,3 +9,7 @@ storico_giornaliero.json
 __pycache__/
 *.pyc
 stato_energia.json
+sessioni.json
+pianificazione.json
+backup_dati/
+.env.bak*

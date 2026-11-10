@@ -7,9 +7,10 @@ un campione al minuto) e riproduce:
   - la centralina: pcar = setpoint (questa centralina non misura nulla);
   - l'auto: segue il setpoint con un piccolo ritardo, fino al suo massimo.
 
-Il vecchio algoritmo e' una COPIA di run_logic/_set_power di
-solar_webinterface.py: se si cambia quello, va aggiornata anche qui.
-Il PID invece e' importato da regolatore_pid.py, lo stesso file del Pi.
+Gli algoritmi (regolatore_classico.py, regolatore_pid.py) e la protezione
+del contatore sono importati dagli stessi file del Pi. Resta una copia solo
+dei filtri di WallboxController._set_power (FintaWallbox): se si cambiano
+quelli, va aggiornata anche qui.
 
 Uso:
   python simulatore_regolatore.py storico.jsonl [giorno ...]
@@ -22,7 +23,8 @@ import sys
 import datetime
 
 from regolatore_pid import RegolatorePID
-from protezione_contatore import ProtezioneContatore, prelevabile_effettivo
+from regolatore_classico import RegolatoreClassico
+from protezione_contatore import ProtezioneContatore
 
 CONFIG_BASE = {
     'MONOFASE_MIN_POWER': 1380, 'MONOFASE_MAX_POWER': 7360,
@@ -230,7 +232,7 @@ class FintaWallbox:
 
 
 # ---------------------------------------------------------------------------
-# Vecchio algoritmo: copia di EnergyMonitor + run_logic
+# Algoritmi: classico (regolatore_classico.py) e PID (regolatore_pid.py)
 # ---------------------------------------------------------------------------
 def nuova_protezione(cfg):
     if not cfg.get('PROTEZIONE_VELOCE', True):
@@ -251,6 +253,7 @@ class AlgoritmoClassico:
         self.total_grid_load = 0.0
         self.house_load = 0.0
         self.protezione = nuova_protezione(cfg)
+        self.reg = RegolatoreClassico(cfg, log=lambda m: None, orologio=orologio)
 
     def pacchetto_solar(self, sole, exporting):
         self.solar_now = sole
@@ -264,60 +267,12 @@ class AlgoritmoClassico:
         self.run_logic()
 
     def run_logic(self):
-        wallbox, cfg = self.wb, self.cfg
+        wallbox = self.wb
         if self.protezione is not None and self.protezione.controlla(wallbox, self.solar_now):
             return
         if wallbox.tetto_contatore is not None:
             return
-        potenza_casa = self.house_load
-        potenza_generata = self.solar_now + prelevabile_effettivo(cfg, potenza_casa - self.solar_now)
-        potenza_consumata = self.total_grid_load
-        potenza_carica = wallbox.potenza_reale() if wallbox.is_on else 0
-        potenza_esportata = potenza_generata - potenza_consumata
-        potenza_minima, potenza_massima = wallbox.limiti_potenza()
-        now = self.ora()
-
-        if potenza_consumata == 0:
-            return
-        if not wallbox.is_on:
-            if potenza_esportata > potenza_minima:
-                wallbox.turn_on()
-            return
-        if wallbox.pending_off_until > 0:
-            if now < wallbox.pending_off_until:
-                return
-            wallbox.pending_off_until = 0
-            if potenza_generata < potenza_minima or potenza_esportata < -200:
-                wallbox.turn_off(force=True)
-            else:
-                wallbox.set_power(potenza_minima, bypass=True)
-            return
-        if potenza_consumata > potenza_generata:
-            nuova_potenza = potenza_generata - potenza_casa - 200
-            wallbox.set_power(nuova_potenza, bypass=False)
-        if potenza_carica > (potenza_generata - potenza_casa) or potenza_esportata < 0:
-            if potenza_esportata < 0:
-                nuova_potenza = potenza_carica - abs(potenza_esportata)
-            else:
-                nuova_potenza = potenza_generata - potenza_casa - 100
-            if nuova_potenza < potenza_minima or potenza_generata < potenza_minima:
-                wallbox.set_power(potenza_minima, bypass=True)
-                wallbox.pending_off_until = now + cfg['TIMER_SPEGNIMENTO']
-            else:
-                wallbox.set_power(nuova_potenza, bypass=False)
-        else:
-            if potenza_casa < -1500:
-                return
-            nuova_potenza = potenza_carica + abs(potenza_generata - potenza_consumata) - 100
-            delta_potenza = nuova_potenza - potenza_carica
-            if potenza_casa + delta_potenza > potenza_generata or nuova_potenza + potenza_casa > potenza_generata:
-                return
-            if nuova_potenza > potenza_massima:
-                if wallbox.current_set_power >= potenza_massima:
-                    return
-                wallbox.set_power(potenza_massima, bypass=True)
-                return
-            wallbox.set_power(nuova_potenza, bypass=False)
+        self.reg.passo(wallbox, self.solar_now, self.total_grid_load, self.house_load)
 
 
 class AlgoritmoPID:

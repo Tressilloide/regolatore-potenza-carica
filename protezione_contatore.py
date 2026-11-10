@@ -31,6 +31,18 @@ def limite_regolazione(config):
     return limite - config.get('MARGINE_CONTATORE', 0)
 
 
+def quota_auto(config, deficit_casa):
+    """Quanto l'AUTO puo' prendere dalla rete, oltre alla casa, in W.
+
+    Con un pianificatore (pianificatore.py: modalita', boost, obiettivo) la
+    decide lui; senza (simulatore, prove) e' POTENZA_PRELEVABILE.
+    """
+    pianificatore = config.get('PIANIFICATORE')
+    if pianificatore is not None:
+        return pianificatore.quota_auto(deficit_casa)
+    return config['POTENZA_PRELEVABILE']
+
+
 def prelevabile_effettivo(config, deficit_casa):
     """Prelievo totale (casa + auto) che i regolatori possono puntare, in W.
 
@@ -38,7 +50,7 @@ def prelevabile_effettivo(config, deficit_casa):
     (negativo se il sole le basta). POTENZA_PRELEVABILE si aggiunge a quello,
     perche' e' la quota dell'auto; il totale resta entro il limite del contatore.
     """
-    prelevabile = config['POTENZA_PRELEVABILE'] + max(0.0, deficit_casa)
+    prelevabile = quota_auto(config, deficit_casa) + max(0.0, deficit_casa)
     tetto = limite_regolazione(config)
     if tetto is not None:
         prelevabile = min(prelevabile, tetto)
