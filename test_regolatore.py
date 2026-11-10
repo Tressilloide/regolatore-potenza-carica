@@ -6,6 +6,8 @@ venv del Pi (Flask, python-telegram-bot, ...): senza, vengono saltati.
 Nessun test tocca la rete, la colonnina o i file del servizio: i file di
 stato vanno in una cartella temporanea.
 """
+import gzip
+import json
 import os
 import tempfile
 import time
@@ -15,6 +17,7 @@ from unittest import mock
 from pianificatore import Pianificatore, interpreta_orario, prossima_scadenza
 from protezione_contatore import prelevabile_effettivo, ProtezioneContatore
 from regolatore_classico import RegolatoreClassico
+import statistiche
 
 
 class Orologio:
@@ -253,6 +256,194 @@ class TestClassicoConPianificatore(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Servizio (richiede le librerie del venv del Pi)
 # ---------------------------------------------------------------------------
+def mezzanotte(anno=2026, mese=6, giorno=15):
+    return time.mktime((anno, mese, giorno, 0, 0, 0, 0, 0, -1))
+
+
+def giornata(inizio, consumo=lambda ora: 1000, sole=lambda ora: 0, auto=lambda ora: 0, minuti=1440):
+    """Un campione al minuto; le funzioni ricevono l'ora del giorno (decimale)."""
+    return [(inizio + m * 60, consumo(m / 60), sole(m / 60), auto(m / 60), None) for m in range(minuti)]
+
+
+class TestStatistiche(unittest.TestCase):
+    PREZZI = {'acquisto': 0.25, 'vendita': 0.10}
+
+    def test_bilancio_di_un_giorno(self):
+        g = statistiche.aggrega(giornata(mezzanotte(), sole=lambda h: 3000 if 10 <= h < 14 else 0))
+        r = g['2026-06-15']
+        self.assertEqual(r['n'], 1440)
+        sole, consumo, auto, prelievo, immessa, auto_sole = statistiche._somma_ore(r)
+        self.assertEqual((sole, consumo, auto, prelievo, immessa), (12000, 24000, 0, 20000, 8000))
+        self.assertEqual(r['ore'][11], [3000, 1000, 0, 0, 2000, 0])
+        self.assertEqual(r['ore'][3], [0, 1000, 0, 1000, 0, 0])
+        self.assertEqual(r['pk']['sole'][0], 3000)
+        self.assertEqual(r['pk']['prelievo'][0], 1000)
+        self.assertEqual(sum(r['ip']), 1200)            # venti ore di prelievo, quattro in immissione
+        self.assertEqual(r['ip'][2], 1200)              # tutte fra 1000 e 1500 W
+        self.assertIsNone(r['fasi'])
+
+    def test_il_rumore_notturno_non_e_produzione(self):
+        r = statistiche.aggrega(giornata(mezzanotte(), sole=lambda h: 32))['2026-06-15']
+        self.assertEqual(statistiche._somma_ore(r)[statistiche.SOLE], 0)
+
+    def test_all_auto_va_il_sole_che_avanza_alla_casa(self):
+        carica = lambda h: 2000 if 12 <= h < 14 else 0
+        r = statistiche.aggrega(giornata(
+            mezzanotte(), consumo=lambda h: 1000 + carica(h), sole=lambda h: 2500, auto=carica))['2026-06-15']
+        tot = statistiche._somma_ore(r)
+        self.assertEqual(tot[statistiche.AUTO], 4000)
+        self.assertEqual(tot[statistiche.AUTO_SOLE], 3000)          # 2500 di sole - 1000 di casa, per due ore
+        self.assertEqual(len(r['ric']), 1)
+        self.assertEqual(r['ric'][0][2:], [4000, 3000, 2000])
+        self.assertEqual(r['ia'][2], 120)
+
+    def test_valore_fermo_a_colonnina_spenta(self):
+        # l'auto carica un'ora a 3 kW, poi la colonnina viene spenta dal quadro:
+        # il dichiarato resta 3000 ma il consumo torna quello della casa
+        reale = lambda h: 3000 if 20 <= h < 21 else 0
+        r = statistiche.aggrega(giornata(
+            mezzanotte(), consumo=lambda h: 800 + reale(h), auto=lambda h: 3000 if h >= 20 else 0))['2026-06-15']
+        self.assertEqual(statistiche._somma_ore(r)[statistiche.AUTO], 3000)
+        # anche se dopo la casa consuma tanto, un valore fermo non riparte
+        r = statistiche.aggrega(giornata(
+            mezzanotte(), consumo=lambda h: 800 + reale(h) + (2500 if h >= 22 else 0),
+            auto=lambda h: 3000 if h >= 20 else 0))['2026-06-15']
+        self.assertEqual(statistiche._somma_ore(r)[statistiche.AUTO], 3000)
+
+    def test_dichiarato_oltre_il_misurato(self):
+        # trifase: la colonnina dichiara 22 kW, il sensore ne misura 11,5 in tutto
+        r = statistiche.aggrega(giornata(
+            mezzanotte(), consumo=lambda h: 11500 if 10 <= h < 12 else 500,
+            auto=lambda h: 22000 if 10 <= h < 12 else 0))['2026-06-15']
+        self.assertEqual(statistiche._somma_ore(r)[statistiche.AUTO], 22000)   # (11500 - 500) x 2 h
+        self.assertEqual(r['pk']['auto'][0], 11000)
+
+    def test_buchi_e_doppioni(self):
+        t = mezzanotte()
+        campioni = [(t, 6000, 0, 0, None), (t, 6000, 0, 0, None),        # doppione
+                    (t + 60, 6000, 0, 0, None), (t + 3600, 6000, 0, 0, None)]   # buco di un'ora
+        r = statistiche.aggrega(campioni)['2026-06-15']
+        self.assertEqual(r['n'], 3)
+        self.assertEqual(statistiche._somma_ore(r)[statistiche.CONSUMO], 300)
+
+    def test_fasi(self):
+        t = mezzanotte()
+        campioni = [(t + m * 60, 1200, 600, 0, [600, 400, 200, 200, 200, 200]) for m in range(60)]
+        r = statistiche.aggrega(campioni)['2026-06-15']
+        self.assertEqual(r['fasi'], [600, 400, 200, 200, 200, 200])
+        self.assertEqual(r['fmax'], [600, 400, 200])
+        self.assertEqual(r['nf'], 60)
+
+    def test_ricarica_a_cavallo_della_mezzanotte(self):
+        t = mezzanotte()
+        carica = lambda h: 2000 if h >= 23 else 0
+        ieri = giornata(t - 86400, consumo=lambda h: 500 + carica(h), auto=carica)
+        oggi = giornata(t, consumo=lambda h: 500 + (2000 if h < 1 else 0) + (1500 if 8 <= h < 8.05 else 0),
+                        auto=lambda h: 2000 if h < 1 else (1500 if 8 <= h < 8.05 else 0))
+        giorni = statistiche.aggrega(ieri + oggi)
+        elenco, brevi = statistiche.ricariche(giorni.values())
+        self.assertEqual(len(elenco), 1)
+        self.assertEqual(brevi, 1)                      # i tre minuti delle 8
+        self.assertEqual(elenco[0]['kwh'], 4.0)
+        self.assertEqual(elenco[0]['minuti'], 120)
+        self.assertEqual(elenco[0]['potenza_media'], 2000)
+
+    def test_archivio(self):
+        t = mezzanotte()
+        campioni = giornata(t - 86400) + giornata(t, minuti=600)
+        with tempfile.TemporaryDirectory() as d:
+            percorso = os.path.join(d, 'stat.jsonl')
+            archivio = statistiche.Archivio(percorso)
+            self.assertEqual(archivio.giorni(), {})
+            self.assertEqual(archivio.archivia(campioni, oggi='2026-06-15'), ['2026-06-14'])
+            self.assertEqual(archivio.archivia(campioni, oggi='2026-06-15'), [])    # gia' fatto
+            with open(percorso, 'a') as f:
+                f.write('{"g": "2026-06-1')                                          # riga troncata
+            riletto = statistiche.Archivio(percorso).giorni()
+            self.assertEqual(list(riletto), ['2026-06-14'])
+            self.assertEqual(riletto['2026-06-14']['n'], 1440)
+
+    def test_intervallo(self):
+        i = statistiche.intervallo
+        self.assertEqual(i('7g', '2026-11-10', '2026-09-14'), ('2026-11-04', '2026-11-10'))
+        self.assertEqual(i('tutto', '2026-11-10', '2026-09-14'), ('2026-09-14', '2026-11-10'))
+        self.assertEqual(i('anno', '2026-11-10', '2025-09-14'), ('2026-01-01', '2026-11-10'))
+        self.assertEqual(i('2026-02', '2026-11-10', '2026-01-01'), ('2026-02-01', '2026-02-28'))
+        self.assertEqual(i(None, '2026-11-10', '2026-01-01', da='2026-03-01', a='2026-03-05'),
+                         ('2026-03-01', '2026-03-05'))
+        for sbagliato in ('ieri', '0g', '2026-13', 'g'):
+            with self.assertRaises(ValueError, msg=sbagliato):
+                i(sbagliato, '2026-11-10', '2026-01-01')
+        with self.assertRaises(ValueError):
+            i(None, '2026-11-10', '2026-01-01', da='2026-03-09', a='2026-03-05')
+        with self.assertRaises(ValueError):
+            i(None, '2026-11-10', '2026-01-01', da='domani')
+
+    def test_calcola(self):
+        t = mezzanotte()
+        carica = lambda h: 2000 if 12 <= h < 14 else 0
+        campioni = []
+        for n in range(14):
+            campioni += giornata(t + n * 86400, consumo=lambda h: 1000 + carica(h),
+                                 sole=lambda h: 4000 if 10 <= h < 16 else 0, auto=carica)
+        giorni = statistiche.aggrega(campioni)
+        s = statistiche.calcola(giorni, '2026-06-22', '2026-06-28', self.PREZZI)
+        self.assertEqual(s['periodo'], {'da': '2026-06-22', 'a': '2026-06-28', 'giorni': 7})
+        self.assertEqual(s['copertura']['giorni'], 14)
+        tot = s['totali']
+        # al giorno: 24 kWh di sole, 24 di casa, 4 d'auto; 10 autoconsumati, 14 immessi, 18 prelevati
+        self.assertEqual((tot['sole'], tot['casa'], tot['auto'], tot['immessa'], tot['prelievo']),
+                         (168, 168, 28, 98, 126))
+        self.assertEqual(tot['auto_sole'], 28)
+        self.assertEqual(tot['casa_sole'], 42)
+        self.assertAlmostEqual(tot['autoconsumo_pct'], 41.7)
+        self.assertAlmostEqual(tot['autosufficienza_pct'], 35.7)
+        self.assertEqual(tot['euro']['spesa'], 31.5)
+        self.assertEqual(tot['euro']['ricavo'], 9.8)
+        self.assertEqual(tot['euro']['beneficio'], round(196 * 0.25 - (31.5 - 9.8), 2))
+        self.assertEqual(s['precedente']['sole'], 168)
+        self.assertEqual(len(s['giorni']), 7)
+        self.assertEqual(len(s['ore']['sole']), 7)
+        self.assertEqual(len(s['calendario']), 14)                   # tutto l'archivio, non solo il periodo
+        self.assertEqual(s['calendario'][0], ['2026-06-15', 24.0, 28.0, 4.0, 18.0, 35.7])
+        self.assertEqual(s['profilo']['tutti']['sole'][12], 4000)
+        self.assertEqual(s['profilo']['tutti']['auto'][12], 2000)
+        self.assertEqual(s['profilo']['feriali']['giorni'], 5)
+        self.assertEqual(s['settimana'][0], {'n': 1, 'sole': 24, 'casa': 24, 'auto': 4,
+                                             'prelievo': 18, 'immessa': 14})
+        self.assertEqual(s['mesi'][0]['mese'], '2026-06')
+        self.assertEqual(s['ricariche']['n'], 7)
+        self.assertEqual(s['ricariche']['ist_ora'][12], 7)
+        self.assertEqual(s['casa']['fondo_w'], 1000)
+        self.assertEqual(s['serie']['giorni_con_ricarica'], 7)
+        chiavi = {r['chiave'] for r in s['record']}
+        self.assertTrue({'giorno_sole_max', 'picco_sole', 'picco_prelievo', 'ricarica_max'} <= chiavi)
+        # senza periodo precedente coperto non si confronta
+        self.assertIsNone(statistiche.calcola(giorni, '2026-06-15', '2026-06-28', self.PREZZI)['precedente'])
+        # periodo senza dati, archivio vuoto
+        self.assertTrue(statistiche.calcola(giorni, '2026-06-01', '2026-06-10', self.PREZZI).get('vuoto'))
+        self.assertIsNone(statistiche.calcola({}, '2026-06-01', '2026-06-10', self.PREZZI)['copertura'])
+        self.assertIn('2026-06-22;24', statistiche.csv_giorni(s).replace('.0;', ';'))
+
+    def test_importa_dai_due_formati(self):
+        t = mezzanotte()
+        with tempfile.TemporaryDirectory() as d:
+            vecchio, nuovo, uscita = (os.path.join(d, n) for n in ('a.jsonl', 'b.jsonl', 'u.jsonl'))
+            with open(vecchio, 'w') as f:
+                for m in range(1440):
+                    f.write(json.dumps([int(t + m * 60), 1000, 0, 0]) + '\n')
+            with open(nuovo, 'w') as f:
+                for m in range(1380, 2880):         # si sovrappone di un'ora al primo
+                    f.write(json.dumps({'ts': int(t + m * 60), 'consumo_w': 2000, 'produzione_w': 0,
+                                        'auto_w': 0, 'fasi_w': [1000, 500, 500, 0, 0, 0]}) + '\n')
+            fatti = statistiche.importa(uscita, [vecchio, nuovo], fino_a='2026-06-17')
+            self.assertEqual([r['g'] for r in fatti], ['2026-06-15', '2026-06-16'])
+            self.assertEqual(statistiche._somma_ore(fatti[0])[statistiche.CONSUMO], 24000)   # vale il primo file
+            self.assertEqual(fatti[1]['fasi'][0], 24000)
+            self.assertEqual(len(statistiche.Archivio(uscita).giorni()), 2)
+
+
+# ---------------------------------------------------------------------------
 try:
     import solar_webinterface as sw
 except ImportError as e:      # Flask, telegram... non installati
@@ -273,6 +464,8 @@ class TestServizio(unittest.TestCase):
             FILE_STORICO_GIORNALIERO=os.path.join(d, 'giorni.json'),
             FILE_STATO_ENERGIA=os.path.join(d, 'energia.json'),
             FILE_PIANO=os.path.join(d, 'piano.json'),
+            FILE_STORICO=os.path.join(d, 'storico.jsonl'),
+            archivio_statistiche=statistiche.Archivio(os.path.join(d, 'statistiche.jsonl')),
             ponte_mqtt_instance=None, wallbox_instance=None,
             notifica=lambda *a, **k: None, log_msg=lambda m: None)
         self.patch.start()
@@ -381,6 +574,89 @@ class TestServizio(unittest.TestCase):
                          'vendor/three.module.min.js', 'vendor/chart.umd.min.js'):
             with client.get('/static/' + percorso) as f:
                 self.assertEqual(f.status_code, 200, percorso)
+
+    def test_statistiche_archivio_api_e_pagina(self):
+        adesso = time.time()
+        oggi = statistiche.giorno_di(adesso)
+        inizio_oggi = time.mktime(time.localtime(adesso)[:3] + (0, 0, 0, 0, 0, -1))
+        ieri = statistiche.giorno_di(inizio_oggi - 43200)
+        memoria = sw.SYSTEM_STATE['ULTIME_LETTURE_FASI']
+        prima = list(memoria)
+        memoria.clear()
+        sw._stat_oggi.update(t=0.0, record=None)
+        try:
+            # ieri intero a 1 kW, oggi un'ora a 2 kW con le fasi
+            for m in range(1440):
+                memoria.append((1000, 0, [0] * 6, inizio_oggi - 86400 + m * 60, 0))
+            for m in range(60):
+                memoria.append((2000, 0, [1000, 600, 400, 0, 0, 0], inizio_oggi + m * 60, 0))
+            sw.archivia_statistiche()
+            self.assertEqual(list(sw.archivio_statistiche.giorni()), [ieri])
+
+            client = sw.app.test_client()
+            r = client.get('/api/statistiche?periodo=7g')
+            self.assertEqual(r.status_code, 200)
+            s = r.get_json()
+            self.assertEqual(s['oggi'], oggi)
+            self.assertEqual(s['periodo']['giorni'], 2)
+            self.assertAlmostEqual(s['totali']['consumo'], 26, places=0)
+            self.assertEqual(s['giorni'][-1]['g'], oggi)
+            self.assertEqual(s['fasi']['giorni'], 1)
+            self.assertEqual(s['prezzi']['acquisto'], sw.CONFIG['PREZZO_ACQUISTO'])
+
+            r = client.get('/api/statistiche?periodo=tutto', headers={'Accept-Encoding': 'gzip'})
+            self.assertEqual(r.headers.get('Content-Encoding'), 'gzip')
+            self.assertEqual(json.loads(gzip.decompress(r.get_data()))['copertura']['giorni'], 2)
+            self.assertEqual(client.get('/api/statistiche?periodo=boh').status_code, 400)
+            self.assertEqual(client.get('/api/statistiche?da=2026-13-01').status_code, 400)
+
+            r = client.get('/api/statistiche.csv?periodo=tutto')
+            self.assertEqual(r.status_code, 200)
+            self.assertIn('text/csv', r.headers['Content-Type'])
+            self.assertEqual(len(r.get_data(as_text=True).strip().splitlines()), 3)
+
+            r = client.get('/statistiche')
+            self.assertEqual(r.status_code, 200)
+            pagina = r.get_data(as_text=True)
+            self.assertNotIn('__V__', pagina)
+            self.assertNotIn('https://', pagina)
+            for percorso in ('statistiche.js', 'statistiche.css'):
+                with client.get('/static/' + percorso) as f:
+                    self.assertEqual(f.status_code, 200, percorso)
+            self.assertIn('/statistiche', client.get('/').get_data(as_text=True))
+        finally:
+            memoria.clear()
+            memoria.extend(prima)
+            sw._stat_oggi.update(t=0.0, record=None)
+
+    def test_storico_su_disco_con_le_fasi(self):
+        memoria = sw.SYSTEM_STATE['ULTIME_LETTURE_FASI']
+        prima = list(memoria)
+        memoria.clear()
+        try:
+            adesso = time.time()
+            with open(sw.FILE_STORICO, 'w') as f:
+                f.write(json.dumps([int(adesso - 300), 900, 100, 0]) + '\n')      # riga di prima, senza fasi
+            sw._ultimo_campione_t = 0.0
+            sw.registra_campione(1200, 300, 0, [700, 300, 200, 100, 100, 100], ts=adesso - 100)
+            sw.flush_storico()
+            memoria.clear()
+            sw.carica_storico()
+            self.assertEqual([p[2] for p in memoria], [[0] * 6, [700, 300, 200, 100, 100, 100]])
+            self.assertEqual(sw.campioni_memoria()[-1][1:4], (1200, 300, 0))
+        finally:
+            memoria.clear()
+            memoria.extend(prima)
+
+    def test_colonnina_sparita_non_conta_energia(self):
+        self.assertEqual(sw.potenza_auto_per_i_conteggi(3000), 3000)
+        w = mock.Mock(offline_dal=None)
+        with mock.patch.object(sw, 'wallbox_instance', w):
+            self.assertEqual(sw.potenza_auto_per_i_conteggi(3000), 3000)
+            w.offline_dal = time.time() - 30         # errore passeggero: si conta ancora
+            self.assertEqual(sw.potenza_auto_per_i_conteggi(3000), 3000)
+            w.offline_dal = time.time() - 600
+            self.assertEqual(sw.potenza_auto_per_i_conteggi(3000), 0)
 
     def test_api_data_leggera(self):
         client = sw.app.test_client()

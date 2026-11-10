@@ -14,6 +14,7 @@ import sys
 import io
 import datetime
 import itertools
+import gzip
 from collections import deque
 import matplotlib
 
@@ -36,6 +37,7 @@ from protezione_contatore import ProtezioneContatore, limite_regolazione
 from pianificatore import (Pianificatore, MODALITA, NOMI_MODALITA, prossima_scadenza,
                            interpreta_orario)
 from ponte_mqtt import PonteMQTT
+import statistiche
 
 # -----------------------------------------------------------
 # CONFIGURAZIONE WEB & GLOBALE
@@ -141,6 +143,7 @@ FILE_STORICO_GIORNALIERO = os.path.join(DIR_BASE, 'storico_giornaliero.json')
 FILE_SESSIONI = os.path.join(DIR_BASE, 'sessioni.json')
 FILE_STATO_ENERGIA = os.path.join(DIR_BASE, 'stato_energia.json')
 FILE_PIANO = os.path.join(DIR_BASE, 'pianificazione.json')
+FILE_STATISTICHE = os.path.join(DIR_BASE, 'statistiche_giorni.jsonl')
 
 # Stato condiviso per la Web UI e Telegram
 SYSTEM_STATE = {
@@ -181,6 +184,7 @@ WALLBOX_LOCK = threading.RLock()
 
 # Variabile globale per accedere al controller dalla UI Web e da Telegram
 wallbox_instance = None
+archivio_statistiche = statistiche.Archivio(FILE_STATISTICHE, log=lambda testo: log_msg(testo))
 contatori_instance = None
 regolatore_pid_instance = None
 classico_instance = None
@@ -1049,7 +1053,7 @@ def run_telegram_polling():
 # La pagina sta in web/ (index.html, app.css, app.js, scena3d.js e le
 # librerie in web/vendor/): niente piu' HTML dentro questo file, e niente
 # CDN, cosi' funziona anche senza internet. Flask la serve da /static.
-_pagina = {'versione': None, 'html': ''}
+_pagine = {}      # nome del file -> (versione, html)
 
 def versione_web():
     """Cambia quando cambia un file della pagina: finisce negli indirizzi
@@ -1061,19 +1065,27 @@ def versione_web():
     except (OSError, ValueError):
         return '0'
 
-@app.route('/')
-def index():
+def servi_pagina(nome):
+    """Una pagina di web/, con __V__ sostituito dalla versione dei file."""
     versione = versione_web()
-    if versione != _pagina['versione']:
+    pagina = _pagine.get(nome)
+    if pagina is None or pagina[0] != versione:
         try:
-            with open(os.path.join(DIR_WEB, 'index.html'), 'r', encoding='utf-8') as f:
-                _pagina['html'] = f.read().replace('__V__', versione)
-            _pagina['versione'] = versione
+            with open(os.path.join(DIR_WEB, nome), 'r', encoding='utf-8') as f:
+                pagina = _pagine[nome] = (versione, f.read().replace('__V__', versione))
         except OSError as e:
             return f"Pagina non disponibile: {e}", 500
-    risposta = make_response(_pagina['html'])
+    risposta = make_response(pagina[1])
     risposta.headers['Cache-Control'] = 'no-cache'
     return risposta
+
+@app.route('/')
+def index():
+    return servi_pagina('index.html')
+
+@app.route('/statistiche')
+def pagina_statistiche():
+    return servi_pagina('statistiche.html')
 
 # Mappa nomi campo web -> chiavi CONFIG, cosi' la UI non conosce i nomi interni
 CAMPI_WEB = {
@@ -1295,6 +1307,82 @@ def get_giorni():
     except (TypeError, ValueError):
         quanti = 14
     return jsonify({'success': True, 'giorni': giorni_storico(quanti)})
+
+def campioni_memoria(da=0):
+    """I campioni in RAM nel formato di statistiche.py:
+    (ts, consumo, sole, auto, fasi)."""
+    return [(p[3], p[0], p[1], p[4] if len(p) > 4 else 0, p[2])
+            for p in list(SYSTEM_STATE['ULTIME_LETTURE_FASI']) if p[3] >= da]
+
+def archivia_statistiche():
+    """Chiude nell'archivio delle statistiche i giorni passati che mancano
+    (di norma: ieri, appena dopo mezzanotte)."""
+    aggiunti = archivio_statistiche.archivia(campioni_memoria())
+    if aggiunti:
+        log_msg(f"[STATISTICHE] Archiviati: {', '.join(aggiunti)}")
+
+_stat_oggi = {'t': 0.0, 'record': None}
+
+def giorni_statistiche():
+    """L'archivio dei giorni chiusi piu' la giornata in corso, ricalcolata
+    dai campioni in memoria al massimo una volta al minuto."""
+    giorni = dict(archivio_statistiche.giorni())
+    adesso = time.time()
+    oggi = statistiche.giorno_di(adesso)
+    if adesso - _stat_oggi['t'] > 60:
+        # due ore di contesto prima di mezzanotte: servono a capire se un
+        # valore dell'auto fermo da ieri sera e' una carica vera
+        mezzanotte = time.mktime(time.localtime(adesso)[:3] + (0, 0, 0, 0, 0, -1))
+        recenti = statistiche.aggrega(campioni_memoria(mezzanotte - 7200))
+        _stat_oggi.update(t=adesso, record=recenti.get(oggi))
+    if _stat_oggi['record'] and _stat_oggi['record']['g'] == oggi:
+        giorni[oggi] = _stat_oggi['record']
+    return giorni, oggi
+
+def calcola_statistiche():
+    giorni, oggi = giorni_statistiche()
+    primo = min(giorni) if giorni else oggi
+    da, a = statistiche.intervallo(request.args.get('periodo', '30g'), oggi, primo,
+                                   request.args.get('da'), request.args.get('a'))
+    stat = statistiche.calcola(
+        giorni, da, a,
+        {'acquisto': CONFIG['PREZZO_ACQUISTO'], 'vendita': CONFIG['PREZZO_VENDITA']},
+        CONFIG['LIMITE_CONTATORE'])
+    stat['oggi'] = oggi
+    stat['adesso'] = time.time()
+    return stat
+
+@app.route('/api/statistiche')
+def api_statistiche():
+    """Tutti i numeri della pagina Statistiche per un periodo:
+    ?periodo=7g|30g|90g|365g|anno|tutto|AAAA-MM  oppure  ?da=AAAA-MM-GG&a=AAAA-MM-GG"""
+    try:
+        stat = calcola_statistiche()
+    except ValueError as e:
+        return jsonify({'success': False, 'messaggio': str(e)}), 400
+    corpo = json.dumps(stat, separators=(',', ':')).encode('utf-8')
+    compresso = 'gzip' in request.headers.get('Accept-Encoding', '')
+    risposta = make_response(gzip.compress(corpo, 5) if compresso else corpo)
+    risposta.headers['Content-Type'] = 'application/json'
+    risposta.headers['Cache-Control'] = 'no-store'
+    if compresso:
+        risposta.headers['Content-Encoding'] = 'gzip'
+        risposta.headers['Vary'] = 'Accept-Encoding'
+    return risposta
+
+@app.route('/api/statistiche.csv')
+def api_statistiche_csv():
+    """I giorni del periodo come tabella per il foglio di calcolo."""
+    try:
+        stat = calcola_statistiche()
+    except ValueError as e:
+        return str(e), 400
+    periodo = stat.get('periodo') or {}
+    risposta = make_response(statistiche.csv_giorni(stat))
+    risposta.headers['Content-Type'] = 'text/csv; charset=utf-8'
+    risposta.headers['Content-Disposition'] = (
+        f"attachment; filename=energia_{periodo.get('da', '')}_{periodo.get('a', '')}.csv")
+    return risposta
 
 @app.route('/api/sessioni')
 def get_sessioni():
@@ -2378,7 +2466,8 @@ def registra_campione(rete, solare, wb, fasi, ts=None):
     if ts - _ultimo_campione_t < CONFIG['STORICO_INTERVALLO_S']:
         return
     _ultimo_campione_t = ts
-    _coda_storico.append([int(ts), int(rete), int(solare), int(wb)])
+    # le sei fasi in coda alla riga: le statistiche le ritrovano dopo un riavvio
+    _coda_storico.append([int(ts), int(rete), int(solare), int(wb)] + [int(x) for x in list(fasi)[:6]])
 
 def flush_storico():
     """Scrive su disco i campioni accodati. Chiamata dal thread periodico ogni
@@ -2409,13 +2498,15 @@ def carica_storico():
                 if not riga:
                     continue
                 try:
-                    ts, rete, solare, wb = json.loads(riga)
+                    campione = json.loads(riga)
+                    ts, rete, solare, wb = campione[:4]
                 except (ValueError, TypeError):
                     continue   # riga troncata da un crash: si salta
                 if ts < limite or ts < TIMESTAMP_MINIMO:
                     continue
-                SYSTEM_STATE['ULTIME_LETTURE_FASI'].append(
-                    (rete, solare, [0, 0, 0, 0, 0, 0], ts, wb))
+                # le righe scritte prima del 10/11/2026 non hanno le fasi
+                fasi = campione[4:10] if len(campione) >= 10 else [0, 0, 0, 0, 0, 0]
+                SYSTEM_STATE['ULTIME_LETTURE_FASI'].append((rete, solare, fasi, ts, wb))
                 caricati += 1
     except OSError as e:
         log_msg(f"[STORICO] Lettura fallita: {e}")
@@ -2546,6 +2637,21 @@ def ruota_storico():
         log_msg(f"[STORICO] Rotazione fallita: {e}")
 
 
+def potenza_auto_per_i_conteggi(wb_power):
+    """La potenza dell'auto da usare per CONTARE l'energia (non per regolare).
+
+    Se la colonnina non risponde da piu' di due minuti l'auto e' ferma.
+    Spenta dal quadro mentre caricava, restava "accesa" al suo ultimo setpoint
+    per ore: l'8/11 risultavano 86,9 kWh in auto in un giorno in cui la casa
+    ne aveva consumati 54 in tutto.
+    """
+    colonnina = wallbox_instance
+    if (colonnina is not None and colonnina.offline_dal
+            and time.time() - colonnina.offline_dal > 120):
+        return 0
+    return wb_power
+
+
 def numero(testo):
     """Testo di un nodo XML -> float, None se manca o non e' un numero."""
     try:
@@ -2623,16 +2729,19 @@ class EnergyMonitor:
                         wb_power = SYSTEM_STATE.get('WALLBOX_POWER', 0) if wb_status else 0
                     self.house_load = self.total_grid_load - wb_power
 
+                    wb_conteggio = potenza_auto_per_i_conteggi(wb_power)
+
                     registra_campione(self.total_grid_load, self.solar_now,
-                                      wb_power, self.fases, self.time)
+                                      wb_conteggio, self.fases, self.time)
                     if contatori_instance:
                         contatori_instance.aggiorna(self.solar_now, self.total_grid_load,
-                                                    wb_power, self.house_load, self.time)
+                                                    wb_conteggio, self.total_grid_load - wb_conteggio,
+                                                    self.time)
                     # Try a parte: un errore qui non deve far scartare il
                     # pacchetto, cioe' saltare la regolazione di questo minuto
                     if ponte_mqtt_instance and ponte_mqtt_instance.attivo:
                         try:
-                            ponte_mqtt_instance.pubblica_minuto(dati_minuto(self, wb_power))
+                            ponte_mqtt_instance.pubblica_minuto(dati_minuto(self, wb_conteggio))
                             ponte_mqtt_instance.pubblica_controlli(stato_controlli())
                         except Exception as e:
                             log_throttled('mqtt_minuto', f"[MQTT] Record del minuto non pubblicato: {e}", 600)
@@ -2826,6 +2935,7 @@ def thread_periodico(wallbox):
     prossimo_watchdog = 0
     prossima_rotazione = time.time() + 3600
     riepilogo_inviato_il = None
+    giorno_statistiche = statistiche.giorno_di(time.time())
 
     while True:
         time.sleep(5)
@@ -2882,6 +2992,14 @@ def thread_periodico(wallbox):
         except Exception as e:
             log_msg(f"[ERRORE] pianificatore: {e}")
 
+        # --- Statistiche: due minuti dopo mezzanotte si chiude il giorno prima ---
+        if statistiche.giorno_di(adesso - 120) != giorno_statistiche:
+            giorno_statistiche = statistiche.giorno_di(adesso - 120)
+            try:
+                archivia_statistiche()
+            except Exception as e:
+                log_msg(f"[ERRORE] archivio statistiche: {e}")
+
         # --- Rotazione storico ogni ora ---
         if adesso >= prossima_rotazione:
             try:
@@ -2912,6 +3030,10 @@ def main():
     # initialize() lavora gia' con i valori salvati dall'utente.
     carica_config()
     carica_storico()
+    try:
+        archivia_statistiche()      # i giorni passati rimasti fuori (servizio fermo a mezzanotte)
+    except Exception as e:
+        log_msg(f"[ERRORE] archivio statistiche: {e}")
     # Legge CONFIG a ogni passo: le modifiche da Telegram valgono subito
     regolatore_pid_instance = RegolatorePID(CONFIG, log=log_msg)
     classico_instance = RegolatoreClassico(

@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="color-scheme" content="light dark">
+    <meta name="theme-color" content="#f6f6f3" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)">
+    <meta name="versione" content="__V__">
+    <title>Statistiche · Casa solare</title>
+    <link rel="icon" href="/static/icona.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="/static/icona.svg">
+    <link rel="stylesheet" href="/static/app.css?v=__V__">
+    <link rel="stylesheet" href="/static/statistiche.css?v=__V__">
+</head>
+<body>
+<div class="pagina">
+
+    <header class="testata">
+        <div class="marchio">
+            <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
+                <circle cx="16" cy="16" r="6.5" fill="currentColor"/>
+                <g stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+                    <path d="M16 2.5v4M16 25.5v4M2.5 16h4M25.5 16h4M6.5 6.5l2.8 2.8M22.7 22.7l2.8 2.8M6.5 25.5l2.8-2.8M22.7 9.3l2.8-2.8"/>
+                </g>
+            </svg>
+            <div>
+                <h1>Statistiche</h1>
+                <p class="sottotitolo" id="copertura">Casa solare</p>
+            </div>
+        </div>
+        <div class="stati">
+            <a class="stato collegamento" href="/">← Pannello</a>
+        </div>
+        <button type="button" class="b-icona" id="btn_tema" aria-label="Cambia tema" title="Tema: automatico">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 3.500a8.500 8.500 0 0 1 0 17z" fill="currentColor"/></svg>
+        </button>
+    </header>
+
+    <!-- Una sola riga di filtri, sopra tutto: vale per ogni scheda della pagina -->
+    <div class="barra-periodo" id="barra_periodo">
+        <div class="filtri" id="filtri_periodo" role="group" aria-label="Periodo">
+            <button type="button" data-p="7g">7 giorni</button>
+            <button type="button" data-p="30g">30 giorni</button>
+            <button type="button" data-p="90g">90 giorni</button>
+            <button type="button" data-p="anno">Anno</button>
+            <button type="button" data-p="tutto">Tutto</button>
+        </div>
+        <label class="scelta-mese"><span class="nascosto">Un mese preciso</span>
+            <select id="sel_mese"><option value="">Mese…</option></select>
+        </label>
+        <span class="passo-giorno" id="passo_giorno" hidden>
+            <button type="button" class="b-icona" id="btn_prima" aria-label="Giorno prima" title="Giorno prima">‹</button>
+            <button type="button" class="b-icona" id="btn_dopo" aria-label="Giorno dopo" title="Giorno dopo">›</button>
+        </span>
+        <span class="periodo-testo" id="periodo_testo" aria-live="polite">Carico…</span>
+        <a class="collegamento-piccolo" id="csv" href="/api/statistiche.csv" download>Scarica CSV</a>
+    </div>
+
+    <div id="avvisi" role="status"></div>
+
+    <main class="sezioni" id="contenuto" hidden>
+
+        <!-- ============ In breve ============ -->
+        <section aria-labelledby="t_breve">
+            <h2 id="t_breve" class="nascosto">In breve</h2>
+            <div class="tessere" id="tessere"></div>
+        </section>
+
+        <!-- ============ Flussi ============ -->
+        <section class="scheda" aria-labelledby="t_flussi">
+            <div class="scheda-testa">
+                <h2 id="t_flussi">Dove è andata l’energia</h2>
+                <span class="distintivo" id="flussi_totale">--</span>
+            </div>
+            <div class="flussi-griglia">
+                <div class="flussi" id="flussi" role="img" aria-label="Flussi di energia nel periodo"></div>
+                <div class="quote">
+                    <div class="quota-voce">
+                        <div class="misura-testa"><span>Autosufficienza</span><b id="q_autosuff">--</b></div>
+                        <div class="barra"><i class="b-sole" id="q_autosuff_b"></i></div>
+                        <p class="nota">Quanta parte dei consumi è stata coperta dal sole.</p>
+                    </div>
+                    <div class="quota-voce">
+                        <div class="misura-testa"><span>Autoconsumo</span><b id="q_autocons">--</b></div>
+                        <div class="barra"><i class="b-sole" id="q_autocons_b"></i></div>
+                        <p class="nota">Quanta parte della produzione è stata usata in casa invece che immessa.</p>
+                    </div>
+                    <div class="quota-voce">
+                        <div class="misura-testa"><span>Auto caricata dal sole</span><b id="q_auto">--</b></div>
+                        <div class="barra"><i class="b-sole" id="q_auto_b"></i></div>
+                        <p class="nota" id="q_auto_nota">Quanta parte dell’energia in auto veniva dal fotovoltaico.</p>
+                    </div>
+                </div>
+            </div>
+            <details class="tabella-dati"><summary>Mostra i dati</summary><div class="tabella-scorri"><table id="tab_flussi"></table></div></details>
+        </section>
+
+        <!-- ============ Nel tempo ============ -->
+        <section class="scheda" aria-labelledby="t_tempo">
+            <div class="scheda-testa">
+                <h2 id="t_tempo">Nel tempo</h2>
+                <div class="filtri" id="filtri_tempo" role="group" aria-label="Cosa mostrare">
+                    <button type="button" data-v="sole">Dove va il sole</button>
+                    <button type="button" data-v="consumi">Da dove arrivano i consumi</button>
+                    <button type="button" data-v="rete">Scambio con la rete</button>
+                </div>
+            </div>
+            <div class="legenda" id="leg_tempo"></div>
+            <div class="grafico"><canvas id="g_tempo" role="img" aria-label="Energia per giorno, settimana o mese"></canvas></div>
+            <details class="tabella-dati"><summary>Mostra i dati</summary><div class="tabella-scorri"><table id="tab_tempo"></table></div></details>
+        </section>
+
+        <!-- ============ Mappa delle ore ============ -->
+        <section class="scheda" aria-labelledby="t_mappa">
+            <div class="scheda-testa">
+                <h2 id="t_mappa">Ora per ora, giorno per giorno</h2>
+                <div class="filtri" id="filtri_mappa" role="group" aria-label="Grandezza">
+                    <button type="button" data-v="sole">Produzione</button>
+                    <button type="button" data-v="casa">Casa</button>
+                    <button type="button" data-v="auto">Auto</button>
+                    <button type="button" data-v="prelievo">Prelievo</button>
+                    <button type="button" data-v="immessa">Immissione</button>
+                </div>
+            </div>
+            <div class="mappa-scorri" id="mappa_scorri"><canvas id="mappa" role="img" aria-label="Mappa: una colonna per giorno, una riga per ora"></canvas></div>
+            <div class="scala" id="mappa_scala"></div>
+            <p class="nota">Ogni colonna è un giorno, ogni riga un’ora (mezzanotte in alto). Più il colore è intenso, più energia in quell’ora.</p>
+        </section>
+
+        <div class="due-schede">
+            <!-- ============ Giornata tipo ============ -->
+            <section class="scheda" aria-labelledby="t_profilo">
+                <div class="scheda-testa">
+                    <h2 id="t_profilo">La giornata tipo</h2>
+                    <div class="filtri" id="filtri_profilo" role="group" aria-label="Quali giorni">
+                        <button type="button" data-v="tutti">Tutti</button>
+                        <button type="button" data-v="feriali">Lun–ven</button>
+                        <button type="button" data-v="festivi">Sab–dom</button>
+                    </div>
+                </div>
+                <div class="legenda">
+                    <span><i class="tinta linea t-sole"></i>Produzione</span>
+                    <span><i class="tinta t-casa"></i>Casa</span>
+                    <span><i class="tinta t-auto"></i>Auto</span>
+                </div>
+                <div class="grafico grafico-basso"><canvas id="g_profilo" role="img" aria-label="Potenza media per ora del giorno"></canvas></div>
+                <p class="nota" id="profilo_nota"></p>
+                <details class="tabella-dati"><summary>Mostra i dati</summary><div class="tabella-scorri"><table id="tab_profilo"></table></div></details>
+            </section>
+
+            <!-- ============ Settimana tipo ============ -->
+            <section class="scheda" aria-labelledby="t_settimana">
+                <div class="scheda-testa"><h2 id="t_settimana">La settimana tipo</h2></div>
+                <div class="legenda">
+                    <span><i class="tinta t-sole"></i>Produzione</span>
+                    <span><i class="tinta t-casa"></i>Casa</span>
+                    <span><i class="tinta t-auto"></i>Auto</span>
+                </div>
+                <div class="grafico grafico-basso"><canvas id="g_settimana" role="img" aria-label="Energia media per giorno della settimana"></canvas></div>
+                <p class="nota">Media dei kWh per ogni giorno della settimana.</p>
+                <details class="tabella-dati"><summary>Mostra i dati</summary><div class="tabella-scorri"><table id="tab_settimana"></table></div></details>
+            </section>
+        </div>
+
+        <div class="due-schede">
+            <!-- ============ Calendario ============ -->
+            <section class="scheda" aria-labelledby="t_calendario">
+                <div class="scheda-testa">
+                    <h2 id="t_calendario">Calendario</h2>
+                    <div class="filtri" id="filtri_calendario" role="group" aria-label="Grandezza">
+                        <button type="button" data-v="autosufficienza">Autosufficienza</button>
+                        <button type="button" data-v="sole">Produzione</button>
+                        <button type="button" data-v="auto">In auto</button>
+                        <button type="button" data-v="prelievo">Prelievo</button>
+                    </div>
+                </div>
+                <div class="calendario-scorri"><div class="calendario" id="calendario"></div></div>
+                <div class="scala" id="calendario_scala"></div>
+                <p class="nota">Tutti i giorni in archivio; quelli fuori dal periodo scelto sono attenuati. Tocca un giorno per vedere solo quello.</p>
+            </section>
+
+            <section class="scheda" aria-labelledby="t_serie">
+                <div class="scheda-testa"><h2 id="t_serie">Strisce</h2></div>
+                <dl class="righe" id="serie"></dl>
+            </section>
+        </div>
+
+        <div class="due-schede">
+            <!-- ============ Sole ============ -->
+            <section class="scheda" aria-labelledby="t_sole">
+                <div class="scheda-testa"><h2 id="t_sole"><i class="tinta t-sole"></i> Il sole</h2></div>
+                <div class="riquadri" id="riq_sole"></div>
+                <h3 class="sotto">La curva del sole, mese per mese</h3>
+                <div class="legenda" id="leg_mesi"></div>
+                <div class="grafico grafico-basso"><canvas id="g_mesi" role="img" aria-label="Produzione media per ora, un mese per linea"></canvas></div>
+            </section>
+
+            <!-- ============ Casa ============ -->
+            <section class="scheda" aria-labelledby="t_casa">
+                <div class="scheda-testa"><h2 id="t_casa"><i class="tinta t-casa"></i> La casa</h2></div>
+                <div class="riquadri" id="riq_casa"></div>
+                <div class="evidenza" id="casa_fondo"></div>
+                <h3 class="sotto">Carico sulle tre fasi</h3>
+                <div id="fasi_box"></div>
+            </section>
+        </div>
+
+        <!-- ============ Rete e contatore ============ -->
+        <section class="scheda" aria-labelledby="t_rete">
+            <div class="scheda-testa">
+                <h2 id="t_rete"><i class="tinta t-rete"></i> La rete e il contatore</h2>
+                <span class="distintivo" id="rete_limite">--</span>
+            </div>
+            <div class="riquadri riquadri-4" id="riq_rete"></div>
+            <div class="due-interne">
+                <div>
+                    <h3 class="sotto">Quanto tempo a ogni potenza di prelievo</h3>
+                    <div class="grafico grafico-basso"><canvas id="g_prelievo" role="img" aria-label="Ore passate a ogni potenza di prelievo"></canvas></div>
+                    <details class="tabella-dati"><summary>Mostra i dati</summary><div class="tabella-scorri"><table id="tab_prelievo"></table></div></details>
+                </div>
+                <div>
+                    <h3 class="sotto">I prelievi più alti</h3>
+                    <ol class="classifica" id="picchi_prelievo"></ol>
+                </div>
+            </div>
+        </section>
+
+        <!-- ============ Ricariche ============ -->
+        <section class="scheda" aria-labelledby="t_ricariche">
+            <div class="scheda-testa">
+                <h2 id="t_ricariche"><i class="tinta t-auto"></i> Le ricariche</h2>
+                <span class="distintivo" id="ric_brevi" hidden></span>
+            </div>
+            <div class="riquadri riquadri-4" id="riq_ricariche"></div>
+            <div class="riquadri riquadri-4" id="riq_strada"></div>
+            <div class="tre-interne">
+                <div>
+                    <h3 class="sotto">Quanta energia per ricarica</h3>
+                    <div class="grafico grafico-mini"><canvas id="g_ric_kwh" role="img" aria-label="Numero di ricariche per quantità di energia"></canvas></div>
+                </div>
+                <div>
+                    <h3 class="sotto">A che ora cominciano</h3>
+                    <div class="grafico grafico-mini"><canvas id="g_ric_ora" role="img" aria-label="Numero di ricariche per ora di inizio"></canvas></div>
+                </div>
+                <div>
+                    <h3 class="sotto">A che potenza si carica</h3>
+                    <div class="grafico grafico-mini"><canvas id="g_ric_potenza" role="img" aria-label="Ore di carica a ogni potenza"></canvas></div>
+                </div>
+            </div>
+            <h3 class="sotto">Tutte le ricariche del periodo</h3>
+            <div class="tabella-scorri alta"><table id="tab_ricariche" class="con-barre"></table></div>
+            <p class="nota">Una ricarica va da quando l’auto comincia ad assorbire a quando smette per più di mezz’ora. L’energia è ricavata dalle misure al minuto.</p>
+        </section>
+
+        <!-- ============ Soldi ============ -->
+        <section class="scheda" aria-labelledby="t_soldi">
+            <div class="scheda-testa">
+                <h2 id="t_soldi">I conti</h2>
+                <span class="distintivo" id="soldi_prezzi">--</span>
+            </div>
+            <div class="riquadri riquadri-4" id="riq_soldi"></div>
+            <h3 class="sotto">Quanto ha reso l’impianto, giorno dopo giorno</h3>
+            <div class="legenda">
+                <span><i class="tinta t-sole"></i>Energia non comprata</span>
+                <span><i class="tinta t-rete"></i>Energia venduta</span>
+            </div>
+            <div class="grafico grafico-basso"><canvas id="g_soldi" role="img" aria-label="Beneficio economico cumulato"></canvas></div>
+            <p class="nota">Con i prezzi impostati oggi nel pannello, applicati a tutto il periodo. Non comprende quote fisse, imposte e incentivi.</p>
+        </section>
+
+        <!-- ============ Record ============ -->
+        <section class="scheda" aria-labelledby="t_record">
+            <div class="scheda-testa"><h2 id="t_record">I primati del periodo</h2></div>
+            <div class="primati" id="record"></div>
+        </section>
+
+        <!-- ============ Mesi ============ -->
+        <section class="scheda" aria-labelledby="t_mesi">
+            <div class="scheda-testa"><h2 id="t_mesi">Mese per mese</h2></div>
+            <div class="tabella-scorri alta"><table id="tab_mesi"></table></div>
+            <p class="nota">Energia in kWh. La resa è quanto l’impianto ha fatto risparmiare e incassare.</p>
+        </section>
+
+        <!-- ============ Ipotesi ============ -->
+        <section class="scheda" aria-labelledby="t_ipotesi">
+            <div class="scheda-testa"><h2 id="t_ipotesi">Ipotesi e metodo</h2></div>
+            <div class="ipotesi">
+                <label class="campo"><span>Consumo dell’auto (kWh ogni 100 km)</span>
+                    <input type="number" id="ip_auto" min="5" max="60" step="0.5" inputmode="decimal"></label>
+                <label class="campo"><span>Auto a benzina di confronto (litri ogni 100 km)</span>
+                    <input type="number" id="ip_litri" min="1" max="30" step="0.1" inputmode="decimal"></label>
+                <label class="campo"><span>Prezzo della benzina (€ al litro)</span>
+                    <input type="number" id="ip_benzina" min="0.5" max="5" step="0.01" inputmode="decimal"></label>
+                <label class="campo"><span>CO₂ della rete elettrica (kg per kWh)</span>
+                    <input type="number" id="ip_co2" min="0" max="2" step="0.01" inputmode="decimal"></label>
+            </div>
+            <p class="nota">Queste quattro ipotesi servono solo per i chilometri, il confronto con la benzina e la CO₂: restano salvate in questo browser.</p>
+            <hr>
+            <ul class="metodo">
+                <li>Tutto è ricavato dai campioni al minuto del sensore: produzione, consumo totale e potenza dell’auto. I giorni chiusi sono archiviati sul Raspberry, quello in corso è ricalcolato ogni minuto.</li>
+                <li>Il sole va prima alla casa e poi all’auto: all’auto si attribuisce la produzione che la casa non usa.</li>
+                <li>Se la colonnina dichiara più potenza di quanta il sensore ne misuri in tutto, vale il sensore. Se resta ferma su un valore mentre i consumi dicono che l’auto non carica, quell’energia non viene contata.</li>
+                <li>Sotto i 50 W la produzione è considerata rumore del sensore (di notte legge 16–48 W) e vale zero.</li>
+                <li>Prima del 28 ottobre 2026 mancano le letture per fase; nei giorni con buchi di misura i totali sono più bassi del vero.</li>
+            </ul>
+        </section>
+    </main>
+
+    <footer class="piede">Statistiche della casa solare · <span id="piede_ora">--</span></footer>
+</div>
+
+<div class="suggerimento" id="suggerimento" hidden></div>
+
+<script src="/static/vendor/chart.umd.min.js" defer></script>
+<script type="module" src="/static/statistiche.js?v=__V__"></script>
+</body>
+</html>

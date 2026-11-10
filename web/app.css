@@ -140,6 +140,12 @@ h1, h2, h3, p { margin: 0; }
     background: var(--superficie); border: 1px solid var(--bordo); color: var(--testo-2); cursor: pointer;
 }
 .b-icona svg { width: 17px; height: 17px; }
+a.b-icona { text-decoration: none; }
+.collegamento { text-decoration: none; color: var(--testo); font-weight: 560; }
+.collegamento:hover { border-color: var(--bordo-forte); }
+.collegamento-piccolo { font-size: .8rem; color: var(--testo-2); text-underline-offset: 3px; white-space: nowrap; }
+.collegamento-piccolo:hover { color: var(--testo); }
+a:focus-visible { outline: 2px solid var(--auto); outline-offset: 2px; }
 .b-icona:hover { color: var(--testo); border-color: var(--bordo-forte); }
 
 /* ---------- avvisi ---------- */

@@ -138,7 +138,8 @@ File principali:
 | File | Cosa contiene |
 |---|---|
 | `solar_webinterface.py` | Il servizio: lettura del sensore, colonnina, API della pagina web, bot Telegram, storico, sessioni |
-| `web/` | La pagina web: `index.html`, `app.css`, `app.js`, la scena 3D `scena3d.js` e le librerie in `web/vendor/` (4.10) |
+| `web/` | Le pagine web: il pannello (`index.html`, `app.css`, `app.js`, la scena 3D `scena3d.js`), le statistiche (`statistiche.html`, `.css`, `.js`) e le librerie in `web/vendor/` (4.10, 4.14) |
+| `statistiche.py` | Statistiche di lungo periodo: dai campioni al minuto ai numeri della pagina Statistiche (4.14). Senza dipendenze esterne |
 | `regolatore_classico.py` | L'algoritmo classico. Senza dipendenze esterne, lo usa anche il simulatore |
 | `regolatore_pid.py` | L'algoritmo PID e lo stimatore dello scambio ogni 6 s. Senza dipendenze esterne, lo usa anche il simulatore |
 | `protezione_contatore.py` | Prelievo concesso e protezione del contatore. Senza dipendenze esterne |
@@ -388,6 +389,9 @@ nulla da internet: three.js r160 e Chart.js 4.4.1 sono in `web/vendor/`.
 | `GET /api/data` | Stato attuale e configurazione, ogni 2 s. Con `storia=0` senza l'ultima ora di storico, con `log_da=N` solo le righe di registro dopo la numero N |
 | `GET /api/storico?range=1h\|6h\|24h\|7g` | Storico per i grafici |
 | `GET /api/giorni`, `GET /api/sessioni` | Storico giornaliero e sessioni |
+| `GET /statistiche` | La pagina Statistiche (4.14) |
+| `GET /api/statistiche?periodo=...` | Tutti i numeri della pagina Statistiche per un periodo: `7g`, `30g`, `90g`, `365g`, `anno`, `tutto`, un mese `AAAA-MM`, oppure `da=AAAA-MM-GG&a=AAAA-MM-GG` |
+| `GET /api/statistiche.csv?periodo=...` | La tabella dei giorni del periodo, per il foglio di calcolo |
 | `POST /api/settings` | Salva le impostazioni (tutto o niente) |
 | `POST /api/comando` | `{"nome": "modalita"\|"prelevabile"\|"obiettivo", "valore": ...}`, come i comandi Telegram |
 | `POST /api/limite_toggle` | Attiva/disattiva il limite kWh |
@@ -460,12 +464,68 @@ Cartella `/home/tressilloide/solar/regolatore-potenza-carica`:
 | File | Contenuto |
 |---|---|
 | `config_utente.json` | Impostazioni salvate dall'utente |
-| `storico.jsonl` | Un campione al minuto `[ts, consumo, produzione, auto]`, ultimi 7 giorni |
+| `storico.jsonl` | Un campione al minuto `[ts, consumo, produzione, auto, L1..L6]`, ultimi 7 giorni (le sei fasi dal 10/11/2026) |
+| `statistiche_giorni.jsonl` | L'archivio delle statistiche: una riga per ogni giorno chiuso, per sempre (4.14) |
 | `storico_giornaliero.json` | Totali di ogni giorno |
 | `sessioni.json` | Ultime 200 sessioni di ricarica |
 | `pianificazione.json` | Obiettivo in corso |
 | `stato_energia.json` | Contatori di oggi, per ripartire dopo un riavvio |
 | `venv/` | L'ambiente Python del servizio |
+
+### 4.14 Statistiche
+
+`http://192.168.1.23:5000/statistiche` (dal pannello: l'icona con le tre
+barre in alto, o "Tutte le statistiche" nella scheda degli ultimi 14 giorni).
+Una pagina sola per tutto lo storico, con un filtro di periodo che vale per
+ogni scheda: 7, 30, 90 giorni, l'anno, tutto, un mese preciso, oppure un
+giorno solo toccandolo nel calendario.
+
+Cosa mostra: i totali con il confronto sul periodo precedente; il diagramma
+dei flussi (sole e rete verso casa, auto e immissione); l'energia nel tempo
+per giorno, settimana o mese; la mappa ora per ora; la giornata e la
+settimana tipo; il calendario; il sole (curva per mese, ore equivalenti,
+CO₂); la casa (carico di fondo, fasi); la rete (tempo a ogni potenza di
+prelievo, picchi oltre il contatore); le ricariche (quante, quanto, a che
+ora, a che potenza, elenco); i conti in euro; i primati e le strisce.
+
+**Da dove arrivano i numeri.** Tutto è ricavato dai campioni al minuto
+(`statistiche.py`), non dai contatori del giorno:
+
+- `aggrega()` trasforma i campioni di un giorno in un record: energia ora
+  per ora (prodotta, consumata, in auto, prelevata, immessa, in auto dal
+  sole), picchi, minuti passati a ogni potenza, energia per fase, tratti di
+  carica. Circa 1 kB al giorno.
+- Due minuti dopo mezzanotte (e all'avvio, se manca qualcosa) il servizio
+  chiude il giorno prima in `statistiche_giorni.jsonl`. Il giorno in corso
+  è ricalcolato dai campioni in memoria, al massimo una volta al minuto.
+- `calcola()` fa tutti i conti del periodo richiesto; la pagina disegna
+  soltanto. Chilometri, benzina e CO₂ dipendono da quattro ipotesi che si
+  cambiano in fondo alla pagina e restano nel browser.
+
+**L'energia in auto.** La potenza dichiarata dalla colonnina non basta
+(`auto_reale()`): spenta dal quadro mentre carica resta ferma all'ultimo
+valore per ore, e in trifase dichiara i 22 kW concessi quando l'auto ne
+prende 11. Il totale misurato dal sensore fa da tetto: dove il dichiarato lo
+supera, all'auto va il totale meno la casa; se quel che resta è sotto il
+minimo della colonnina l'auto è ferma finché il valore non cambia. Sul
+periodo 29/10–9/11 il risultato coincide col contatore della colonnina
+(337 kWh contro 346, e la differenza è il contatore che conta 22 kW).
+Dal 10/11/2026 anche i contatori del giorno non contano più l'auto quando
+la colonnina non risponde da oltre due minuti.
+
+**Ricostruire l'archivio.** I giorni dal 14/9/2026 sono stati ricostruiti
+dall'archivio sul server (5.3). Per rifarlo, sul server:
+
+```sh
+A=/DATA/Documents/solare
+TZ=Europe/Rome python3 statistiche.py importa /tmp/statistiche_giorni.jsonl \
+  $A/pi/*.jsonl $A/pregresso-dal-pi-20261028/storico.jsonl
+scp /tmp/statistiche_giorni.jsonl pi:solar/regolatore-potenza-carica/
+```
+
+`TZ` serve perché il server è in UTC e i giorni sono quelli di casa. Se due
+file coprono lo stesso minuto vale il primo elencato. Il servizio rilegge
+il file da solo, non serve riavviarlo.
 
 ---
 
@@ -662,7 +722,7 @@ ssh pi 'sudo systemctl restart solar_web.service'
 ```
 
 **Test.** `python3 -m unittest -v test_regolatore` prova pianificatore,
-protezione e regolatore classico ovunque. I test del servizio (sessioni,
+protezione, regolatore classico e statistiche ovunque. I test del servizio (sessioni,
 API web, pagina) richiedono le librerie del venv del Pi; sul server non ci
 sono (né pip né venv), quindi li si lancia sul Pi in una cartella a parte,
 senza toccare il servizio:
@@ -739,8 +799,12 @@ arrivava a 137 giorni.
 
 - **Consumi ogni 60 s:** il consumo per fase arriva una volta al minuto, e
   nessun algoritmo può reagire prima a un carico che si accende.
-- **Energia in auto stimata:** i kWh in auto sono stimati dal setpoint; la
-  colonnina non ha un contatore.
+- **Energia in auto stimata:** i kWh in auto vengono dalla potenza dichiarata
+  dalla colonnina, corretta col totale del sensore (4.14): è una stima.
+- **Statistiche prima del 28/10/2026:** i riepiloghi giornalieri di allora
+  (`storico_giornaliero.json`) sottostimano la produzione fino alla metà per
+  un difetto poi corretto; la pagina Statistiche usa i campioni al minuto e
+  non ne risente. Mancano le letture per fase.
 - **Classico al minimo:** durante i 60 s al minimo non risale anche se torna
   il sole.
 - **Colonnina spenta la sera:** di notte risulta "non raggiungibile". Quando
