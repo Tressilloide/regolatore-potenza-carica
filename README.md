@@ -7,8 +7,8 @@ una quota di rete (per esempio per caricare di notte), senza mai far saltare il
 contatore. Si controlla da una pagina web e da Telegram, e i dati finiscono in
 Home Assistant e in un archivio al minuto sul server di casa.
 
-Stato al 9 novembre 2026: sul Pi gira il branch `main`, con l'algoritmo
-**classico** attivo.
+Stato al 10 novembre 2026: sul Pi gira il branch `main`, con l'algoritmo
+**classico** attivo e la modalità di carica **Sole + rete**.
 
 ---
 
@@ -137,9 +137,12 @@ File principali:
 
 | File | Cosa contiene |
 |---|---|
-| `solar_webinterface.py` | Il servizio: lettura del sensore, algoritmo classico, colonnina, pagina web, bot Telegram, storico, sessioni |
+| `solar_webinterface.py` | Il servizio: lettura del sensore, colonnina, pagina web, bot Telegram, storico, sessioni |
+| `regolatore_classico.py` | L'algoritmo classico. Senza dipendenze esterne, lo usa anche il simulatore |
 | `regolatore_pid.py` | L'algoritmo PID e lo stimatore dello scambio ogni 6 s. Senza dipendenze esterne, lo usa anche il simulatore |
 | `protezione_contatore.py` | Prelievo concesso e protezione del contatore. Senza dipendenze esterne |
+| `pianificatore.py` | Modalità di carica, boost e obiettivo kWh: decide la quota di rete per l'auto (4.4). Senza dipendenze esterne |
+| `test_regolatore.py` | Test automatici (sezione 6) |
 | `ponte_mqtt.py` | Invio dei dati al server (Home Assistant e archivio) |
 | `simulatore_regolatore.py` | Prova gli algoritmi sul PC con i dati veri (sezione 7) |
 | `API_CENTRALINA.md` | Come funziona la colonnina, ricavato dal suo firmware |
@@ -176,20 +179,22 @@ A ogni pacchetto, in quest'ordine:
 
 1. Il PID osserva sempre, anche quando comanda il classico. Così, se si cambia
    algoritmo, è già pronto.
-2. **Protezione del contatore** (4.6). Se interviene, il pacchetto finisce qui.
+2. **Protezione del contatore** (4.7). Se interviene, il pacchetto finisce qui.
 3. Se è attivo l'override manuale (`/spegni` da Telegram), non si fa nulla.
 4. L'algoritmo scelto decide: il **classico** a ogni pacchetto, il **PID**
-   solo sui pacchetti `solar`.
+   solo sui pacchetti `solar`. Entrambi chiedono al pianificatore (4.4)
+   quanta rete può prendere l'auto.
 
 ### 4.3 Quanto può prendere l'auto: prelevabile e limite del contatore
 
-- `POTENZA_PRELEVABILE` è quanto **l'auto** può prendere dalla rete, **in
-  aggiunta** a quello che preleva già la casa.
+- La **quota dell'auto** è quanto l'auto può prendere dalla rete, **in
+  aggiunta** a quello che preleva già la casa. La decide il pianificatore
+  (4.4): nella modalità Sole + rete è `POTENZA_PRELEVABILE`.
 - Il prelievo totale (casa + auto - sole) non supera mai
   `LIMITE_CONTATORE - MARGINE_CONTATORE` (6600 - 300 = 6300 W).
 
 ```
-prelievo totale concesso = min( PRELEVABILE + max(0, casa - sole),  6600 - 300 )
+prelievo totale concesso = min( quota auto + max(0, casa - sole),  6600 - 300 )
 ```
 
 Esempio di notte, con prelevabile 3000 W:
@@ -208,9 +213,41 @@ più basso l'auto non parte.
 Fino al 3/11/2026 il prelevabile era il totale, casa compresa. Il campo
 `prelevabile_w` nell'archivio cambia significato da quella data.
 
-### 4.4 Algoritmo classico
+### 4.4 Modalità di carica, boost e obiettivo
 
-La logica storica, in `run_logic`:
+`pianificatore.py` decide la **quota dell'auto** (4.3). Il limite del
+contatore e la sua protezione (4.7) valgono in ogni caso.
+
+| Modalità | Quota di rete per l'auto |
+|---|---|
+| **Solo sole** (`sole`) | 0: solo il sole in più rispetto alla casa |
+| **Sole + rete** (`misto`) | `POTENZA_PRELEVABILE` (il comportamento di prima) |
+| **Veloce** (`veloce`) | Quanto il contatore permette: fino a 6300 W di prelievo in tutto, casa compresa |
+
+- **Boost:** Veloce per un certo tempo (di default 1 ora), poi si torna
+  alla modalità scelta. Sopravvive a un riavvio del servizio.
+- **Obiettivo:** "N kWh in auto entro le HH:MM". Si carica col sole
+  finché basta. Quando la potenza media necessaria per finire in tempo
+  (kWh mancanti / ore rimaste / 0,9) arriva al minimo della colonnina, si
+  integra con la rete quanto serve. Da lì l'integrazione resta agganciata,
+  con 400 W sopra il minimo, fino all'obiettivo: senza, caricando al minimo
+  la potenza necessaria scenderebbe sotto il minimo e l'auto si
+  spegnerebbe a ogni giro.
+  - L'energia contata è quella del contatore della centralina, la stessa
+    del limite kWh e delle sessioni.
+  - Raggiunto l'obiettivo, o passata la scadenza, arriva un messaggio su
+    Telegram e si torna alla modalità scelta.
+  - Si annulla da solo se l'auto viene scollegata.
+  - Esempio, trifase (minimo 4140 W), 10 kWh entro le 7:00 impostati alle
+    23: fino alle 4:20 circa si aspetta, poi si carica a ~4,5 kW.
+
+Si comanda dalla pagina web (scheda Carica), da Telegram (`/modalita`,
+`/boost`, `/obiettivo`) e da Home Assistant (5.1). Boost e obiettivo sono
+salvati in `pianificazione.json`.
+
+### 4.5 Algoritmo classico
+
+`regolatore_classico.py` (la logica storica di `run_logic`):
 
 - **Bilancio:** potenza disponibile = sole + prelievo concesso; consumo = il
   consumo totale dell'ultimo pacchetto `electricity`.
@@ -230,7 +267,7 @@ Limite noto: fra un pacchetto `electricity` e l'altro il classico lavora su un
 consumo vecchio fino a 60 s. Durante i 60 s al minimo resta al minimo anche se
 il sole torna.
 
-### 4.5 Algoritmo PID (sperimentale)
+### 4.6 Algoritmo PID (sperimentale)
 
 `regolatore_pid.py`. Decide a ogni pacchetto `solar` (6 s):
 
@@ -247,7 +284,7 @@ quasi la metà delle volte. Sul campo, a sole stabile, i due algoritmi sono
 risultati pari. Si cambia da Telegram con `/algoritmo pid` o
 `/algoritmo classico`, senza riavviare.
 
-### 4.6 Protezione del contatore
+### 4.7 Protezione del contatore
 
 `protezione_contatore.py`. Il contatore ha 6 kW di contratto e
 `LIMITE_CONTATORE` = 6600 W (+10%). A ogni pacchetto si stima il prelievo:
@@ -270,7 +307,7 @@ contatore stacca in circa 2 minuti solo oltre il 27% in più (circa 8,4 kW);
 fra 6,6 e 8,4 kW regge circa 3 ore. Nelle prove sulle sere vere l'auto non
 aggiunge distacchi a quelli che la casa farebbe da sola.
 
-### 4.7 Limite di energia (kWh)
+### 4.8 Limite di energia (kWh)
 
 - **Come si imposta:** dalla pagina web (cursore e pulsante "Attiva/Disattiva
   limite", oppure "Salva impostazioni") o con `/limite <kWh>`. Il Pi manda
@@ -280,14 +317,23 @@ aggiunge distacchi a quelli che la casa farebbe da sola.
 - **Se cambia senza il Pi** (dal pannello della colonnina, o perché è stata
   spenta e riaccesa): il Pi lo scrive nel log e lo adotta. Se un limite
   attivo sparisce, arriva un avviso su Telegram.
-- **Attenzione:** all'avvio del servizio (riavvio, deploy, "Re-inizializza
-  wallbox", `/reset`) un limite attivo viene **disattivato**. Dopo un riavvio
-  va rimesso.
+- **Riavvii:** un riavvio del servizio (anche un deploy) lascia il limite
+  com'è. Lo disattivano solo "Re-inizializza wallbox" e `/reset`. Fino al
+  10/11/2026 lo disattivava anche il riavvio.
 
-### 4.8 Sessioni, contatori ed energia
+### 4.9 Sessioni, contatori ed energia
 
 - **Sessione di ricarica:** inizia quando la colonnina segnala potenza (`pcar`
   > 0) e finisce quando torna a 0, anche se è l'auto a fermarsi da sola.
+  Se la colonnina smette di rispondere mentre carica (spenta dal quadro),
+  dopo 10 minuti (`SESSIONE_OFFLINE_S`) la sessione si chiude all'ultima
+  volta che la si è vista caricare.
+- **kWh della sessione:** la somma degli incrementi del contatore `energy`
+  della centralina, che regge sia le pause (il contatore non si azzera) sia
+  il cavo staccato (si azzera). La quota dal sole la sessione la accumula per
+  conto suo: fino al 10/11/2026 veniva dai contatori del giorno, e le
+  sessioni a cavallo della mezzanotte uscivano con la quota vuota o
+  negativa.
 - **Contatori del giorno:** integrano le potenze di ogni minuto: sole,
   prelievo, immissione, auto, auto dal sole, minuti di carica. Si salvano in
   `stato_energia.json` e ripartono dopo un riavvio.
@@ -297,11 +343,13 @@ aggiunge distacchi a quelli che la casa farebbe da sola.
 - **Risparmio:** `PREZZO_ACQUISTO` meno `PREZZO_VENDITA` per i kWh caricati
   dal sole.
 
-### 4.9 Pagina web
+### 4.10 Pagina web
 
 `http://192.168.1.23:5000`. Mostra:
 
-- sole, consumi per fase e stato della colonnina;
+- sole, consumi per fase, prelievo o immissione, stato della colonnina;
+- scheda **Carica**: modalità, boost, obiettivo con barra di avanzamento.
+  Questi comandi valgono subito, senza "Salva impostazioni";
 - grafico dell'ultima ora e dello storico;
 - energia di oggi, sessioni, storico giornaliero;
 - console dei log;
@@ -318,11 +366,12 @@ modifiche in sospeso.
 | `GET /api/storico` | Storico per i grafici |
 | `GET /api/giorni`, `GET /api/sessioni` | Storico giornaliero e sessioni |
 | `POST /api/settings` | Salva le impostazioni (tutto o niente) e invia il limite |
+| `POST /api/comando` | `{"nome": "modalita"\|"prelevabile"\|"boost"\|"obiettivo", "valore": ...}`, come i comandi Telegram |
 | `POST /api/limite_toggle` | Attiva/disattiva il limite kWh |
 | `POST /api/init_wallbox` | Re-inizializza la colonnina |
 | `GET /api/wallbox_raw` | JSON grezzo della colonnina, per diagnosi |
 
-### 4.10 Telegram
+### 4.11 Telegram
 
 | Comando | Cosa fa |
 |---|---|
@@ -332,7 +381,10 @@ modifiche in sospeso.
 | `/fase` | Rilegge subito monofase/trifase |
 | `/accendi`, `/spegni` | Forza accensione/spegnimento. Dopo `/spegni` il regolatore non riaccende finché non arriva `/accendi` |
 | `/reset` | Re-inizializza la colonnina |
-| `/prelevabile <W>`, `/protezione <W>` | Prelevabile per l'auto, soglia di protezione |
+| `/modalita [sole\|misto\|veloce]` | Modalità di carica (4.4) |
+| `/boost [minuti\|off]` | Veloce per un po' (default 60 minuti) |
+| `/obiettivo <kWh> <HH:MM>`, `/obiettivo off` | Obiettivo di carica, per esempio `/obiettivo 15 7:30` |
+| `/prelevabile <W>`, `/protezione <W>` | Prelevabile per l'auto (modalità Sole + rete), soglia di protezione |
 | `/limite <kWh>` | Limite di energia |
 | `/algoritmo [classico\|pid]`, `/pid ...` | Scelta e taratura dell'algoritmo |
 
@@ -343,16 +395,18 @@ Notifiche automatiche:
   non raggiungibile o non in modalità `Man`.
 - **Potenza:** potenza massima raggiunta, carica spenta per poco sole,
   intervento del limite del contatore ⚡.
+- **Pianificazione:** boost finito, obiettivo raggiunto 🎯 o non raggiunto
+  entro la scadenza, obiettivo annullato perché l'auto è stata scollegata.
 - **Allarmi:** sensore muto da 5 minuti, presa a 60 °C (attenzione) o 70 °C
   (allarme), limite kWh sparito dalla colonnina.
 
-### 4.11 Configurazione
+### 4.12 Configurazione
 
 In cima a `solar_webinterface.py` c'è il dizionario `CONFIG`. Le voci
 modificabili dall'utente vengono salvate in `config_utente.json` e ricaricate
 all'avvio:
 
-- `POTENZA_PRELEVABILE`, `POTENZA_PROTEZIONE`, `LIMITE_KWH`;
+- `POTENZA_PRELEVABILE`, `POTENZA_PROTEZIONE`, `LIMITE_KWH`, `MODALITA`;
 - `PREZZO_ACQUISTO`, `PREZZO_VENDITA`;
 - `ALGORITMO`, `PID_KP`, `PID_KI`, `PID_KD`, `PID_MARGINE`.
 
@@ -364,6 +418,7 @@ Le altre restano nel codice. Le più importanti:
 | `TIMER_SPEGNIMENTO` | 60 s | Quanto si resta al minimo prima di spegnere |
 | `COOLDOWN_ACCENSIONE` | 60 s | Attesa minima fra spegnimento e riaccensione |
 | `INTERVALLO_SYNC_FASE` | 5 s | Ogni quanto si legge la colonnina |
+| `SESSIONE_OFFLINE_S` | 600 s | Colonnina muta da tanto mentre caricava: la sessione si chiude |
 | `TEMP_PRESA_ATTENZIONE` / `ALLARME` | 60 / 70 °C | Soglie della temperatura della presa |
 | `ADOTTA_CARICA_IN_CORSO` | True | All'avvio non interrompe una carica in corso |
 | `ORA_RIEPILOGO` | 23 | Ora del riepilogo su Telegram |
@@ -372,7 +427,7 @@ Il file `.env` (non versionato) contiene `API_KEY` e `CHAT_ID` del bot
 Telegram e `MQTT_HOST`, `MQTT_PORT`, `MQTT_USER`, `MQTT_PASSWORD` per il
 server.
 
-### 4.12 File sul Pi
+### 4.13 File sul Pi
 
 Cartella `/home/tressilloide/solar/regolatore-potenza-carica`:
 
@@ -382,6 +437,7 @@ Cartella `/home/tressilloide/solar/regolatore-potenza-carica`:
 | `storico.jsonl` | Un campione al minuto `[ts, consumo, produzione, auto]`, ultimi 7 giorni |
 | `storico_giornaliero.json` | Totali di ogni giorno |
 | `sessioni.json` | Ultime 200 sessioni di ricarica |
+| `pianificazione.json` | Boost e obiettivo in corso |
 | `stato_energia.json` | Contatori di oggi, per ripartire dopo un riavvio |
 | `venv/` | L'ambiente Python del servizio |
 
@@ -399,12 +455,17 @@ Il Pi pubblica su Mosquitto del server (192.168.1.36:1883, utente
 | `solare/pi/online` | `online` / `offline` (retained, ultimo messaggio automatico se il Pi sparisce) |
 | `solare/pi/stato` | Un JSON al minuto, subito dopo ogni `electricity` (retained) |
 | `solare/pi/sessione` | L'ultima sessione di ricarica chiusa (retained) |
+| `solare/pi/controlli` | Modalità, prelevabile, boost e obiettivo (retained), a ogni cambio e ogni minuto |
+| `solare/pi/cmd/<comando>` | **Comandi** verso il Pi, non retained: `modalita` (`sole`/`misto`/`veloce`), `prelevabile` (W), `boost` (minuti, 0 = annulla), `obiettivo` (`15 7:30` o `off`) |
 | `homeassistant/device/colonnina_pi/config` | Annuncio automatico per Home Assistant (MQTT Discovery) |
 
 Il JSON al minuto contiene:
 
 - **auto e colonnina:** `auto_w`, `setpoint_w`, `pcar_w`, stato della
   colonnina, fase, algoritmo, `prelevabile_w`, kWh della sessione;
+- **pianificazione:** `modalita` (quella in vigore, boost compreso),
+  `quota_rete_auto_w`, e con un obiettivo `obiettivo_kwh` e
+  `obiettivo_fatti_kwh`;
 - **sole e rete come li vede il Pi:** `produzione_w`, `consumo_w`,
   `prelievo_w`, le sei fasi, e media/minimo/massimo della produzione nel
   minuto;
@@ -424,8 +485,20 @@ In Home Assistant compare il dispositivo **Colonnina**:
 | `sensor.colonnina_in_auto_dal_sole_oggi` | kWh in auto dal sole oggi |
 | `sensor.colonnina_minuti_di_carica_oggi` | Minuti di carica oggi |
 | `sensor.colonnina_ultima_sessione` | kWh dell'ultima sessione, con i dettagli negli attributi |
+| `select.colonnina_modalita` | **Comando:** modalità di carica (`sole`, `misto`, `veloce`) |
+| `number.colonnina_prelevabile_per_l_auto` | **Comando:** prelevabile per l'auto, 0-6600 W |
+| `button.colonnina_boost_1_ora`, `button.colonnina_annulla_boost` | **Comando:** boost di un'ora, annulla boost |
+| `sensor.colonnina_modalita_attiva` | Modalità in vigore (boost compreso); boost e obiettivo negli attributi |
+| `sensor.colonnina_obiettivo_caricato` | kWh caricati per l'obiettivo in corso |
 
 Senza aggiornamenti per 5 minuti i sensori diventano "non disponibili".
+
+Con i comandi Home Assistant può anche automatizzare: per esempio
+"modalità Veloce quando la tariffa è bassa", o un obiettivo pubblicando su
+`solare/pi/cmd/obiettivo`. Il Pi valida ogni comando come quelli di
+Telegram, scrive nel log chi l'ha dato (`[HOME ASSISTANT]`) e ignora i
+messaggi retained. Mosquitto non ha ACL: qualunque utente del broker può
+mandare comandi.
 
 ### 5.2 Sul server: `owl-fotovoltaico`
 
@@ -512,7 +585,7 @@ GIT_SSH_COMMAND="ssh -i ~/.ssh/solarpi -o IdentitiesOnly=yes" \
 # sul Pi
 cd /home/tressilloide/solar/regolatore-potenza-carica
 git merge --ff-only tmp/main && git branch -D tmp/main
-./venv/bin/python3 -m py_compile solar_webinterface.py regolatore_pid.py protezione_contatore.py ponte_mqtt.py
+./venv/bin/python3 -m py_compile *.py
 sudo systemctl restart solar_web.service
 ```
 
@@ -559,24 +632,35 @@ cartella del progetto sul Pi:
 git push pi main:tmp/main
 ssh pi 'cd /home/tressilloide/solar/regolatore-potenza-carica \
   && git merge --ff-only tmp/main && git branch -D tmp/main \
-  && ./venv/bin/python3 -m py_compile solar_webinterface.py regolatore_pid.py protezione_contatore.py ponte_mqtt.py'
+  && ./venv/bin/python3 -m py_compile *.py'
 ssh pi 'sudo systemctl restart solar_web.service'
+```
+
+**Test.** `python3 -m unittest -v test_regolatore` prova pianificatore,
+protezione e regolatore classico ovunque. I test del servizio (sessioni,
+API web) richiedono le librerie del venv del Pi; sul server non ci sono (né
+pip né venv), quindi li si lancia sul Pi in una cartella a parte, senza
+toccare il servizio:
+
+```sh
+ssh pi 'rm -rf /tmp/prova-regolatore && mkdir /tmp/prova-regolatore'
+scp *.py pi:/tmp/prova-regolatore/
+ssh pi 'cd /tmp/prova-regolatore && MPLCONFIGDIR=/tmp/prova-regolatore/.mpl \
+  /home/tressilloide/solar/regolatore-potenza-carica/venv/bin/python -m unittest -v test_regolatore'
 ```
 
 Da sapere sul clone del server:
 
-- **Commit:** git non ha ancora nome ed email configurati (`git config
-  user.name` / `user.email`).
-- **GitHub:** per fare push su GitHub servono credenziali, per esempio
-  `gh auth login` o un token.
+- **Commit e GitHub:** nome ed email di git sono configurati e il push su
+  GitHub (`origin`, via SSH) funziona.
 - **Configurazione sul server:** la descrizione completa è in
   `/mnt/nas-hdd/backups/SERVER.md`, capitoli 13 e 17.
 
 Dopo un riavvio:
 
 - la carica in corso continua;
-- il limite kWh viene disattivato. Si rimette dalla pagina web oppure con
-  `curl "http://192.168.1.22/index.json?btn=L8"`.
+- il limite kWh resta com'è sulla colonnina;
+- modalità, boost e obiettivo ripartono da dove erano.
 
 Comandi utili sul Pi (altri in `comandi.txt`):
 
@@ -615,9 +699,14 @@ python simulatore_regolatore.py storico.jsonl            # classico e PID, giorn
 python simulatore_regolatore.py storico.jsonl --taratura # griglia di parametri del PID
 ```
 
-Il PID e la protezione del contatore vengono importati dagli stessi file del
-Pi. Il classico invece è una **copia** di `run_logic`: se si cambia quello, va
-aggiornata anche la copia nel simulatore.
+Classico, PID e protezione del contatore vengono importati dagli stessi
+file del Pi. Resta una copia solo dei filtri di `WallboxController._set_power`
+(`FintaWallbox`): se si cambiano quelli, va aggiornata anche lì.
+
+Per avere più giorni si può costruire un file nello stesso formato dagli
+archivi del server (`pregresso-dal-pi-20261028/storico.jsonl` e
+`pi/AAAA-MM.jsonl`), togliendo l'auto dal consumo: a novembre 2026 così si
+arrivava a 137 giorni.
 
 ---
 
@@ -629,6 +718,5 @@ aggiornata anche la copia nel simulatore.
   colonnina non ha un contatore.
 - **Classico al minimo:** durante i 60 s al minimo non risale anche se torna
   il sole.
-- **Limite kWh e riavvii:** ogni riavvio del servizio disattiva il limite kWh.
 - **Colonnina spenta la sera:** di notte risulta "non raggiungibile". Quando
   torna alimentata riparte da sola al minimo e il Pi adotta la carica.
