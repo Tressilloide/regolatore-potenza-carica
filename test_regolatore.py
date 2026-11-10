@@ -61,25 +61,6 @@ class TestPianificatore(unittest.TestCase):
         self.assertEqual(prelevabile_effettivo(cfg, 2000), 2000)   # solo la casa
         self.assertEqual(prelevabile_effettivo(cfg, -3000), 0)     # il sole avanza
 
-    def test_boost_scade_e_torna_alla_modalita(self):
-        orologio = Orologio()
-        cfg = config_base(MODALITA='sole')
-        p, avvisi = nuovo_pianificatore(cfg, orologio=orologio)
-        ok, _ = p.imposta_boost(60)
-        self.assertTrue(ok)
-        self.assertEqual(p.modalita_effettiva(), 'veloce')
-        self.assertEqual(p.quota_auto(0), 6600)
-        orologio.t += 61 * 60
-        self.assertEqual(p.quota_auto(0), 0)
-        self.assertIsNone(p.boost_fino)
-        self.assertEqual(len(avvisi), 1)
-
-    def test_boost_valori_non_validi(self):
-        p, _ = nuovo_pianificatore(config_base())
-        for valore in ('abc', -5, 100000, float('nan')):
-            self.assertFalse(p.imposta_boost(valore)[0], valore)
-        self.assertTrue(p.imposta_boost(0)[0])      # annulla: sempre ok
-
     def test_obiettivo_aspetta_il_minimo_poi_integra(self):
         orologio = Orologio()
         cfg = config_base(MODALITA='sole')
@@ -136,19 +117,16 @@ class TestPianificatore(unittest.TestCase):
         salvati = []
         p = Pianificatore(config_base(), log=lambda m: None, salva=salvati.append,
                           orologio=orologio)
-        p.imposta_boost(30)
         p.imposta_obiettivo(12, orologio.t + 5 * 3600)
         p.aggiungi_energia(2)
         q, _ = nuovo_pianificatore(config_base(), orologio=orologio)
         q.importa(salvati[-1])
         self.assertEqual(q.obiettivo['fatti'], 2)
-        self.assertIsNotNone(q.boost_fino)
         # Gia' scaduti al riavvio: non si riprendono
         orologio.t += 6 * 3600
         r, _ = nuovo_pianificatore(config_base(), orologio=orologio)
         r.importa(salvati[-1])
         self.assertIsNone(r.obiettivo)
-        self.assertIsNone(r.boost_fino)
         r.importa("spazzatura")
         r.importa({'obiettivo': {'kwh': 'x'}})
         self.assertIsNone(r.obiettivo)
@@ -157,7 +135,7 @@ class TestPianificatore(unittest.TestCase):
         def rotto(_):
             raise OSError("disco pieno")
         p = Pianificatore(config_base(), log=lambda m: None, salva=rotto, orologio=Orologio())
-        self.assertTrue(p.imposta_boost(10)[0])
+        self.assertTrue(p.imposta_obiettivo(10, p.ora() + 3600)[0])
 
     def test_orari(self):
         self.assertEqual(interpreta_orario('7'), (7, 0))
@@ -376,8 +354,12 @@ class TestServizio(unittest.TestCase):
         self.assertEqual(r.get_json()['piano']['obiettivo']['kwh'], 12)
         r = client.post('/api/comando', json={'nome': 'obiettivo', 'valore': 'off'})
         self.assertIsNone(r.get_json()['piano']['obiettivo'])
-        r = client.post('/api/comando', json={'nome': 'boost', 'valore': '30'})
-        self.assertEqual(r.get_json()['piano']['modalita_effettiva'], 'veloce')
+        r = client.post('/api/comando', json={'nome': 'boost', 'valore': '30'})     # tolto il 10/11/2026
+        self.assertEqual(r.status_code, 400)
+        r = client.post('/api/comando', json={'nome': 'prelevabile', 'valore': '2500'})
+        self.assertEqual(r.get_json()['piano']['prelevabile_w'], 2500)
+        r = client.post('/api/comando', json={'nome': 'prelevabile', 'valore': '-5'})
+        self.assertEqual(r.status_code, 400)
         r = client.post('/api/comando', data='non json')
         self.assertEqual(r.status_code, 400)
         r = client.get('/api/data')

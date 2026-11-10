@@ -53,7 +53,7 @@ CONFIG = {
     'POTENZA_PRELEVABILE': 0,       # Quanto l'AUTO puo' prendere dalla rete, oltre alla casa (Web e Telegram, persistito)
     # Modalita' di carica (pianificatore.py, persistita): 'sole' = solo il
     # sole in piu', 'misto' = sole + POTENZA_PRELEVABILE, 'veloce' = quanto il
-    # contatore permette. Boost a tempo e obiettivo kWh stanno in FILE_PIANO.
+    # contatore permette. L'obiettivo kWh sta in FILE_PIANO.
     'MODALITA': 'misto',
     # --- Contatore di casa (protezione_contatore.py) ---
     # Oltre LIMITE_CONTATORE di prelievo (sole escluso, auto compresa) il
@@ -453,7 +453,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/reset - Re-inizializza la centralina\n\n"
         "*Carica*\n"
         "/modalita [sole|misto|veloce] - Solo sole, sole + rete, massima\n"
-        "/boost [minuti|off] - Veloce per un po' (default 60 min)\n"
         "/obiettivo <kWh> <HH:MM> - Pronta entro un orario (off per annullare)\n\n"
         "*Impostazioni*\n"
         "/prelevabile <W> - Quanto l'auto può prendere dalla rete, oltre alla casa\n"
@@ -576,8 +575,7 @@ def esegui_comando(nome, valore, origine):
     """Unico punto per i comandi di carica, da Web, Telegram e Home Assistant
     (MQTT): stessa validazione e stesso effetto da qualunque parte arrivino.
 
-    nome: 'modalita' | 'prelevabile' | 'boost' (minuti, 0 = annulla) |
-          'obiettivo' ('<kWh> <HH:MM>' oppure 'off')
+    nome: 'modalita' | 'prelevabile' | 'obiettivo' ('<kWh> <HH:MM>' oppure 'off')
     Ritorna (ok, messaggio).
     """
     valore = '' if valore is None else str(valore).strip()
@@ -589,13 +587,11 @@ def esegui_comando(nome, valore, origine):
         esito = (ok, f"Prelevabile per l'auto: {CONFIG['POTENZA_PRELEVABILE']} W" if ok else errore)
     elif pianificatore_instance is None:
         esito = (False, "Pianificatore non pronto")
-    elif nome == 'boost':
-        esito = pianificatore_instance.imposta_boost(0 if valore.lower() in ('off', 'no', '') else valore)
     elif nome == 'obiettivo':
         esito = imposta_obiettivo_da_testo(valore)
     else:
         esito = (False, f"Comando sconosciuto: {nome}")
-    if esito[0] and nome in ('boost', 'obiettivo'):
+    if esito[0] and nome == 'obiettivo':
         log_msg(f"[{origine}] {esito[1]}")
     if esito[0] and ponte_mqtt_instance and pianificatore_instance:
         ponte_mqtt_instance.pubblica_controlli(stato_controlli())
@@ -619,7 +615,7 @@ def imposta_obiettivo_da_testo(testo):
     return pianificatore_instance.imposta_obiettivo(kwh, prossima_scadenza(*orario))
 
 def stato_controlli():
-    """Modalita', prelevabile, boost e obiettivo: per pagina web e Home Assistant."""
+    """Modalita', prelevabile e obiettivo: per pagina web e Home Assistant."""
     stato = pianificatore_instance.stato() if pianificatore_instance else {}
     stato['prelevabile_w'] = CONFIG['POTENZA_PRELEVABILE']
     return stato
@@ -636,14 +632,6 @@ async def cmd_modalita(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     ok, messaggio = esegui_comando('modalita', context.args[0], 'TELEGRAM')
     await update.message.reply_text(f"{'✅' if ok else '⚠️'} {messaggio}")
-
-async def cmd_boost(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/boost [minuti|off]: carica veloce per un po', poi torna alla modalita'."""
-    if not check_auth(update): return
-    valore = context.args[0] if context.args else '60'
-    ok, messaggio = esegui_comando('boost', valore, 'TELEGRAM')
-    await update.message.reply_text(f"{'⚡' if ok else '⚠️'} {messaggio}"
-                                    + ("" if ok else "\nUsa: /boost 90 (minuti) oppure /boost off"))
 
 async def cmd_obiettivo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/obiettivo <kWh> <HH:MM> | off"""
@@ -1001,7 +989,6 @@ def _registra_comandi(app):
         (["limite"], cmd_limite),
         (["algoritmo"], cmd_algoritmo),
         (["modalita"], cmd_modalita),
-        (["boost"], cmd_boost),
         (["obiettivo"], cmd_obiettivo),
         (["pid"], cmd_pid),
         (["fase"], cmd_fase),
@@ -1253,7 +1240,7 @@ def update_settings():
 
 @app.route('/api/comando', methods=['POST'])
 def api_comando():
-    """Comandi di carica dalla pagina: {nome: modalita|prelevabile|boost|obiettivo,
+    """Comandi di carica dalla pagina: {nome: modalita|prelevabile|obiettivo,
     valore: ...}. Stessa funzione di Telegram e Home Assistant."""
     dati = request.get_json(silent=True)
     if not isinstance(dati, dict) or not isinstance(dati.get('nome'), str):
@@ -2888,7 +2875,7 @@ def thread_periodico(wallbox):
                 log_msg(f"[ERRORE] watchdog: {e}")
             prossimo_watchdog = adesso + 60
 
-        # --- Scadenze di boost e obiettivo (anche senza pacchetti) ---
+        # --- Scadenza dell'obiettivo (anche senza pacchetti) ---
         try:
             if pianificatore_instance:
                 pianificatore_instance.controlla()
@@ -2949,7 +2936,7 @@ def main():
     wallbox_instance = WallboxController()
     wallbox = wallbox_instance
 
-    # Modalita', boost e obiettivo: decidono la quota di rete per l'auto
+    # Modalita' e obiettivo: decidono la quota di rete per l'auto
     # (prelevabile_effettivo la chiede a CONFIG['PIANIFICATORE'])
     pianificatore_instance = Pianificatore(
         CONFIG, minimo_colonnina=lambda: wallbox.limiti_potenza()[0], log=log_msg,

@@ -261,6 +261,17 @@ button:focus-visible, input:focus-visible, summary:focus-visible, .registro:focu
 .segmenti button.attivo span { color: inherit; opacity: .75; }
 .segmenti button.scelta { box-shadow: inset 0 0 0 1.5px var(--bordo-forte); }
 
+/* prelevabile: cursore e campo numerico sono lo stesso valore */
+.prelevabile { margin-top: 12px; padding: 12px 13px; border-radius: 12px; background: var(--superficie-2); border: 1px solid var(--bordo); transition: opacity .2s; }
+.prelevabile.inattivo { opacity: .55; }
+.prelevabile-testa { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-size: .84rem; margin-bottom: 9px; }
+.prelevabile-testa label { font-weight: 560; color: var(--testo-2); }
+.prelevabile-testa b { font-weight: 680; font-size: .98rem; white-space: nowrap; }
+.prelevabile-riga { display: grid; grid-template-columns: 1fr 7.2em; gap: 12px; align-items: center; }
+.con-unita { position: relative; display: block; }
+.con-unita input { padding-right: 1.9em; background: var(--superficie); }
+.con-unita i { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); font-style: normal; font-size: .82rem; color: var(--testo-2); pointer-events: none; }
+
 .filtri { display: flex; gap: 4px; padding: 3px; border-radius: 999px; background: var(--superficie-2); border: 1px solid var(--bordo); }
 .filtri button { padding: 5px 11px; border-radius: 999px; font-size: .78rem; background: transparent; color: var(--testo-2); }
 .filtri button.attivo { background: var(--superficie); color: var(--testo); box-shadow: 0 1px 3px rgba(0, 0, 0, .14); }
@@ -286,6 +297,7 @@ input[type=range] { width: 100%; accent-color: var(--testo); margin: 0; }
 .barra { height: 8px; border-radius: 999px; background: color-mix(in srgb, var(--testo) 9%, transparent); overflow: hidden; }
 .barra > i { display: block; height: 100%; width: 0; border-radius: 999px; background: var(--auto); transition: width .6s ease; }
 .barra > i.b-sole { background: var(--sole); }
+.barra > i.b-neutro { background: var(--neutro); }
 
 .esito { margin-top: 12px; padding: 10px 13px; border-radius: 10px; font-size: .84rem; white-space: pre-line; border: 1px solid var(--bordo); background: var(--superficie-2); }
 .esito::before { font-weight: 700; margin-right: 6px; }
@@ -343,17 +355,19 @@ table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nu
 .suggerimento .voce { display: flex; align-items: center; gap: 7px; padding: 1px 0; }
 .suggerimento .voce b { margin-left: auto; padding-left: 14px; font-weight: 640; font-variant-numeric: tabular-nums; }
 
-/* ---------- dettagli tecnici ---------- */
+/* ---------- fasi e registro ---------- */
 details > summary { cursor: pointer; list-style: none; display: flex; align-items: center; justify-content: space-between; }
 details > summary::-webkit-details-marker { display: none; }
 #dettagli_tecnici > summary::after { content: "Mostra"; font-size: .78rem; color: var(--testo-2); }
 #dettagli_tecnici[open] > summary::after { content: "Nascondi"; }
 #dettagli_tecnici[open] > summary { margin-bottom: 14px; }
-.fasi { margin-bottom: 16px; font-size: .86rem; }
-.fasi th, .fasi td { padding: 7px 0; border-bottom: 1px solid var(--bordo); text-align: right; font-weight: 500; }
-.fasi th:first-child { text-align: left; color: var(--testo-2); font-weight: 500; }
-.fasi thead th { color: var(--testo-2); font-size: .78rem; }
-.fasi .totale th, .fasi .totale td { font-weight: 660; border-bottom: 0; color: var(--testo); }
+.fasi { font-size: .88rem; table-layout: fixed; }
+.fasi th, .fasi td { padding: 8px 0 8px 18px; border-bottom: 1px solid var(--bordo); text-align: right; font-weight: 560; }
+.fasi th:first-child { width: 3.6em; padding-left: 0; text-align: left; color: var(--testo-2); font-weight: 500; }
+.fasi thead th { color: var(--testo-2); font-size: .78rem; font-weight: 500; padding-top: 0; }
+.fasi td > span:first-child { display: block; }
+.fasi td .barra { display: block; height: 5px; margin-top: 5px; }
+.fasi .totale th, .fasi .totale td { font-weight: 680; border-bottom: 0; padding-bottom: 0; color: var(--testo); }
 .registro {
     margin: 0; height: 250px; overflow: auto; padding: 12px; border-radius: 11px; font-size: .74rem; line-height: 1.6;
     font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word;

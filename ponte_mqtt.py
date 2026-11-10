@@ -7,11 +7,11 @@ Topic, tutti con QoS 1:
   solare/pi/stato     un JSON al minuto, subito dopo il pacchetto 'electricity'
                       del sensore (retained: HA lo ritrova dopo un suo riavvio)
   solare/pi/sessione  l'ultima sessione di ricarica chiusa (retained)
-  solare/pi/controlli modalita', prelevabile, boost, obiettivo (retained), a
+  solare/pi/controlli modalita', prelevabile, obiettivo (retained), a
                       ogni cambio e ogni minuto
   solare/pi/cmd/<nome> comandi da Home Assistant (NON retained): modalita
-                      (sole|misto|veloce), prelevabile (W), boost (minuti,
-                      0 = annulla), obiettivo ('<kWh> <HH:MM>' o 'off')
+                      (sole|misto|veloce), prelevabile (W), obiettivo
+                      ('<kWh> <HH:MM>' o 'off')
   homeassistant/device/colonnina_pi/config
                       MQTT Discovery: HA crea da solo il dispositivo
                       "Colonnina" con i sensori di SENSORI
@@ -41,7 +41,7 @@ T_STATO = 'solare/pi/stato'
 T_SESSIONE = 'solare/pi/sessione'
 T_CONTROLLI = 'solare/pi/controlli'
 T_COMANDI = 'solare/pi/cmd/'
-COMANDI = ('modalita', 'prelevabile', 'boost', 'obiettivo')
+COMANDI = ('modalita', 'prelevabile', 'obiettivo')
 T_DISCOVERY = f'homeassistant/device/{NODO}/config'
 CODA_MAX = 7 * 24 * 60
 # Senza un nuovo 'stato' per 5 minuti i sensori diventano "non disponibili":
@@ -89,12 +89,12 @@ SENSORI = {
                     'unit_of_measurement': 'W', 'device_class': 'power',
                     'command_topic': T_COMANDI + 'prelevabile', 'state_topic': T_CONTROLLI,
                     'value_template': '{{ value_json.prelevabile_w }}'},
-    'boost': {'p': 'button', 'name': 'Boost 1 ora', 'unique_id': f'{NODO}_boost',
-              'icon': 'mdi:lightning-bolt', 'command_topic': T_COMANDI + 'boost',
-              'payload_press': '60'},
-    'boost_annulla': {'p': 'button', 'name': 'Annulla boost', 'unique_id': f'{NODO}_boost_annulla',
-                      'icon': 'mdi:lightning-bolt-outline', 'command_topic': T_COMANDI + 'boost',
-                      'payload_press': '0'},
+    # Il boost e' stato tolto il 10/11/2026. Un componente con la sola
+    # piattaforma dice a Home Assistant di eliminare i due pulsanti che aveva
+    # gia' creato; ometterli li lascerebbe li', orfani. Queste due righe si
+    # possono togliere quando HA li ha rimossi.
+    'boost': {'p': 'button'},
+    'boost_annulla': {'p': 'button'},
     'modalita_attiva': {'p': 'sensor', 'name': 'Modalità attiva', 'unique_id': f'{NODO}_modalita_attiva',
                         'icon': 'mdi:car-clock', 'state_topic': T_CONTROLLI,
                         'value_template': '{{ value_json.modalita_effettiva }}',

@@ -1,4 +1,4 @@
-"""Modalita' di carica, boost a tempo e obiettivo "X kWh entro le HH:MM".
+"""Modalita' di carica e obiettivo "X kWh entro le HH:MM".
 
 Decide QUANTO l'auto puo' prendere dalla rete, in aggiunta a quello che
 preleva gia' la casa: la quota che prima era sempre POTENZA_PRELEVABILE.
@@ -12,8 +12,6 @@ Modalita' (MODALITA in config, persistita):
   misto   sole + POTENZA_PRELEVABILE dalla rete (il comportamento storico)
   veloce  quanto il contatore permette (quota = LIMITE_CONTATORE, poi
           prelevabile_effettivo la riduce a LIMITE - MARGINE meno la casa)
-
-Boost: 'veloce' per un tempo, poi si torna alla modalita' scelta.
 
 Obiettivo: "voglio N kWh in auto entro le HH:MM". Si carica col sole finche'
 basta; quando la potenza media che servirebbe per finire in tempo,
@@ -44,7 +42,6 @@ class Pianificatore:
     # classico accende solo con un'eccedenza OLTRE il minimo, e il PID tiene
     # 300 W di riserva (PID_MARGINE)
     MARGINE_ACCENSIONE = 400
-    BOOST_MAX_MINUTI = 12 * 60
     OBIETTIVO_MAX_KWH = 100
     OBIETTIVO_MAX_ORE = 48
 
@@ -58,7 +55,6 @@ class Pianificatore:
         self.avvisa = avvisa or (lambda messaggio: None)
         self.salva = salva or (lambda stato: None)
         self.ora = orologio
-        self.boost_fino = None
         self.obiettivo = None       # {'kwh', 'entro', 'fatti', 'impostato'}
         self.in_recupero = False
         self.ultima_quota = None
@@ -70,17 +66,13 @@ class Pianificatore:
     # Persistenza
     # ------------------------------------------------------------------
     def esporta(self):
-        return {'boost_fino': self.boost_fino, 'obiettivo': self.obiettivo,
-                'in_recupero': self.in_recupero}
+        return {'obiettivo': self.obiettivo, 'in_recupero': self.in_recupero}
 
     def importa(self, dati):
         """Ripristina lo stato salvato, ignorando cio' che e' gia' scaduto."""
         if not isinstance(dati, dict):
             return
         adesso = self.ora()
-        boost = dati.get('boost_fino')
-        if isinstance(boost, (int, float)) and boost > adesso:
-            self.boost_fino = float(boost)
         ob = dati.get('obiettivo')
         try:
             if (isinstance(ob, dict) and float(ob['entro']) > adesso
@@ -101,31 +93,6 @@ class Pianificatore:
     # ------------------------------------------------------------------
     # Comandi
     # ------------------------------------------------------------------
-    def imposta_boost(self, minuti):
-        """Ritorna (ok, messaggio). 0 minuti = annulla."""
-        try:
-            minuti = float(minuti)
-        except (TypeError, ValueError):
-            return False, "Durata non valida"
-        if minuti != minuti or minuti < 0 or minuti > self.BOOST_MAX_MINUTI:
-            return False, f"Durata fra 0 e {self.BOOST_MAX_MINUTI} minuti"
-        if minuti == 0:
-            return self.annulla_boost()
-        self.boost_fino = self.ora() + minuti * 60
-        self.log(f"[PIANO] Boost attivo per {minuti:.0f} min, "
-                 f"fino alle {time.strftime('%H:%M', time.localtime(self.boost_fino))}")
-        self._cambiato()
-        return True, (f"Boost attivo fino alle "
-                      f"{time.strftime('%H:%M', time.localtime(self.boost_fino))}")
-
-    def annulla_boost(self):
-        if self.boost_fino is None:
-            return True, "Nessun boost attivo"
-        self.boost_fino = None
-        self.log("[PIANO] Boost annullato")
-        self._cambiato()
-        return True, "Boost annullato"
-
     def imposta_obiettivo(self, kwh, entro):
         """`entro`: timestamp. Ritorna (ok, messaggio)."""
         try:
@@ -157,20 +124,13 @@ class Pianificatore:
     # Stato
     # ------------------------------------------------------------------
     def controlla(self):
-        """Scadenze del boost e dell'obiettivo. Idempotente, la si chiama
+        """Scadenza dell'obiettivo. Idempotente, la si chiama
         spesso (a ogni quota e dal thread periodico)."""
         with self._lock:
             self._controlla()
 
     def _controlla(self):
         adesso = self.ora()
-        if self.boost_fino is not None and adesso >= self.boost_fino:
-            self.boost_fino = None
-            self.log("[PIANO] Boost finito: torno alla modalita' "
-                     f"{NOMI_MODALITA.get(self.config.get('MODALITA'), '?')}")
-            self.avvisa("⏱️ Boost finito: torno alla modalità "
-                        f"*{NOMI_MODALITA.get(self.config.get('MODALITA'), '?')}*.")
-            self._cambiato()
         ob = self.obiettivo
         if ob is not None and adesso >= ob['entro']:
             mancano = ob['kwh'] - ob['fatti']
@@ -183,8 +143,6 @@ class Pianificatore:
             self._cambiato()
 
     def modalita_effettiva(self):
-        if self.boost_fino is not None and self.ora() < self.boost_fino:
-            return 'veloce'
         modalita = self.config.get('MODALITA', 'misto')
         return modalita if modalita in MODALITA else 'misto'
 
@@ -255,11 +213,8 @@ class Pianificatore:
                          'minuti_rimasti': max(0, round((ob['entro'] - adesso) / 60)),
                          'potenza_necessaria': round(necessaria) if necessaria is not None else None,
                          'in_recupero': self.in_recupero}
-        boost = self.boost_fino if self.boost_fino is not None and self.boost_fino > adesso else None
         return {'modalita': self.config.get('MODALITA', 'misto'),
                 'modalita_effettiva': self.modalita_effettiva(),
-                'boost_fino': boost,
-                'boost_minuti_rimasti': round((boost - adesso) / 60) if boost else 0,
                 'obiettivo': obiettivo,
                 'quota_w': self.ultima_quota}
 
@@ -267,9 +222,6 @@ class Pianificatore:
         """Una riga per Telegram."""
         s = self.stato()
         testo = NOMI_MODALITA[s['modalita_effettiva']]
-        if s['boost_fino']:
-            testo += (f" (boost fino alle "
-                      f"{time.strftime('%H:%M', time.localtime(s['boost_fino']))})")
         ob = s['obiettivo']
         if ob:
             testo += (f"\n🎯 Obiettivo {ob['fatti']:.1f}/{ob['kwh']:g} kWh entro "

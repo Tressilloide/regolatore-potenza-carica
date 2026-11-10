@@ -123,7 +123,7 @@ function setCampo(id, valore) {
 function mostraSporchi() {
     $('non_salvate').hidden = ![...sporchi].some(id => id !== 'limite');
 }
-['prelevabile', 'protezione', 'prezzo_acquisto', 'prezzo_vendita', 'limite'].forEach(id => {
+['protezione', 'prezzo_acquisto', 'prezzo_vendita', 'limite'].forEach(id => {
     $(id).addEventListener('input', () => { sporchi.add(id); mostraSporchi(); if (ultimo) mostraLimite(ultimo); });
 });
 
@@ -162,6 +162,7 @@ async function aggiorna() {
     mostraOggi(d.energia || {});
     mostraColonnina(s, c);
     mostraImpostazioni(c);
+    mostraFasi(s);
     mostraTecnici(d);
     testo('piede_ora', 'aggiornato alle ' + new Date(s.server_time * 1000).toLocaleTimeString('it-IT'));
 }
@@ -315,9 +316,8 @@ $('btn_scena').addEventListener('click', () => {
 });
 
 /* ------------------------------------------------------------------
-   Carica: modalita', boost, obiettivo, limite
+   Carica: modalita', prelevabile, obiettivo, limite
    ------------------------------------------------------------------ */
-const NOMI_MODALITA = { sole: 'Solo sole', misto: 'Sole + rete', veloce: 'Veloce' };
 
 function mostraCarica(d, b) {
     const s = d.status, c = d.config, p = d.piano;
@@ -338,19 +338,18 @@ function mostraCarica(d, b) {
     });
     const tetto = c.limite_contatore - (c.margine_contatore || 0);
     let nota;
-    if (p.boost_fino) {
-        nota = 'Boost: Veloce fino alle ' + ora(p.boost_fino) + ' (ancora ' + durata(p.boost_minuti_rimasti)
-             + '), poi si torna a ' + NOMI_MODALITA[p.modalita] + '.';
-    } else if (p.modalita === 'sole') {
-        nota = 'L’auto prende solo il sole che avanza alla casa. Parte da ' + watt(c.potenza_minima) + ' di avanzo.';
+    if (p.modalita === 'sole') {
+        nota = 'L’auto prende solo il sole che avanza alla casa (parte da ' + watt(c.potenza_minima)
+             + ' di avanzo). Il prelevabile qui sopra non conta.';
     } else if (p.modalita === 'misto') {
-        nota = 'Oltre al sole, l’auto può prendere fino a ' + watt(p.prelevabile_w)
-             + ' dalla rete (si cambia nelle impostazioni).';
+        nota = 'Oltre al sole, l’auto può prendere dalla rete fino al prelevabile, in aggiunta a quello che '
+             + 'preleva la casa. In tutto si resta sotto ' + watt(tetto) + ' (limite del contatore).';
     } else {
-        nota = 'L’auto prende tutto quello che il contatore permette: fino a ' + watt(tetto) + ' di prelievo, casa compresa.';
+        nota = 'L’auto prende tutto quello che il contatore permette: fino a ' + watt(tetto)
+             + ' di prelievo, casa compresa. Il prelevabile qui sopra non conta.';
     }
     testo('nota_modalita', nota);
-    $('btn_boost_off').disabled = !p.boost_fino;
+    mostraPrelevabile(c, p);
 
     const ob = p.obiettivo;
     $('box_obiettivo').hidden = !ob;
@@ -368,6 +367,45 @@ function mostraCarica(d, b) {
               + ' in media, si integra quando arrivano al minimo della colonnina (' + watt(c.potenza_minima) + ').');
     }
 }
+
+/* Prelevabile: il cursore e il campo numerico mostrano lo stesso valore, e
+   il comando parte quando si rilascia il cursore o si conferma il numero.
+   Mentre lo si tocca, il valore che arriva dal Pi non lo sovrascrive. */
+const prel = $('prelevabile'), prelNum = $('prelevabile_num');
+let prelInModifica = false;
+
+function mostraPrelevabile(c, p) {
+    const massimo = c.limite_contatore || 6600;
+    prel.max = prelNum.max = massimo;
+    if (!prelInModifica && document.activeElement !== prel && document.activeElement !== prelNum) {
+        prel.value = prelNum.value = c.prelevabile;
+    }
+    testo('prelevabile_kw', watt(Number(prel.value)));
+    $('box_prelevabile').classList.toggle('inattivo', p.modalita !== 'misto');
+}
+async function inviaPrelevabile(grezzo) {
+    const massimo = Number(prel.max) || 6600;
+    let v = Math.round(Number(String(grezzo).replace(',', '.')));
+    if (!Number.isFinite(v)) { esito('Prelevabile: valore non valido.', false, 'esito_carica'); prelInModifica = false; return; }
+    v = Math.min(massimo, Math.max(0, v));
+    prel.value = prelNum.value = v;
+    testo('prelevabile_kw', watt(v));
+    await comando('prelevabile', v);
+    prelInModifica = false;
+}
+prel.addEventListener('input', () => {
+    prelInModifica = true;
+    prelNum.value = prel.value;
+    testo('prelevabile_kw', watt(Number(prel.value)));
+});
+prel.addEventListener('change', () => inviaPrelevabile(prel.value));
+prelNum.addEventListener('input', () => {
+    prelInModifica = true;
+    const v = Number(prelNum.value);
+    if (Number.isFinite(v)) { prel.value = v; testo('prelevabile_kw', watt(Math.min(Number(prel.max), Math.max(0, v)))); }
+});
+prelNum.addEventListener('change', () => inviaPrelevabile(prelNum.value));
+prelNum.addEventListener('keydown', e => { if (e.key === 'Enter') prelNum.blur(); });
 
 function mostraLimite(d) {
     const s = d.status, c = d.config;
@@ -398,8 +436,6 @@ async function impostaLimite(attivo) {
 
 document.querySelectorAll('#seg_modalita button').forEach(el =>
     el.addEventListener('click', () => comando('modalita', el.dataset.m)));
-$('btn_boost').addEventListener('click', () => comando('boost', 60));
-$('btn_boost_off').addEventListener('click', () => comando('boost', 0));
 $('btn_ob_off').addEventListener('click', () => comando('obiettivo', 'off'));
 $('btn_limite_on').addEventListener('click', () => impostaLimite(true));
 $('btn_limite_off').addEventListener('click', () => impostaLimite(false));
@@ -450,19 +486,29 @@ function mostraColonnina(s, c) {
 }
 
 function mostraImpostazioni(c) {
-    setCampo('prelevabile', c.prelevabile);
     setCampo('protezione', c.protezione);
     setCampo('prezzo_acquisto', c.prezzo_acquisto);
     setCampo('prezzo_vendita', c.prezzo_vendita);
-    testo('limite_contatore', nf0.format(c.limite_contatore - (c.margine_contatore || 0)));
+}
+
+function mostraFasi(s) {
+    const fasi = s.fasi || [];
+    /* una sola scala per le sei barre, mai sotto 1 kW: cosi' 50 W non sembrano tanti */
+    const scala = Math.max(1000, ...fasi.map(v => Math.abs(v || 0)));
+    fasi.forEach((v, i) => {
+        testo('l' + (i + 1), watt(v));
+        const barra = $('l' + (i + 1) + '_b');
+        if (barra) barra.style.width = Math.min(100, Math.abs(v || 0) / scala * 100) + '%';
+    });
+    testo('tot_grid', watt(s.grid_total));
+    testo('tot_solar', watt(s.solar_total));
+    const eta = s.last_fasi ? Math.max(0, Math.round(s.server_time - s.last_fasi)) : null;
+    testo('fasi_eta', eta === null ? '' : (eta < 120 ? 'misura di ' + eta + ' s fa' : 'misura di ' + durata(eta / 60) + ' fa'));
 }
 
 let righeLog = [];
 function mostraTecnici(d) {
     const s = d.status;
-    (s.fasi || []).forEach((v, i) => testo('l' + (i + 1), watt(v)));
-    testo('tot_grid', watt(s.grid_total));
-    testo('tot_solar', watt(s.solar_total));
     if (d.logs_completi) righeLog = d.logs || [];
     else if (d.logs && d.logs.length) righeLog = righeLog.concat(d.logs).slice(-300);
     else if (logSeq !== null) { logSeq = d.log_seq; return; }
@@ -481,14 +527,13 @@ async function salva() {
         if (grezzo === '' || !Number.isFinite(v) || v < 0) { errori.push(nome + ': valore non valido'); return; }
         corpo[id] = intero ? Math.round(v) : v;
     };
-    leggi('prelevabile', 'Prelevabile', true);
     leggi('protezione', 'Soglia di protezione', true);
     leggi('prezzo_acquisto', 'Prezzo di acquisto', false);
     leggi('prezzo_vendita', 'Prezzo di vendita', false);
     if (errori.length) { esito('Correggi:\n' + errori.join('\n'), false); return; }
     const { ok, dati } = await invia('/api/settings', corpo);
     if (!ok) { esito('Salvataggio non riuscito:\n' + (dati.errori || [dati.messaggio || 'errore sconosciuto']).join('\n'), false); return; }
-    ['prelevabile', 'protezione', 'prezzo_acquisto', 'prezzo_vendita'].forEach(id => sporchi.delete(id));
+    ['protezione', 'prezzo_acquisto', 'prezzo_vendita'].forEach(id => sporchi.delete(id));
     mostraSporchi();
     esito('Impostazioni salvate.', true);
     aggiorna();
@@ -498,7 +543,7 @@ $('btn_salva').addEventListener('click', salva);
 $('btn_reinit').addEventListener('click', async () => {
     if (!confirm('Re-inizializzare la colonnina? La carica in corso continua, ma un limite di energia attivo viene tolto.')) return;
     const { ok, dati } = await invia('/api/init_wallbox');
-    esito(ok ? 'Re-inizializzazione avviata: segui il registro nei dettagli tecnici.' : 'Errore: ' + (dati.error || 'comando non riuscito'), ok);
+    esito(ok ? 'Re-inizializzazione avviata: segui il registro in fondo alla pagina.' : 'Errore: ' + (dati.error || 'comando non riuscito'), ok);
 });
 
 /* ------------------------------------------------------------------

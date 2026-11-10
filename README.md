@@ -142,7 +142,7 @@ File principali:
 | `regolatore_classico.py` | L'algoritmo classico. Senza dipendenze esterne, lo usa anche il simulatore |
 | `regolatore_pid.py` | L'algoritmo PID e lo stimatore dello scambio ogni 6 s. Senza dipendenze esterne, lo usa anche il simulatore |
 | `protezione_contatore.py` | Prelievo concesso e protezione del contatore. Senza dipendenze esterne |
-| `pianificatore.py` | Modalità di carica, boost e obiettivo kWh: decide la quota di rete per l'auto (4.4). Senza dipendenze esterne |
+| `pianificatore.py` | Modalità di carica e obiettivo kWh: decide la quota di rete per l'auto (4.4). Senza dipendenze esterne |
 | `test_regolatore.py` | Test automatici (sezione 6) |
 | `ponte_mqtt.py` | Invio dei dati al server (Home Assistant e archivio) |
 | `simulatore_regolatore.py` | Prova gli algoritmi sul PC con i dati veri (sezione 7) |
@@ -214,7 +214,7 @@ più basso l'auto non parte.
 Fino al 3/11/2026 il prelevabile era il totale, casa compresa. Il campo
 `prelevabile_w` nell'archivio cambia significato da quella data.
 
-### 4.4 Modalità di carica, boost e obiettivo
+### 4.4 Modalità di carica e obiettivo
 
 `pianificatore.py` decide la **quota dell'auto** (4.3). Il limite del
 contatore e la sua protezione (4.7) valgono in ogni caso.
@@ -225,8 +225,6 @@ contatore e la sua protezione (4.7) valgono in ogni caso.
 | **Sole + rete** (`misto`) | `POTENZA_PRELEVABILE` (il comportamento di prima) |
 | **Veloce** (`veloce`) | Quanto il contatore permette: fino a 6300 W di prelievo in tutto, casa compresa |
 
-- **Boost:** Veloce per un certo tempo (di default 1 ora), poi si torna
-  alla modalità scelta. Sopravvive a un riavvio del servizio.
 - **Obiettivo:** "N kWh in auto entro le HH:MM". Si carica col sole
   finché basta. Quando la potenza media necessaria per finire in tempo
   (kWh mancanti / ore rimaste / 0,9) arriva al minimo della colonnina, si
@@ -243,8 +241,9 @@ contatore e la sua protezione (4.7) valgono in ogni caso.
     23: fino alle 4:20 circa si aspetta, poi si carica a ~4,5 kW.
 
 Si comanda dalla pagina web (scheda Carica), da Telegram (`/modalita`,
-`/boost`, `/obiettivo`) e da Home Assistant (5.1). Boost e obiettivo sono
-salvati in `pianificazione.json`.
+`/obiettivo`) e da Home Assistant (5.1). L'obiettivo è salvato in
+`pianificazione.json`. Il boost (Veloce a tempo), aggiunto la mattina del
+10/11/2026, è stato tolto lo stesso giorno.
 
 ### 4.5 Algoritmo classico
 
@@ -364,17 +363,21 @@ nulla da internet: three.js r160 e Chart.js 4.4.1 sono in `web/vendor/`.
   - Il pulsante "Vista semplice" la sostituisce con quattro riquadri; lo
     stesso succede da solo se il browser non ha WebGL. I numeri sono
     etichette HTML sopra la scena, quindi ci sono sempre.
-- **Carica:** modalità, boost, obiettivo con barra di avanzamento, limite di
-  energia. Questi comandi valgono subito.
+- **Carica:** modalità, prelevabile per l'auto (cursore da 0 al limite del
+  contatore, con accanto il valore in watt da scrivere a mano), obiettivo
+  con barra di avanzamento, limite di energia. Questi comandi valgono
+  subito.
 - **Oggi:** energia del giorno, quota della ricarica coperta dal sole,
   autoconsumo (quanto del sole è stato usato in casa) e autosufficienza
   (quanta parte dei consumi ha coperto il sole).
 - **Andamento:** produzione contro consumi (casa + auto impilati), su 1 ora,
   6 ore, 24 ore o 7 giorni. **Ultimi 14 giorni:** kWh in auto dal sole e
   dalla rete, e kWh prodotti. Ogni grafico ha anche i dati in tabella.
-- **Colonnina**, **sessioni**, **impostazioni** (prelevabile, soglia di
-  protezione, prezzi: valgono solo dopo "Salva impostazioni") e **dettagli
-  tecnici** (fasi e registro del servizio).
+- **Fasi:** consumo e produzione di L1, L2 e L3, sempre visibili sopra gli
+  ultimi 14 giorni, con l'età della misura (arriva ogni 60 s).
+- **Colonnina**, **sessioni**, **impostazioni** (soglia di protezione e
+  prezzi: valgono solo dopo "Salva impostazioni") e il **registro del
+  servizio**.
 - Tema chiaro, scuro o automatico (pulsante in alto a destra). Si può
   aggiungere alla schermata Home del telefono.
 - A pagina nascosta il browser smette di interrogare il Pi.
@@ -386,7 +389,7 @@ nulla da internet: three.js r160 e Chart.js 4.4.1 sono in `web/vendor/`.
 | `GET /api/storico?range=1h\|6h\|24h\|7g` | Storico per i grafici |
 | `GET /api/giorni`, `GET /api/sessioni` | Storico giornaliero e sessioni |
 | `POST /api/settings` | Salva le impostazioni (tutto o niente) |
-| `POST /api/comando` | `{"nome": "modalita"\|"prelevabile"\|"boost"\|"obiettivo", "valore": ...}`, come i comandi Telegram |
+| `POST /api/comando` | `{"nome": "modalita"\|"prelevabile"\|"obiettivo", "valore": ...}`, come i comandi Telegram |
 | `POST /api/limite_toggle` | Attiva/disattiva il limite kWh |
 | `POST /api/init_wallbox` | Re-inizializza la colonnina |
 | `GET /api/wallbox_raw` | JSON grezzo della colonnina, per diagnosi |
@@ -406,7 +409,6 @@ modifica, quindi il browser prende subito quelli nuovi).
 | `/accendi`, `/spegni` | Forza accensione/spegnimento. Dopo `/spegni` il regolatore non riaccende finché non arriva `/accendi` |
 | `/reset` | Re-inizializza la colonnina |
 | `/modalita [sole\|misto\|veloce]` | Modalità di carica (4.4) |
-| `/boost [minuti\|off]` | Veloce per un po' (default 60 minuti) |
 | `/obiettivo <kWh> <HH:MM>`, `/obiettivo off` | Obiettivo di carica, per esempio `/obiettivo 15 7:30` |
 | `/prelevabile <W>`, `/protezione <W>` | Prelevabile per l'auto (modalità Sole + rete), soglia di protezione |
 | `/limite <kWh>` | Limite di energia |
@@ -419,7 +421,7 @@ Notifiche automatiche:
   non raggiungibile o non in modalità `Man`.
 - **Potenza:** potenza massima raggiunta, carica spenta per poco sole,
   intervento del limite del contatore ⚡.
-- **Pianificazione:** boost finito, obiettivo raggiunto 🎯 o non raggiunto
+- **Pianificazione:** obiettivo raggiunto 🎯 o non raggiunto
   entro la scadenza, obiettivo annullato perché l'auto è stata scollegata.
 - **Allarmi:** sensore muto da 5 minuti, presa a 60 °C (attenzione) o 70 °C
   (allarme), limite kWh sparito dalla colonnina.
@@ -461,7 +463,7 @@ Cartella `/home/tressilloide/solar/regolatore-potenza-carica`:
 | `storico.jsonl` | Un campione al minuto `[ts, consumo, produzione, auto]`, ultimi 7 giorni |
 | `storico_giornaliero.json` | Totali di ogni giorno |
 | `sessioni.json` | Ultime 200 sessioni di ricarica |
-| `pianificazione.json` | Boost e obiettivo in corso |
+| `pianificazione.json` | Obiettivo in corso |
 | `stato_energia.json` | Contatori di oggi, per ripartire dopo un riavvio |
 | `venv/` | L'ambiente Python del servizio |
 
@@ -479,15 +481,15 @@ Il Pi pubblica su Mosquitto del server (192.168.1.36:1883, utente
 | `solare/pi/online` | `online` / `offline` (retained, ultimo messaggio automatico se il Pi sparisce) |
 | `solare/pi/stato` | Un JSON al minuto, subito dopo ogni `electricity` (retained) |
 | `solare/pi/sessione` | L'ultima sessione di ricarica chiusa (retained) |
-| `solare/pi/controlli` | Modalità, prelevabile, boost e obiettivo (retained), a ogni cambio e ogni minuto |
-| `solare/pi/cmd/<comando>` | **Comandi** verso il Pi, non retained: `modalita` (`sole`/`misto`/`veloce`), `prelevabile` (W), `boost` (minuti, 0 = annulla), `obiettivo` (`15 7:30` o `off`) |
+| `solare/pi/controlli` | Modalità, prelevabile e obiettivo (retained), a ogni cambio e ogni minuto |
+| `solare/pi/cmd/<comando>` | **Comandi** verso il Pi, non retained: `modalita` (`sole`/`misto`/`veloce`), `prelevabile` (W), `obiettivo` (`15 7:30` o `off`) |
 | `homeassistant/device/colonnina_pi/config` | Annuncio automatico per Home Assistant (MQTT Discovery) |
 
 Il JSON al minuto contiene:
 
 - **auto e colonnina:** `auto_w`, `setpoint_w`, `pcar_w`, stato della
   colonnina, fase, algoritmo, `prelevabile_w`, kWh della sessione;
-- **pianificazione:** `modalita` (quella in vigore, boost compreso),
+- **pianificazione:** `modalita`,
   `quota_rete_auto_w`, e con un obiettivo `obiettivo_kwh` e
   `obiettivo_fatti_kwh`;
 - **sole e rete come li vede il Pi:** `produzione_w`, `consumo_w`,
@@ -511,8 +513,7 @@ In Home Assistant compare il dispositivo **Colonnina**:
 | `sensor.colonnina_ultima_sessione` | kWh dell'ultima sessione, con i dettagli negli attributi |
 | `select.colonnina_modalita` | **Comando:** modalità di carica (`sole`, `misto`, `veloce`) |
 | `number.colonnina_prelevabile_per_l_auto` | **Comando:** prelevabile per l'auto, 0-6600 W |
-| `button.colonnina_boost_1_ora`, `button.colonnina_annulla_boost` | **Comando:** boost di un'ora, annulla boost |
-| `sensor.colonnina_modalita_attiva` | Modalità in vigore (boost compreso); boost e obiettivo negli attributi |
+| `sensor.colonnina_modalita_attiva` | Modalità in vigore, con l'obiettivo negli attributi |
 | `sensor.colonnina_obiettivo_caricato` | kWh caricati per l'obiettivo in corso |
 
 Senza aggiornamenti per 5 minuti i sensori diventano "non disponibili".
@@ -684,7 +685,7 @@ Dopo un riavvio:
 
 - la carica in corso continua;
 - il limite kWh resta com'è sulla colonnina;
-- modalità, boost e obiettivo ripartono da dove erano.
+- modalità e obiettivo ripartono da dove erano.
 
 Comandi utili sul Pi (altri in `comandi.txt`):
 

@@ -89,6 +89,26 @@
                 </details>
             </section>
 
+            <!-- ============ Fasi ============ -->
+            <section class="scheda" data-ordine="7" aria-labelledby="t_fasi">
+                <div class="scheda-testa"><h2 id="t_fasi">Fasi</h2><span class="nota" id="fasi_eta"></span></div>
+                <table class="fasi">
+                    <thead><tr><th></th><th>Consumo</th><th>Produzione</th></tr></thead>
+                    <tbody>
+                        <tr><th>L1</th>
+                            <td><span id="l1">--</span><span class="barra"><i id="l1_b" class="b-neutro"></i></span></td>
+                            <td><span id="l4">--</span><span class="barra"><i id="l4_b" class="b-sole"></i></span></td></tr>
+                        <tr><th>L2</th>
+                            <td><span id="l2">--</span><span class="barra"><i id="l2_b" class="b-neutro"></i></span></td>
+                            <td><span id="l5">--</span><span class="barra"><i id="l5_b" class="b-sole"></i></span></td></tr>
+                        <tr><th>L3</th>
+                            <td><span id="l3">--</span><span class="barra"><i id="l3_b" class="b-neutro"></i></span></td>
+                            <td><span id="l6">--</span><span class="barra"><i id="l6_b" class="b-sole"></i></span></td></tr>
+                        <tr class="totale"><th>Totale</th><td><span id="tot_grid">--</span></td><td><span id="tot_solar">--</span></td></tr>
+                    </tbody>
+                </table>
+            </section>
+
             <!-- ============ Ultimi giorni ============ -->
             <section class="scheda" data-ordine="8" aria-labelledby="t_giorni">
                 <div class="scheda-testa"><h2 id="t_giorni">Ultimi 14 giorni</h2></div>
@@ -117,21 +137,10 @@
                 <ul class="sessioni" id="elenco_sessioni"></ul>
             </section>
 
-            <!-- ============ Dettagli tecnici ============ -->
+            <!-- ============ Registro ============ -->
             <section class="scheda" data-ordine="10" aria-labelledby="t_tecnici">
                 <details id="dettagli_tecnici">
-                    <summary><h2 id="t_tecnici">Dettagli tecnici</h2></summary>
-                    <h3>Fasi</h3>
-                    <table class="fasi">
-                        <thead><tr><th></th><th>Consumo</th><th>Produzione</th></tr></thead>
-                        <tbody>
-                            <tr><th>L1</th><td id="l1">--</td><td id="l4">--</td></tr>
-                            <tr><th>L2</th><td id="l2">--</td><td id="l5">--</td></tr>
-                            <tr><th>L3</th><td id="l3">--</td><td id="l6">--</td></tr>
-                            <tr class="totale"><th>Totale</th><td id="tot_grid">--</td><td id="tot_solar">--</td></tr>
-                        </tbody>
-                    </table>
-                    <h3>Registro</h3>
+                    <summary><h2 id="t_tecnici">Registro del servizio</h2></summary>
                     <pre class="registro" id="registro" tabindex="0" aria-label="Registro del servizio"></pre>
                 </details>
             </section>
@@ -148,12 +157,22 @@
                     <button type="button" data-m="misto"><b>Sole + rete</b><span id="seg_misto_w">--</span></button>
                     <button type="button" data-m="veloce"><b>Veloce</b><span>massima</span></button>
                 </div>
-                <p class="nota" id="nota_modalita">--</p>
 
-                <div class="riga-azioni">
-                    <button type="button" class="b-secondario" id="btn_boost">Boost 1 ora</button>
-                    <button type="button" class="b-secondario" id="btn_boost_off" disabled>Annulla boost</button>
+                <div class="prelevabile" id="box_prelevabile">
+                    <div class="prelevabile-testa">
+                        <label for="prelevabile">Prelevabile dalla rete per l’auto</label>
+                        <b id="prelevabile_kw">--</b>
+                    </div>
+                    <div class="prelevabile-riga">
+                        <input type="range" id="prelevabile" min="0" max="6600" step="100">
+                        <span class="con-unita">
+                            <input type="number" id="prelevabile_num" min="0" max="6600" step="100" inputmode="numeric"
+                                   aria-label="Prelevabile dalla rete per l’auto, in watt">
+                            <i aria-hidden="true">W</i>
+                        </span>
+                    </div>
                 </div>
+                <p class="nota" id="nota_modalita">--</p>
 
                 <hr>
 
@@ -231,11 +250,6 @@
             <!-- ============ Impostazioni ============ -->
             <section class="scheda" data-ordine="9" aria-labelledby="t_impostazioni">
                 <div class="scheda-testa"><h2 id="t_impostazioni">Impostazioni</h2></div>
-                <label class="campo"><span>Prelevabile dalla rete per l’auto (W)</span>
-                    <input type="number" id="prelevabile" min="0" max="20000" step="100" inputmode="numeric">
-                    <small>Vale in modalità Sole + rete, in aggiunta a quello che preleva la casa. In tutto si
-                        resta sotto <span id="limite_contatore">--</span> W (limite del contatore).</small>
-                </label>
                 <label class="campo"><span>Soglia di protezione (W)</span>
                     <input type="number" id="protezione" min="50" max="5000" step="50" inputmode="numeric">
                     <small>Variazioni più piccole non vengono inviate alla colonnina.</small>
