@@ -519,6 +519,59 @@ sudo systemctl restart solar_web.service
 In alternativa, sul Pi, `git pull` da GitHub. Si lavora anche direttamente sul
 Pi: prima di fondere un branch, controllare che `main` non sia andato avanti.
 
+### Dal server di casa (192.168.1.36)
+
+Sul server c'è un clone del progetto in
+`/DATA/Documents/claude/regolatore-potenza-carica`, per lavorarci anche con
+Claude Code direttamente da lì:
+
+```sh
+ssh tressilloide@192.168.1.36
+cd /DATA/Documents/claude/regolatore-potenza-carica
+claude
+```
+
+**Accesso al Pi.** Dal server si entra nel Pi con `ssh pi`, senza password:
+
+| Dove | Cosa |
+|---|---|
+| Server, `~/.ssh/solarpi` | Chiave privata dedicata (ed25519, senza passphrase) |
+| Server, `~/.ssh/config` | Alias `pi` (anche `solarpi`, `raspberry`): 192.168.1.23, utente `tressilloide`, chiave `~/.ssh/solarpi` |
+| Server, `~/.ssh/known_hosts` | Chiave host del Pi, impronta `SHA256:HnqQm701gsT5UHn+DeXDaLlQvMNa8QbXwkV7VYOl514` |
+| Pi, `~/.ssh/authorized_keys` | Chiave pubblica del server, riga con il commento `serverbello-claude` |
+
+Sul Pi `sudo` non chiede password, quindi da lì si può anche riavviare il
+servizio. Prove rapide dal server:
+
+```sh
+ssh pi 'hostname; systemctl is-active solar_web.service'
+ssh pi 'journalctl -u solar_web.service -n 30 -o cat'
+```
+
+Per revocare l'accesso del server basta togliere dal Pi la riga
+`serverbello-claude` in `~/.ssh/authorized_keys`.
+
+**Deploy dal server.** Nel clone c'è il remote git `pi`, che punta alla
+cartella del progetto sul Pi:
+
+```sh
+# sul server, nella cartella del clone
+git push pi main:tmp/main
+ssh pi 'cd /home/tressilloide/solar/regolatore-potenza-carica \
+  && git merge --ff-only tmp/main && git branch -D tmp/main \
+  && ./venv/bin/python3 -m py_compile solar_webinterface.py regolatore_pid.py protezione_contatore.py ponte_mqtt.py'
+ssh pi 'sudo systemctl restart solar_web.service'
+```
+
+Da sapere sul clone del server:
+
+- **Commit:** git non ha ancora nome ed email configurati (`git config
+  user.name` / `user.email`).
+- **GitHub:** per fare push su GitHub servono credenziali, per esempio
+  `gh auth login` o un token.
+- **Configurazione sul server:** la descrizione completa è in
+  `/mnt/nas-hdd/backups/SERVER.md`, capitoli 13 e 17.
+
 Dopo un riavvio:
 
 - la carica in corso continua;
