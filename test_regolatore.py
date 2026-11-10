@@ -353,6 +353,17 @@ class TestServizio(unittest.TestCase):
         s = sw.leggi_sessioni(1)[0]
         self.assertLessEqual(s['fine'], time.time() - 690)
 
+    def test_niente_accensione_se_la_centralina_non_risponde(self):
+        wb = sw.WallboxController()
+        wb.sync_falliti = 3
+        with mock.patch.object(wb, 'send_command') as invio:
+            self.assertFalse(wb.turn_on())
+            invio.assert_not_called()
+        wb.sync_falliti = 0
+        with mock.patch.object(wb, 'send_command', return_value=True) as invio:
+            self.assertTrue(wb.turn_on())
+            self.assertEqual(invio.call_count, 2)       # potenza minima, poi accensione
+
     def test_api_comando_e_pagina(self):
         client = sw.app.test_client()
         r = client.post('/api/comando', json={'nome': 'modalita', 'valore': 'sole'})
@@ -372,9 +383,48 @@ class TestServizio(unittest.TestCase):
         r = client.get('/api/data')
         self.assertEqual(r.status_code, 200)
         self.assertIn('piano', r.get_json())
-        pagina = client.get('/').get_data(as_text=True)
+
+    def test_pagina_e_file_statici(self):
+        client = sw.app.test_client()
+        r = client.get('/')
+        self.assertEqual(r.status_code, 200)
+        pagina = r.get_data(as_text=True)
         self.assertIn('seg_modalita', pagina)
-        self.assertIn('impostaObiettivo', pagina)
+        self.assertIn('form_obiettivo', pagina)
+        self.assertNotIn('__V__', pagina)           # versione dei file sostituita
+        self.assertEqual(r.headers.get('Cache-Control'), 'no-cache')
+        # tutto quello che la pagina carica arriva dal Pi, niente CDN
+        self.assertNotIn('https://', pagina)
+        for percorso in ('app.js', 'app.css', 'scena3d.js', 'icona.svg', 'manifest.webmanifest',
+                         'vendor/three.module.min.js', 'vendor/chart.umd.min.js'):
+            with client.get('/static/' + percorso) as f:
+                self.assertEqual(f.status_code, 200, percorso)
+
+    def test_api_data_leggera(self):
+        client = sw.app.test_client()
+        sw.SYSTEM_STATE['LOGS'].clear()
+        for i in range(5):
+            sw.SYSTEM_STATE['LOGS'].append(f'riga {i}')
+        sw.SYSTEM_STATE['LOG_SEQ'] = 105
+        tutto = client.get('/api/data').get_json()
+        self.assertIn('history', tutto)
+        self.assertEqual(len(tutto['logs']), 5)
+        self.assertTrue(tutto['logs_completi'])
+        self.assertEqual(tutto['log_seq'], 105)
+        for chiave in ('potenza_minima', 'potenza_massima', 'margine_contatore'):
+            self.assertIn(chiave, tutto['config'])
+        for chiave in ('auto_collegata', 'in_carica', 'picco_solare_w'):
+            self.assertIn(chiave, tutto['status'])
+        leggero = client.get('/api/data?storia=0&log_da=103').get_json()
+        self.assertNotIn('history', leggero)
+        self.assertEqual(leggero['logs'], ['riga 3', 'riga 4'])
+        self.assertFalse(leggero['logs_completi'])
+        self.assertEqual(client.get('/api/data?storia=0&log_da=105').get_json()['logs'], [])
+        # pagina piu' avanti del servizio (riavviato) o troppo indietro: si rimanda tutto
+        for da in (900, 3):
+            d = client.get(f'/api/data?storia=0&log_da={da}').get_json()
+            self.assertTrue(d['logs_completi'], da)
+            self.assertEqual(len(d['logs']), 5)
 
 
 if __name__ == '__main__':

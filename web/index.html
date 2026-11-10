@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="color-scheme" content="light dark">
+    <meta name="theme-color" content="#f6f6f3" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="Casa solare">
+    <meta name="versione" content="__V__">
+    <title>Casa solare</title>
+    <link rel="icon" href="/static/icona.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="/static/icona.svg">
+    <link rel="manifest" href="/static/manifest.webmanifest">
+    <link rel="stylesheet" href="/static/app.css?v=__V__">
+</head>
+<body>
+<div class="pagina">
+
+    <header class="testata">
+        <div class="marchio">
+            <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
+                <circle cx="16" cy="16" r="6.5" fill="currentColor"/>
+                <g stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+                    <path d="M16 2.5v4M16 25.5v4M2.5 16h4M25.5 16h4M6.5 6.5l2.8 2.8M22.7 22.7l2.8 2.8M6.5 25.5l2.8-2.8M22.7 9.3l2.8-2.8"/>
+                </g>
+            </svg>
+            <div>
+                <h1>Casa solare</h1>
+                <p class="sottotitolo">Ricarica dell’auto con il fotovoltaico</p>
+            </div>
+        </div>
+        <div class="stati" id="stati" aria-live="polite">
+            <span class="stato" id="st_colonnina"><i class="punto"></i><span>Colonnina</span></span>
+            <span class="stato" id="st_sensore"><i class="punto"></i><span>Sensore</span></span>
+            <span class="stato" id="st_fase"><span>--</span></span>
+        </div>
+        <button type="button" class="b-icona" id="btn_tema" aria-label="Cambia tema" title="Tema: automatico">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 3.500a8.500 8.500 0 0 1 0 17z" fill="currentColor"/></svg>
+        </button>
+    </header>
+
+    <div id="avvisi" role="status"></div>
+
+    <main class="colonne">
+        <div class="colonna colonna-a">
+
+            <!-- ============ Scena ============ -->
+            <section class="scheda scheda-scena" aria-labelledby="t_scena">
+                <h2 id="t_scena" class="nascosto">Flussi di energia adesso</h2>
+                <div class="scena" id="scena" data-fase="giorno">
+                    <div class="scena-tela" id="scena_tela" aria-hidden="true"></div>
+                    <div class="etichette" id="etichette">
+                        <div class="etichetta" data-nodo="sole"><i class="tinta t-sole"></i><div><b id="n_sole">--</b><span>Produzione</span></div></div>
+                        <div class="etichetta" data-nodo="casa"><i class="tinta t-casa"></i><div><b id="n_casa">--</b><span>Casa</span></div></div>
+                        <div class="etichetta" data-nodo="auto"><i class="tinta t-auto"></i><div><b id="n_auto">--</b><span id="n_auto_nome">Auto</span></div></div>
+                        <div class="etichetta" data-nodo="rete"><i class="tinta t-rete"></i><div><b id="n_rete">--</b><span id="n_rete_nome">Rete</span></div></div>
+                    </div>
+                    <button type="button" class="b-scena" id="btn_scena" hidden>Vista 3D</button>
+                </div>
+                <div class="frase">
+                    <p id="frase">Lettura dei dati…</p>
+                    <p class="nota" id="frase_eta"></p>
+                </div>
+            </section>
+
+            <!-- ============ Andamento ============ -->
+            <section class="scheda" data-ordine="4" aria-labelledby="t_andamento">
+                <div class="scheda-testa">
+                    <h2 id="t_andamento">Andamento</h2>
+                    <div class="filtri" id="filtri_andamento" role="group" aria-label="Intervallo">
+                        <button type="button" data-r="1h" class="attivo">1 ora</button>
+                        <button type="button" data-r="6h">6 ore</button>
+                        <button type="button" data-r="24h">24 ore</button>
+                        <button type="button" data-r="7g">7 giorni</button>
+                    </div>
+                </div>
+                <div class="legenda" aria-hidden="true">
+                    <span><i class="tinta t-sole linea"></i>Produzione</span>
+                    <span><i class="tinta t-casa"></i>Casa</span>
+                    <span><i class="tinta t-auto"></i>Auto</span>
+                </div>
+                <div class="grafico"><canvas id="grafico_andamento" role="img" aria-label="Produzione, consumo della casa e potenza dell'auto nel tempo"></canvas></div>
+                <details class="tabella-dati">
+                    <summary>Dati in tabella</summary>
+                    <div class="tabella-scorri"><table id="tab_andamento"></table></div>
+                </details>
+            </section>
+
+            <!-- ============ Ultimi giorni ============ -->
+            <section class="scheda" data-ordine="8" aria-labelledby="t_giorni">
+                <div class="scheda-testa"><h2 id="t_giorni">Ultimi 14 giorni</h2></div>
+                <div class="riquadri riquadri-4">
+                    <div class="riquadro"><b id="g_solare">--</b><span>kWh prodotti</span></div>
+                    <div class="riquadro"><b id="g_auto">--</b><span>kWh in auto</span></div>
+                    <div class="riquadro"><b id="g_eff">--</b><span>dell’auto dal sole</span></div>
+                    <div class="riquadro"><b id="g_eur">--</b><span>risparmio stimato</span></div>
+                </div>
+                <div class="legenda" aria-hidden="true">
+                    <span><i class="tinta t-sole"></i>In auto dal sole</span>
+                    <span><i class="tinta t-rete"></i>In auto dalla rete</span>
+                    <span><i class="tinta t-neutro linea"></i>Prodotti dal fotovoltaico</span>
+                </div>
+                <div class="grafico grafico-basso"><canvas id="grafico_giorni" role="img" aria-label="Energia caricata in auto per giorno, dal sole e dalla rete, e energia prodotta"></canvas></div>
+                <details class="tabella-dati">
+                    <summary>Dati in tabella</summary>
+                    <div class="tabella-scorri"><table id="tab_giorni"></table></div>
+                </details>
+            </section>
+
+            <!-- ============ Sessioni ============ -->
+            <section class="scheda" data-ordine="6" aria-labelledby="t_sessioni">
+                <div class="scheda-testa"><h2 id="t_sessioni">Sessioni di ricarica</h2></div>
+                <div class="sessione-corso" id="sessione_corso" hidden></div>
+                <ul class="sessioni" id="elenco_sessioni"></ul>
+            </section>
+
+            <!-- ============ Dettagli tecnici ============ -->
+            <section class="scheda" data-ordine="10" aria-labelledby="t_tecnici">
+                <details id="dettagli_tecnici">
+                    <summary><h2 id="t_tecnici">Dettagli tecnici</h2></summary>
+                    <h3>Fasi</h3>
+                    <table class="fasi">
+                        <thead><tr><th></th><th>Consumo</th><th>Produzione</th></tr></thead>
+                        <tbody>
+                            <tr><th>L1</th><td id="l1">--</td><td id="l4">--</td></tr>
+                            <tr><th>L2</th><td id="l2">--</td><td id="l5">--</td></tr>
+                            <tr><th>L3</th><td id="l3">--</td><td id="l6">--</td></tr>
+                            <tr class="totale"><th>Totale</th><td id="tot_grid">--</td><td id="tot_solar">--</td></tr>
+                        </tbody>
+                    </table>
+                    <h3>Registro</h3>
+                    <pre class="registro" id="registro" tabindex="0" aria-label="Registro del servizio"></pre>
+                </details>
+            </section>
+
+        </div>
+        <div class="colonna colonna-b">
+
+            <!-- ============ Carica ============ -->
+            <section class="scheda" data-ordine="2" aria-labelledby="t_carica">
+                <div class="scheda-testa"><h2 id="t_carica">Carica</h2><span class="distintivo" id="carica_stato">--</span></div>
+
+                <div class="segmenti" id="seg_modalita" role="group" aria-label="Modalità di carica">
+                    <button type="button" data-m="sole"><b>Solo sole</b><span>niente rete</span></button>
+                    <button type="button" data-m="misto"><b>Sole + rete</b><span id="seg_misto_w">--</span></button>
+                    <button type="button" data-m="veloce"><b>Veloce</b><span>massima</span></button>
+                </div>
+                <p class="nota" id="nota_modalita">--</p>
+
+                <div class="riga-azioni">
+                    <button type="button" class="b-secondario" id="btn_boost">Boost 1 ora</button>
+                    <button type="button" class="b-secondario" id="btn_boost_off" disabled>Annulla boost</button>
+                </div>
+
+                <hr>
+
+                <h3>Obiettivo</h3>
+                <div class="obiettivo" id="box_obiettivo" hidden>
+                    <div class="obiettivo-testa"><b id="ob_testo">--</b><span id="ob_tempo">--</span></div>
+                    <div class="barra" role="progressbar" aria-valuemin="0" aria-valuemax="100" id="ob_prog"><i id="ob_barra"></i></div>
+                    <p class="nota" id="ob_nota">--</p>
+                    <button type="button" class="b-secondario" id="btn_ob_off">Annulla obiettivo</button>
+                </div>
+                <form class="obiettivo-nuovo" id="form_obiettivo">
+                    <label><span>kWh in auto</span><input type="number" id="ob_kwh" min="1" max="100" step="1" inputmode="decimal" placeholder="15"></label>
+                    <label><span>entro le</span><input type="time" id="ob_ora" value="07:30"></label>
+                    <button type="submit" class="b-secondario">Imposta</button>
+                </form>
+                <p class="nota" id="nota_obiettivo">Carica col sole finché basta; se non basta per finire in tempo,
+                    integra con la rete quanto serve, sempre entro il limite del contatore.</p>
+
+                <hr>
+
+                <h3>Limite di energia <span class="distintivo" id="limite_stato">--</span></h3>
+                <div class="limite">
+                    <input type="range" id="limite" min="1" max="100" step="1" aria-label="Limite in kWh">
+                    <output id="limite_val" for="limite">--</output>
+                </div>
+                <div class="riga-azioni">
+                    <button type="button" class="b-secondario" id="btn_limite_on">Imposta limite</button>
+                    <button type="button" class="b-secondario" id="btn_limite_off">Togli limite</button>
+                </div>
+                <p class="nota">La colonnina si ferma da sola quando la sessione arriva a questi kWh.</p>
+
+                <div id="esito_carica" class="esito" hidden></div>
+            </section>
+
+            <!-- ============ Oggi ============ -->
+            <section class="scheda" data-ordine="3" aria-labelledby="t_oggi">
+                <div class="scheda-testa"><h2 id="t_oggi">Oggi</h2></div>
+                <div class="riquadri">
+                    <div class="riquadro"><b id="e_solare">--</b><span>kWh prodotti</span></div>
+                    <div class="riquadro"><b id="e_import">--</b><span>kWh prelevati</span></div>
+                    <div class="riquadro"><b id="e_export">--</b><span>kWh immessi</span></div>
+                    <div class="riquadro"><b id="e_wb">--</b><span>kWh in auto</span></div>
+                    <div class="riquadro"><b id="e_wb_fv">--</b><span>di cui dal sole</span></div>
+                    <div class="riquadro"><b id="e_tempo">--</b><span>di carica</span></div>
+                </div>
+                <div class="misure">
+                    <div class="misura">
+                        <div class="misura-testa"><span>Ricarica coperta dal sole</span><b id="m_eff">--</b></div>
+                        <div class="barra"><i id="m_eff_bar" class="b-sole"></i></div>
+                    </div>
+                    <div class="misura">
+                        <div class="misura-testa"><span>Autoconsumo <small>(sole usato in casa)</small></span><b id="m_autoc">--</b></div>
+                        <div class="barra"><i id="m_autoc_bar" class="b-sole"></i></div>
+                    </div>
+                    <div class="misura">
+                        <div class="misura-testa"><span>Autosufficienza <small>(consumi coperti dal sole)</small></span><b id="m_autos">--</b></div>
+                        <div class="barra"><i id="m_autos_bar" class="b-sole"></i></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- ============ Colonnina ============ -->
+            <section class="scheda" data-ordine="5" aria-labelledby="t_colonnina">
+                <div class="scheda-testa"><h2 id="t_colonnina">Colonnina</h2><span class="distintivo" id="c_desc">--</span></div>
+                <dl class="righe">
+                    <div><dt>Potenza impostata</dt><dd id="c_set">--</dd></div>
+                    <div><dt>Potenza dell’auto</dt><dd id="c_pcar">--</dd></div>
+                    <div><dt>Dal collegamento</dt><dd id="c_sess">--</dd></div>
+                    <div><dt>Temperatura della presa</dt><dd id="c_temp">--</dd></div>
+                    <div><dt>Limiti di potenza</dt><dd id="c_limiti">--</dd></div>
+                    <div><dt>Algoritmo</dt><dd id="c_alg">--</dd></div>
+                </dl>
+            </section>
+
+            <!-- ============ Impostazioni ============ -->
+            <section class="scheda" data-ordine="9" aria-labelledby="t_impostazioni">
+                <div class="scheda-testa"><h2 id="t_impostazioni">Impostazioni</h2></div>
+                <label class="campo"><span>Prelevabile dalla rete per l’auto (W)</span>
+                    <input type="number" id="prelevabile" min="0" max="20000" step="100" inputmode="numeric">
+                    <small>Vale in modalità Sole + rete, in aggiunta a quello che preleva la casa. In tutto si
+                        resta sotto <span id="limite_contatore">--</span> W (limite del contatore).</small>
+                </label>
+                <label class="campo"><span>Soglia di protezione (W)</span>
+                    <input type="number" id="protezione" min="50" max="5000" step="50" inputmode="numeric">
+                    <small>Variazioni più piccole non vengono inviate alla colonnina.</small>
+                </label>
+                <div class="due">
+                    <label class="campo"><span>Prezzo di acquisto (€/kWh)</span>
+                        <input type="number" id="prezzo_acquisto" min="0" max="5" step="0.01" inputmode="decimal"></label>
+                    <label class="campo"><span>Prezzo di vendita (€/kWh)</span>
+                        <input type="number" id="prezzo_vendita" min="0" max="5" step="0.01" inputmode="decimal"></label>
+                </div>
+                <div id="non_salvate" class="esito ko" hidden>Modifiche non salvate: il regolatore usa ancora i valori di prima.</div>
+                <button type="button" class="b-primario" id="btn_salva">Salva impostazioni</button>
+                <button type="button" class="b-secondario largo" id="btn_reinit">Re-inizializza la colonnina</button>
+                <div id="esito" class="esito" hidden></div>
+            </section>
+
+        </div>
+    </main>
+
+    <footer class="piede">Regolatore di potenza della ricarica · <span id="piede_ora">--</span></footer>
+</div>
+
+<div class="suggerimento" id="suggerimento" hidden></div>
+
+<script src="/static/vendor/chart.umd.min.js" defer></script>
+<script type="module" src="/static/app.js?v=__V__"></script>
+</body>
+</html>

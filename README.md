@@ -137,7 +137,8 @@ File principali:
 
 | File | Cosa contiene |
 |---|---|
-| `solar_webinterface.py` | Il servizio: lettura del sensore, colonnina, pagina web, bot Telegram, storico, sessioni |
+| `solar_webinterface.py` | Il servizio: lettura del sensore, colonnina, API della pagina web, bot Telegram, storico, sessioni |
+| `web/` | La pagina web: `index.html`, `app.css`, `app.js`, la scena 3D `scena3d.js` e le librerie in `web/vendor/` (4.10) |
 | `regolatore_classico.py` | L'algoritmo classico. Senza dipendenze esterne, lo usa anche il simulatore |
 | `regolatore_pid.py` | L'algoritmo PID e lo stimatore dello scambio ogni 6 s. Senza dipendenze esterne, lo usa anche il simulatore |
 | `protezione_contatore.py` | Prelievo concesso e protezione del contatore. Senza dipendenze esterne |
@@ -345,31 +346,54 @@ aggiunge distacchi a quelli che la casa farebbe da sola.
 
 ### 4.10 Pagina web
 
-`http://192.168.1.23:5000`. Mostra:
+`http://192.168.1.23:5000`. Dal 10/11/2026 la pagina sta nella cartella
+`web/` (prima era una stringa dentro `solar_webinterface.py`) e non carica
+nulla da internet: three.js r160 e Chart.js 4.4.1 sono in `web/vendor/`.
 
-- sole, consumi per fase, prelievo o immissione, stato della colonnina;
-- scheda **Carica**: modalità, boost, obiettivo con barra di avanzamento.
-  Questi comandi valgono subito, senza "Salva impostazioni";
-- grafico dell'ultima ora e dello storico;
-- energia di oggi, sessioni, storico giornaliero;
-- console dei log;
-- impostazioni: prelevabile per l'auto, soglia di protezione, limite kWh,
-  prezzi.
-
-Le modifiche valgono solo dopo "Salva impostazioni". Finché ce ne sono di non
-salvate, compare un avviso rosso. Il pulsante del limite salva anche le altre
-modifiche in sospeso.
+- **Scena 3D** in alto: la casa con i pannelli, la colonnina, l'auto e il
+  palo della rete.
+  - Le palline lungo i cavi sono i flussi veri: quante e quanto veloci
+    dipende dai watt; sulla linea della rete il verso dice se si preleva o
+    si immette.
+  - Sole, luna, luci di casa e nuvole seguono l'ora e la produzione
+    (nuvole più fitte quando si produce meno del previsto per quell'ora).
+  - L'auto compare solo se è collegata; in carica la presa lampeggia.
+  - Si ruota trascinando, doppio clic per tornare alla vista iniziale.
+  - Sotto, una frase dice a parole cosa sta succedendo ("L'auto carica a
+    5,2 kW, tutta dal sole. Stai immettendo 2,2 kW in rete.").
+  - Il pulsante "Vista semplice" la sostituisce con quattro riquadri; lo
+    stesso succede da solo se il browser non ha WebGL. I numeri sono
+    etichette HTML sopra la scena, quindi ci sono sempre.
+- **Carica:** modalità, boost, obiettivo con barra di avanzamento, limite di
+  energia. Questi comandi valgono subito.
+- **Oggi:** energia del giorno, quota della ricarica coperta dal sole,
+  autoconsumo (quanto del sole è stato usato in casa) e autosufficienza
+  (quanta parte dei consumi ha coperto il sole).
+- **Andamento:** produzione contro consumi (casa + auto impilati), su 1 ora,
+  6 ore, 24 ore o 7 giorni. **Ultimi 14 giorni:** kWh in auto dal sole e
+  dalla rete, e kWh prodotti. Ogni grafico ha anche i dati in tabella.
+- **Colonnina**, **sessioni**, **impostazioni** (prelevabile, soglia di
+  protezione, prezzi: valgono solo dopo "Salva impostazioni") e **dettagli
+  tecnici** (fasi e registro del servizio).
+- Tema chiaro, scuro o automatico (pulsante in alto a destra). Si può
+  aggiungere alla schermata Home del telefono.
+- A pagina nascosta il browser smette di interrogare il Pi.
 
 | Indirizzo | Cosa fa |
 |---|---|
-| `GET /api/data` | Stato attuale, configurazione, ultima ora (la pagina lo chiede ogni 2 s) |
-| `GET /api/storico` | Storico per i grafici |
+| `GET /` e `GET /static/...` | La pagina e i suoi file (`web/`) |
+| `GET /api/data` | Stato attuale e configurazione, ogni 2 s. Con `storia=0` senza l'ultima ora di storico, con `log_da=N` solo le righe di registro dopo la numero N |
+| `GET /api/storico?range=1h\|6h\|24h\|7g` | Storico per i grafici |
 | `GET /api/giorni`, `GET /api/sessioni` | Storico giornaliero e sessioni |
-| `POST /api/settings` | Salva le impostazioni (tutto o niente) e invia il limite |
+| `POST /api/settings` | Salva le impostazioni (tutto o niente) |
 | `POST /api/comando` | `{"nome": "modalita"\|"prelevabile"\|"boost"\|"obiettivo", "valore": ...}`, come i comandi Telegram |
 | `POST /api/limite_toggle` | Attiva/disattiva il limite kWh |
 | `POST /api/init_wallbox` | Re-inizializza la colonnina |
 | `GET /api/wallbox_raw` | JSON grezzo della colonnina, per diagnosi |
+
+Per cambiare la pagina basta modificare i file in `web/` e fare il deploy:
+non serve riavviare il servizio (gli indirizzi dei file portano la data di
+modifica, quindi il browser prende subito quelli nuovi).
 
 ### 4.11 Telegram
 
@@ -377,7 +401,7 @@ modifiche in sospeso.
 |---|---|
 | `/info` | Stato del sistema, della colonnina e del limite |
 | `/energia`, `/storico [giorni]`, `/sessioni` | Energia di oggi, ultimi giorni, ultime sessioni |
-| `/grafici [15m\|1h\|6h\|24h]` | Grafico dell'andamento |
+| `/grafici [15m\|1h\|6h\|24h\|7g]` | Grafico dell'andamento |
 | `/fase` | Rilegge subito monofase/trifase |
 | `/accendi`, `/spegni` | Forza accensione/spegnimento. Dopo `/spegni` il regolatore non riaccende finché non arriva `/accendi` |
 | `/reset` | Re-inizializza la colonnina |
@@ -638,13 +662,13 @@ ssh pi 'sudo systemctl restart solar_web.service'
 
 **Test.** `python3 -m unittest -v test_regolatore` prova pianificatore,
 protezione e regolatore classico ovunque. I test del servizio (sessioni,
-API web) richiedono le librerie del venv del Pi; sul server non ci sono (né
-pip né venv), quindi li si lancia sul Pi in una cartella a parte, senza
-toccare il servizio:
+API web, pagina) richiedono le librerie del venv del Pi; sul server non ci
+sono (né pip né venv), quindi li si lancia sul Pi in una cartella a parte,
+senza toccare il servizio:
 
 ```sh
 ssh pi 'rm -rf /tmp/prova-regolatore && mkdir /tmp/prova-regolatore'
-scp *.py pi:/tmp/prova-regolatore/
+scp -r *.py web pi:/tmp/prova-regolatore/
 ssh pi 'cd /tmp/prova-regolatore && MPLCONFIGDIR=/tmp/prova-regolatore/.mpl \
   /home/tressilloide/solar/regolatore-potenza-carica/venv/bin/python -m unittest -v test_regolatore'
 ```
