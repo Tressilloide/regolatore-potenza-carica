@@ -156,6 +156,7 @@ FILE_SESSIONI = os.path.join(DIR_BASE, 'sessioni.json')
 FILE_STATO_ENERGIA = os.path.join(DIR_BASE, 'stato_energia.json')
 FILE_PIANO = os.path.join(DIR_BASE, 'pianificazione.json')
 FILE_STATISTICHE = os.path.join(DIR_BASE, 'statistiche_giorni.jsonl')
+FILE_PREVISIONI = os.path.join(DIR_BASE, 'previsioni.jsonl')
 
 # Stato condiviso per la Web UI e Telegram
 SYSTEM_STATE = {
@@ -1681,6 +1682,33 @@ def giorni_statistiche():
         giorni[oggi] = _stat_oggi['record']
     return giorni, oggi
 
+def previsioni_salvate():
+    """{giorno: {'kwh', 'fonte'}}: la previsione fatta la sera prima."""
+    previsioni = {}
+    try:
+        with open(FILE_PREVISIONI, encoding='utf-8') as f:
+            for riga in f:
+                try:
+                    r = json.loads(riga)
+                    previsioni[r['g']] = r
+                except (ValueError, KeyError, TypeError):
+                    continue
+    except OSError:
+        pass
+    return previsioni
+
+def salva_previsione_di_domani():
+    """Alle 20 si mette da parte quanto ci si aspetta per domani: la pagina
+    Statistiche lo confronta poi con quello che il tetto ha fatto davvero."""
+    aggiorna_previsione(forza=True)
+    domani = previsione_instance.domani()
+    if domani is None or domani[0] in previsioni_salvate():
+        return
+    with open(FILE_PREVISIONI, 'a', encoding='utf-8') as f:
+        f.write(json.dumps({'g': domani[0], 'kwh': domani[1], 'fonte': previsione_instance.fonte(),
+                            'fatta': int(time.time())}, separators=(',', ':')) + '\n')
+    log_msg(f"[PREVISIONE] Per domani ({domani[0]}): {domani[1]} kWh, fonte {previsione_instance.fonte()}")
+
 def calcola_statistiche():
     giorni, oggi = giorni_statistiche()
     primo = min(giorni) if giorni else oggi
@@ -1689,7 +1717,7 @@ def calcola_statistiche():
     stat = statistiche.calcola(
         giorni, da, a,
         {'acquisto': CONFIG['PREZZO_ACQUISTO'], 'vendita': CONFIG['PREZZO_VENDITA']},
-        CONFIG['LIMITE_CONTATORE'])
+        CONFIG['LIMITE_CONTATORE'], previsioni_salvate())
     stat['oggi'] = oggi
     stat['adesso'] = time.time()
     return stat
@@ -1932,6 +1960,16 @@ class WallboxController:
                 log_msg("[SESSIONE] Centralina irraggiungibile da "
                         f"{(time.time() - self.offline_dal) / 60:.0f} min: chiudo la sessione.")
                 contatori_instance.fine_sessione(fine=self.ultima_carica_vista)
+        # Sparita da dieci minuti: per noi e' spenta. Restava "accesa" al suo
+        # ultimo setpoint finche' non tornava (l'11/11: ON a 1418 W per ore
+        # con la colonnina staccata dal quadro), e la casa calcolata usciva
+        # piu' bassa di quel tanto. Quando torna e carica, la si adotta.
+        if (self.is_on and self.offline_dal
+                and time.time() - self.offline_dal > CONFIG['SESSIONE_OFFLINE_S']):
+            self.is_on = False
+            self.update_shared_state()
+            log_msg("[CENTRALINA] Irraggiungibile da piu' di "
+                    f"{CONFIG['SESSIONE_OFFLINE_S'] // 60} minuti: la considero spenta.")
         if self.sync_falliti >= 2:
             # Colonnina spenta o irraggiungibile: il limite che ha adesso non
             # lo sappiamo. Prima restava l'ultimo letto, e l'interfaccia lo
@@ -2902,12 +2940,28 @@ def risparmio_euro(kwh_da_fv, kwh_da_rete=0.0):
     return round(kwh_da_fv * delta - kwh_da_rete * CONFIG['PREZZO_ACQUISTO'], 2)
 
 def giorni_storico(quanti=14):
-    """Ultimi N giorni chiusi + la giornata in corso, con risparmio stimato."""
-    giorni = leggi_json(FILE_STORICO_GIORNALIERO, [])[-quanti:]
+    """Ultimi N giorni chiusi + la giornata in corso, con risparmio stimato.
+
+    I giorni chiusi vengono dall'archivio delle statistiche (statistiche.py),
+    gli stessi numeri della pagina Statistiche: i vecchi riepiloghi di
+    storico_giornaliero.json sottostimavano la produzione fino al 28/10/2026 e
+    contavano in auto energia mai caricata. Quel file resta scritto, per
+    confronto, ma non lo legge piu' nessuno. La giornata in corso viene dai
+    contatori, cosi' coincide con la scheda Oggi."""
+    archivio, oggi_iso = giorni_statistiche()
+    giorni = []
+    for giorno in sorted(g for g in archivio if g != oggi_iso)[-quanti:]:
+        record = archivio[giorno]
+        x = statistiche.giornaliero(record)
+        giorni.append({
+            'giorno': giorno, 'solare_kwh': x['sole'],
+            'rete_importata_kwh': x['prelievo'], 'rete_esportata_kwh': x['immessa'],
+            'wallbox_kwh': x['auto'], 'wallbox_da_fv_kwh': x['auto_sole'],
+            'efficienza': round(x['auto_sole'] / x['auto'] * 100, 1) if x['auto'] > 0.05 else None,
+            'minuti_carica': round(sum(record['ia'])),
+        })
     if contatori_instance:
-        oggi = contatori_instance.riepilogo()
-        # il giorno in corso non e' ancora nel file: lo aggiungo in coda
-        giorni = [g for g in giorni if g.get('giorno') != oggi['giorno']] + [oggi]
+        giorni = (giorni + [contatori_instance.riepilogo()])[-quanti:]
     for g in giorni:
         da_fv = g.get('wallbox_da_fv_kwh') or 0
         da_rete = max(0, (g.get('wallbox_kwh') or 0) - da_fv)
@@ -3282,6 +3336,7 @@ def thread_periodico(wallbox):
     prossima_rotazione = time.time() + 3600
     riepilogo_inviato_il = None
     rapporto_inviato_il = None
+    previsione_salvata_il = None
     giorno_statistiche = statistiche.giorno_di(time.time())
 
     while True:
@@ -3377,6 +3432,10 @@ def thread_periodico(wallbox):
                 riepilogo_inviato_il = oggi
                 if contatori_instance.wallbox_wh > 0 or contatori_instance.solare_wh > 0:
                     notifica("📅 *Riepilogo giornaliero*\n\n" + contatori_instance.riepilogo_markdown())
+            # Alle 20 la previsione per domani, da confrontare poi col vero
+            if ora_locale.tm_hour == 20 and previsione_salvata_il != oggi:
+                previsione_salvata_il = oggi
+                salva_previsione_di_domani()
             # La domenica, alla stessa ora, anche la settimana
             if (ora_locale.tm_wday == 6 and ora_locale.tm_hour == CONFIG['ORA_RIEPILOGO']
                     and rapporto_inviato_il != oggi and CONFIG['RAPPORTO_SETTIMANALE']):

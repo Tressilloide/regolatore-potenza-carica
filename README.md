@@ -519,7 +519,8 @@ Cartella `/home/tressilloide/solar/regolatore-potenza-carica`:
 | `config_utente.json` | Impostazioni salvate dall'utente |
 | `storico.jsonl` | Un campione al minuto `[ts, consumo, produzione, auto, L1..L6]`, ultimi 7 giorni (le sei fasi dal 10/11/2026) |
 | `statistiche_giorni.jsonl` | L'archivio delle statistiche: una riga per ogni giorno chiuso, per sempre (4.14) |
-| `storico_giornaliero.json` | Totali di ogni giorno |
+| `previsioni.jsonl` | La previsione fatta ogni sera per il giorno dopo (4.15) |
+| `storico_giornaliero.json` | I vecchi totali di ogni giorno. Dall'11/11/2026 non lo legge più nessuno: "Ultimi 14 giorni" e `/storico` usano l'archivio delle statistiche |
 | `sessioni.json` | Ultime 200 sessioni di ricarica |
 | `pianificazione.json` | Obiettivo in corso |
 | `stato_energia.json` | Contatori di oggi, per ripartire dopo un riavvio |
@@ -543,8 +544,15 @@ Il meteo arriva da Home Assistant, che ha già le previsioni orarie di
 met.no (`weather.forecast_home`): il pacchetto
 `homeassistant/previsione_meteo.yaml` le pubblica ogni ora su
 `solare/previsione/meteo` (retained). Va copiato in `config/packages/` di
-Home Assistant; finché non c'è, la previsione resta quella dallo storico.
-Il Pi non interroga nessun servizio su internet.
+Home Assistant (installato l'11/11/2026 come `solare_previsione.yaml`); se
+manca, la previsione resta quella dallo storico. Il Pi non interroga nessun
+servizio su internet.
+
+La pagina mostra il sole previsto ora per ora nella scheda Oggi. Ogni sera
+alle 20 la previsione per il giorno dopo viene messa da parte in
+`previsioni.jsonl`, e la pagina Statistiche (scheda "Il sole") la confronta
+con quello che il tetto ha prodotto davvero: è il modo per sapere quanto
+fidarsene.
 
 ### 4.14 Statistiche
 

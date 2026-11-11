@@ -520,10 +520,11 @@ def _giornaliero(r):
 giornaliero = _giornaliero      # i totali di un giorno, anche per chi sta fuori dal modulo
 
 
-def calcola(giorni, da, a, prezzi, limite_contatore=6600):
+def calcola(giorni, da, a, prezzi, limite_contatore=6600, previsioni=None):
     """Tutti i numeri della pagina per il periodo [da, a] (giorni ISO, inclusi).
 
     giorni: {giorno: record}, gia' comprensivo del giorno in corso se serve.
+    previsioni: {giorno: {'kwh': previsti la sera prima, 'fonte': ...}}, se ci sono.
     """
     tutti = sorted(giorni)
     if not tutti:
@@ -555,6 +556,24 @@ def calcola(giorni, da, a, prezzi, limite_contatore=6600):
 
     giornalieri = [_giornaliero(r) for r in record]
     out['giorni'] = giornalieri
+    # Quanto ci ha preso la previsione fatta la sera prima (solo giorni completi)
+    confronti = []
+    for r, g in zip(record, giornalieri):
+        p = (previsioni or {}).get(g['g'])
+        g['previsto'] = p.get('kwh') if isinstance(p, dict) else None
+        if g['previsto'] is not None and r['n'] >= GIORNO_COMPLETO_MIN:
+            confronti.append((g['previsto'], g['sole'], p.get('fonte')))
+    if confronti:
+        prodotti = sum(c[1] for c in confronti)
+        out['previsione'] = {
+            'giorni': len(confronti),
+            'errore_medio_kwh': round(sum(abs(c[0] - c[1]) for c in confronti) / len(confronti), 1),
+            'errore_pct': round(sum(abs(c[0] - c[1]) for c in confronti) / prodotti * 100) if prodotti > 0.5 else None,
+            'previsti': round(sum(c[0] for c in confronti), 1), 'prodotti': round(prodotti, 1),
+            'col_meteo': sum(1 for c in confronti if c[2] == 'meteo'),
+        }
+    else:
+        out['previsione'] = None
     # tutto l'archivio in piccolo, per il calendario: [giorno, sole, casa + auto, auto, prelievo, autosufficienza]
     del_periodo = {x['g']: x for x in giornalieri}
     out['calendario'] = []

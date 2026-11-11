@@ -656,6 +656,7 @@ class TestServizio(unittest.TestCase):
             FILE_STATO_ENERGIA=os.path.join(d, 'energia.json'),
             FILE_PIANO=os.path.join(d, 'piano.json'),
             FILE_STORICO=os.path.join(d, 'storico.jsonl'),
+            FILE_PREVISIONI=os.path.join(d, 'previsioni.jsonl'),
             salva_config=lambda: True,
             archivio_statistiche=statistiche.Archivio(os.path.join(d, 'statistiche.jsonl')),
             ponte_mqtt_instance=None, wallbox_instance=None,
@@ -843,6 +844,17 @@ class TestServizio(unittest.TestCase):
             memoria.clear()
             memoria.extend(prima)
 
+    def test_colonnina_sparita_risulta_spenta(self):
+        wb = sw.WallboxController()
+        wb.is_on = True
+        with mock.patch.object(sw.time, 'time', return_value=1000.0):
+            wb._lettura_fallita()
+        self.assertTrue(wb.is_on)                     # un errore solo non basta
+        with mock.patch.object(sw.time, 'time', return_value=1000.0 + sw.CONFIG['SESSIONE_OFFLINE_S'] + 5):
+            wb._lettura_fallita()
+        self.assertFalse(wb.is_on)
+        self.assertFalse(sw.SYSTEM_STATE['WALLBOX_STATUS'])
+
     def test_colonnina_sparita_non_conta_energia(self):
         self.assertEqual(sw.potenza_auto_per_i_conteggi(3000), 3000)
         w = mock.Mock(offline_dal=None)
@@ -922,6 +934,24 @@ class TestServizio(unittest.TestCase):
             self.assertEqual(client.get('/api/previsione').get_json()['domani_kwh'], 18.0)
             self.assertEqual(client.get('/api/data').get_json()['piano']['previsione']['fonte'], 'storico')
             self.assertIn('Domani: 18.0 kWh', sw.testo_previsione())
+            # gli ultimi giorni della pagina vengono dalle stesse statistiche
+            ultimi = client.get('/api/giorni').get_json()['giorni']
+            self.assertEqual([g['solare_kwh'] for g in ultimi[:2]], [18.0, 18.0])
+            self.assertEqual(ultimi[-1]['giorno'], statistiche.giorno_di(adesso))
+            self.assertIn('risparmio_eur', ultimi[0])
+            # la previsione per domani si mette da parte una volta sola
+            sw.salva_previsione_di_domani()
+            sw.salva_previsione_di_domani()
+            salvate = sw.previsioni_salvate()
+            self.assertEqual([p['kwh'] for p in salvate.values()], [18.0])
+            # e si confronta con il prodotto: ieri previsti 20, prodotti 18
+            ieri = statistiche.giorno_di(inizio_oggi - 43200)
+            with open(sw.FILE_PREVISIONI, 'a') as f:
+                f.write(json.dumps({'g': ieri, 'kwh': 20, 'fonte': 'meteo'}) + '\nriga rotta\n')
+            s = client.get('/api/statistiche?periodo=7g').get_json()
+            self.assertEqual(s['previsione'], {'giorni': 1, 'errore_medio_kwh': 2.0, 'errore_pct': 11,
+                                               'previsti': 20, 'prodotti': 18.0, 'col_meteo': 1})
+            self.assertEqual([g['previsto'] for g in s['giorni']][-2], 20)
             # il meteo di Home Assistant: tutto coperto, un quarto del sereno
             sw.meteo_ricevuto({'ore': [{'t': adesso + h * 3600, 'nuvole': 100} for h in range(-2, 50)]})
             self.assertEqual(sw.aggiorna_previsione()['fonte'], 'meteo')

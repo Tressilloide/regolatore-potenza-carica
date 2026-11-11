@@ -71,6 +71,8 @@ class Previsione:
             valori = sorted((r['ore'][h][SOLE] for r in recenti), reverse=True)
             # la seconda ora migliore: la prima puo' essere un riflesso fra le nuvole
             self.sereno[h] = float(valori[1] if len(valori) > 1 else valori[0] if valori else 0)
+            if self.sereno[h] < 30:
+                self.sereno[h] = 0.0        # qualche Wh di notte e' rumore del sensore
             self.tipico[h] = sum(r['ore'][h][SOLE] for r in ultimi) / len(ultimi) if ultimi else 0.0
             self.casa[h] = (sum(max(0, r['ore'][h][CONSUMO] - r['ore'][h][AUTO]) for r in recenti)
                             / len(recenti)) if recenti else 0.0
@@ -150,6 +152,14 @@ class Previsione:
         if self.giorni_storia == 0:
             return None
         return sum(o[2] for o in self.ore_previste(da, a)) / 1000.0
+
+    def domani(self):
+        """(giorno ISO, kWh previsti) per la giornata di domani, oppure None."""
+        if self.giorni_storia == 0:
+            return None
+        inizio, fine = self._mezzanotte(1), self._mezzanotte(2)
+        kwh = sum(o[1] for o in self.ore_previste(inizio, fine)) / 1000.0
+        return time.strftime('%Y-%m-%d', time.localtime(inizio + 43200)), round(kwh, 1)
 
     def _mezzanotte(self, giorni_avanti=0):
         t = time.localtime(self.ora())

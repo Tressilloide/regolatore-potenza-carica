@@ -782,7 +782,8 @@ $('btn_reinit').addEventListener('click', async () => {
 /* ------------------------------------------------------------------
    Grafici
    ------------------------------------------------------------------ */
-let grafAndamento = null, grafGiorni = null;
+let grafAndamento = null, grafGiorni = null, grafPrevisione = null;
+let orePreviste = [];           // [inizio dell'ora, Wh previsti, Wh per l'auto]
 let intervallo = ['1h', '6h', '24h', '7g'].includes(memoria('intervallo')) ? memoria('intervallo') : '1h';
 let puntiAndamento = [], giorni = [];
 const alfa = (hex, a) => hex + Math.round(a * 255).toString(16).padStart(2, '0');
@@ -856,6 +857,29 @@ function creaGrafici() {
     const col = colori();
     grafAndamento?.destroy();
     grafGiorni?.destroy();
+    grafPrevisione?.destroy();
+
+    /* Sole previsto: una barra per ora, oggi e domani */
+    const o3 = opzioniBase(col, 'kWh');
+    o3.scales.x.ticks.maxTicksLimit = 9;
+    o3.scales.y.ticks.maxTicksLimit = 4;
+    o3.plugins.tooltip.external = suggerimento('kWh', true);
+    o3.plugins.tooltip.callbacks = { title: voci => {
+        const o = orePreviste[voci[0]?.dataIndex];
+        if (!o) return '';
+        const quando = new Date(o[0] * 1000);
+        return quando.toLocaleDateString('it-IT', { weekday: 'short', day: 'numeric' }) + ' · ore '
+            + String(quando.getHours()).padStart(2, '0') + '–' + String((quando.getHours() + 1) % 24).padStart(2, '0')
+            + ' · all’auto ' + nf1.format(o[2] / 1000) + ' kWh';
+    } };
+    grafPrevisione = new Chart($('grafico_previsione'), {
+        type: 'bar',
+        data: { labels: [], datasets: [
+            { label: 'Sole previsto', coloreSerie: col.sole, data: [], backgroundColor: col.sole,
+              borderRadius: 3, maxBarThickness: 18 } ] },
+        options: o3
+    });
+    disegnaPrevisione();
 
     const o1 = opzioniBase(col, 'kW');
     o1.scales.y.stacked = true;
@@ -902,6 +926,29 @@ function creaGrafici() {
     });
     disegnaAndamento();
     disegnaGiorni();
+}
+
+function disegnaPrevisione() {
+    if (!grafPrevisione) return;
+    let giornoPrima = null;
+    grafPrevisione.data.labels = orePreviste.map(o => {
+        const quando = new Date(o[0] * 1000), giorno = quando.getDate();
+        const cambia = giornoPrima !== null && giorno !== giornoPrima;
+        giornoPrima = giorno;
+        return cambia ? quando.toLocaleDateString('it-IT', { weekday: 'short' }) : String(quando.getHours()).padStart(2, '0');
+    });
+    grafPrevisione.data.datasets[0].data = orePreviste.map(o => Math.round(o[1] / 10) / 100);
+    grafPrevisione.update();
+}
+async function caricaPrevisione() {
+    try {
+        const r = await fetch('/api/previsione', { cache: 'no-store' });
+        const p = await r.json();
+        /* solo le ore di luce: di notte non c'e' niente da vedere */
+        orePreviste = (p.ore || []).filter(o => o[1] >= 20);
+        $('grafico_previsione').parentElement.hidden = !orePreviste.length;
+        disegnaPrevisione();
+    } catch (e) { /* la pagina vive anche senza */ }
 }
 
 function ridipingi() {
@@ -1053,6 +1100,7 @@ aggiorna();
 caricaAndamento();
 caricaGiorni();
 caricaSessioni();
+caricaPrevisione();
 avviaScena();
 addEventListener('resize', misuraEtichette);
 
@@ -1063,6 +1111,7 @@ function avviaTimer() {
     timer = [setInterval(aggiorna, INTERVALLO_MS),
              setInterval(caricaAndamento, 60000),
              setInterval(caricaGiorni, 120000),
+             setInterval(caricaPrevisione, 300000),
              setInterval(caricaSessioni, 30000)];
 }
 function fermaTimer() { timer.forEach(clearInterval); timer = []; }

@@ -448,3 +448,5 @@ input[type=checkbox] { width: 18px; height: 18px; accent-color: var(--testo); ma
     .regola-valori .acceso { justify-self: start; }
     .regola-valori .b-togli { justify-self: end; }
 }
+
+.grafico-previsione { height: 130px; margin-top: 12px; }

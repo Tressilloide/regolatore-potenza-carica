@@ -797,6 +797,23 @@ function sole(col) {
     grafico('g_mesi', { type: 'line', data: { labels: Array.from({ length: 24 }, (_, h) => String(h).padStart(2, '0')),
         datasets: ultimi.map((m, i) => ({ label: nomeMese(m.mese, true), coloreSerie: tinte[i], data: m.profilo_sole, fill: false,
             borderColor: tinte[i], borderWidth: 2, pointRadius: 0, pointHoverRadius: 4, tension: .3 })) }, options: o });
+
+    /* Quanto ci ha preso la previsione della sera prima */
+    const conPrevisto = d.giorni.filter(g => !manca(g.previsto));
+    $('box_previsto').hidden = !conPrevisto.length;
+    if (!conPrevisto.length) { grafici.g_previsto?.destroy(); delete grafici.g_previsto; return; }
+    const op = opzioniBase(col, 'kWh');
+    op.plugins.tooltip.external = suggerimentoGrafico(v => nf1.format(v) + ' kWh', i => dataMedia(conPrevisto[i].g));
+    grafico('g_previsto', { type: 'bar', data: { labels: conPrevisto.map(g => dataBreve(g.g)), datasets: [
+        { type: 'line', label: 'Previsto', coloreSerie: col.neutro, data: conPrevisto.map(g => g.previsto), borderColor: col.neutro,
+          backgroundColor: col.neutro, borderWidth: 2, pointRadius: 3, pointHoverRadius: 5, tension: 0, order: 1 },
+        barra(col, 'Prodotto', col.sole, conPrevisto.map(g => g.sole), { order: 2 }),
+    ] }, options: op });
+    const p = d.previsione;
+    $('previsto_nota').textContent = p
+        ? `Su ${p.giorni} ${p.giorni === 1 ? 'giorno' : 'giorni'} la previsione ha sbagliato in media di ${nf1.format(p.errore_medio_kwh)} kWh`
+          + (manca(p.errore_pct) ? '' : ` (${p.errore_pct}% del prodotto)`) + `; ${p.col_meteo} con il meteo di Home Assistant.`
+        : 'La previsione viene messa da parte ogni sera alle 20 per il giorno dopo.';
 }
 function casa(col) {
     const c = d.casa, t = d.totali;

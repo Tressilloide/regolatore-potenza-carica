@@ -194,6 +194,15 @@
                 <h3 class="sotto">La curva del sole, mese per mese</h3>
                 <div class="legenda" id="leg_mesi"></div>
                 <div class="grafico grafico-basso"><canvas id="g_mesi" role="img" aria-label="Produzione media per ora, un mese per linea"></canvas></div>
+                <div id="box_previsto" hidden>
+                    <h3 class="sotto">Previsto la sera prima e prodotto davvero</h3>
+                    <div class="legenda">
+                        <span><i class="tinta t-sole"></i>Prodotto</span>
+                        <span><i class="tinta linea t-neutro"></i>Previsto</span>
+                    </div>
+                    <div class="grafico grafico-mini"><canvas id="g_previsto" role="img" aria-label="Produzione prevista e reale, giorno per giorno"></canvas></div>
+                    <p class="nota" id="previsto_nota"></p>
+                </div>
             </section>
 
             <!-- ============ Casa ============ -->

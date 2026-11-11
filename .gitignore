@@ -14,3 +14,4 @@ pianificazione.json
 backup_dati/
 .env.bak*
 statistiche_giorni.jsonl
+previsioni.jsonl
