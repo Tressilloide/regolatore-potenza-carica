@@ -759,6 +759,12 @@ def aggiorna_previsione(forza=False):
             # l'auto non prende piu' di 11 kW nemmeno in trifase (colonnina da 22)
             previsione_instance.potenza_massima_auto = min(11000, wallbox_instance.limiti_potenza()[1])
         previsione_instance.aggiorna_storia(giorni, oggi)
+        # Dai giorni gia' passati: quanto toglie davvero il cielo coperto
+        passati = [(p['nuvole'], statistiche.giornaliero(giorni[g])['sole'], p['sereno'])
+                   for g, p in sorted(previsioni_salvate().items())
+                   if p.get('nuvole') is not None and p.get('sereno') and g in giorni and g < oggi
+                   and giorni[g]['n'] >= statistiche.GIORNO_COMPLETO_MIN]
+        previsione_instance.impara_perdita(passati[-20:])
         _previsione['riepilogo'] = previsione_instance.riepilogo()
     return _previsione['riepilogo']
 
@@ -1706,6 +1712,9 @@ def salva_previsione_di_domani():
         return
     with open(FILE_PREVISIONI, 'a', encoding='utf-8') as f:
         f.write(json.dumps({'g': domani[0], 'kwh': domani[1], 'fonte': previsione_instance.fonte(),
+                            # servono a imparare quanto toglie il cielo coperto (impara_perdita)
+                            'nuvole': previsione_instance.nuvole_di_domani(),
+                            'sereno': round(sum(previsione_instance.sereno) / 1000.0, 1),
                             'fatta': int(time.time())}, separators=(',', ':')) + '\n')
     log_msg(f"[PREVISIONE] Per domani ({domani[0]}): {domani[1]} kWh, fonte {previsione_instance.fonte()}")
 

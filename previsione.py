@@ -11,7 +11,12 @@ Due modi, a seconda di cosa c'e':
            di un'ora e' quella di una giornata serena, ricavata dalle
            statistiche di casa (la seconda ora migliore degli ultimi 14
            giorni), per un fattore che scende con le nuvole:
-               1 - 0,75 * nuvole^3,4        (Kasten e Czeplak, 1980)
+               1 - perdita * nuvole^3,4     (la forma di Kasten e Czeplak, 1980)
+           La loro perdita a cielo coperto e' 0,75, ma vale per
+           l'irraggiamento: questo tetto, nei giorni coperti di novembre
+           2026, ha reso il 9-15% del sereno e non il 25%. Si parte quindi da
+           0,85, e poi la perdita si impara dai giorni gia' passati
+           (impara_perdita), confrontando nuvole previste e produzione vera.
   storico  senza meteo (o con meteo vecchio): la media degli ultimi 5 giorni
            a quell'ora. Non sa che tempo fara': e' un "piu' o meno come ieri".
 
@@ -32,12 +37,14 @@ GIORNI_SERENO = 14          # finestra per la giornata serena
 GIORNI_TIPICO = 5           # finestra per la media "come ieri"
 GIORNO_COMPLETO_MIN = 1200  # minuti misurati perche' un giorno faccia storia
 METEO_VALIDO_S = 9 * 3600   # un meteo piu' vecchio di cosi' non si usa
+PERDITA_COPERTO = 0.85      # quanta produzione toglie un cielo tutto coperto, prima di impararla
+ESPONENTE_NUVOLE = 3.4
 
 
-def fattore_nuvole(percento):
-    """Quota di irraggiamento che resta con quella copertura (0-100%)."""
+def fattore_nuvole(percento, perdita=PERDITA_COPERTO):
+    """Quota di produzione che resta con quella copertura (0-100%)."""
     c = min(1.0, max(0.0, float(percento) / 100.0))
-    return 1.0 - 0.75 * c ** 3.4
+    return 1.0 - perdita * c ** ESPONENTE_NUVOLE
 
 
 def inizio_ora(ts):
@@ -52,6 +59,8 @@ class Previsione:
         self.tipico = [0.0] * 24        # Wh per ora, media degli ultimi giorni
         self.casa = [0.0] * 24          # Wh per ora della casa, senza auto
         self.giorni_storia = 0
+        self.perdita = PERDITA_COPERTO  # si aggiorna con impara_perdita()
+        self.giorni_imparati = 0
         self.meteo = {}                 # inizio dell'ora (ts) -> nuvole %
         self.meteo_del = 0.0
         self.oggi = None                # record di statistiche.py della giornata in corso
@@ -94,6 +103,46 @@ class Previsione:
             self.meteo_del = self.ora() if ricevuto_il is None else ricevuto_il
         return len(nuovo)
 
+    def impara_perdita(self, passati):
+        """`passati`: elenco di (nuvole medie previste %, kWh prodotti, kWh di
+        una giornata serena) per giorni gia' chiusi. Dai giorni nuvolosi
+        (almeno il 70%) ricava quanta produzione toglie davvero il cielo
+        coperto su questo tetto; servono almeno due giorni, e il risultato
+        resta fra 0,6 e 0,95."""
+        stime = []
+        for nuvole, prodotti, sereno in passati:
+            try:
+                c = float(nuvole) / 100.0
+                if c >= 0.7 and sereno > 5:
+                    stime.append((1.0 - min(1.0, prodotti / sereno)) / c ** ESPONENTE_NUVOLE)
+            except (TypeError, ValueError, ZeroDivisionError):
+                continue
+        self.giorni_imparati = len(stime)
+        if len(stime) >= 2:
+            stime.sort()
+            meta = len(stime) // 2
+            mediana = stime[meta] if len(stime) % 2 else (stime[meta - 1] + stime[meta]) / 2.0
+            self.perdita = min(0.95, max(0.6, mediana))
+        else:
+            self.perdita = PERDITA_COPERTO
+        return self.perdita
+
+    def nuvole_di_domani(self):
+        """Nuvole previste per domani (%), pesate con le ore in cui il tetto
+        produce. None senza meteo valido."""
+        if not self.meteo_valido():
+            return None
+        peso = somma = 0.0
+        t, fine = self._mezzanotte(1), self._mezzanotte(2)
+        while t < fine:
+            ora = inizio_ora(t + 1800)
+            if ora in self.meteo:
+                w = self.sereno[time.localtime(ora + 1800).tm_hour]
+                peso += w
+                somma += w * self.meteo[ora]
+            t += 3600
+        return round(somma / peso, 1) if peso > 0 else None
+
     # ------------------------------------------------------------------
     # Modello
     # ------------------------------------------------------------------
@@ -109,7 +158,7 @@ class Previsione:
         """Wh attesi nell'ora che comincia a `ts_ora`, senza la correzione di oggi."""
         h = time.localtime(ts_ora + 1800).tm_hour
         if self.meteo_valido() and ts_ora in self.meteo:
-            return self.sereno[h] * fattore_nuvole(self.meteo[ts_ora])
+            return self.sereno[h] * fattore_nuvole(self.meteo[ts_ora], self.perdita)
         return self.tipico[h]
 
     def correzione_di_oggi(self):
@@ -181,6 +230,7 @@ class Previsione:
             'giorni_storia': self.giorni_storia,
             'meteo_del': self.meteo_del if fonte == 'meteo' else None,
             'correzione_oggi': round(self.correzione_di_oggi(), 2),
+            'perdita_coperto': round(self.perdita, 2), 'giorni_imparati': self.giorni_imparati,
             'oggi_restante_kwh': kwh(resto, 1), 'oggi_restante_auto_kwh': kwh(resto, 2),
             'domani_kwh': kwh(poi, 1), 'domani_auto_kwh': kwh(poi, 2),
             'sereno_kwh': round(sum(self.sereno) / 1000.0, 1),

@@ -534,7 +534,7 @@ pagina la mostra nella scheda Oggi ("Sole previsto").
 
 | Fonte | Come si calcola |
 |---|---|
-| **meteo** | La produzione di una giornata serena (la seconda ora migliore degli ultimi 14 giorni, dalle statistiche) per un fattore che scende con le nuvole: `1 - 0,75 × nuvole^3,4` |
+| **meteo** | La produzione di una giornata serena (la seconda ora migliore degli ultimi 14 giorni, dalle statistiche) per un fattore che scende con le nuvole: `1 - perdita × nuvole^3,4`. La perdita a cielo coperto parte da 0,85 (nei giorni coperti di novembre 2026 il tetto ha reso il 9-15% del sereno) e poi si impara: dai giorni già passati con almeno il 70% di nuvole previste si ricava quanta produzione hanno tolto davvero (mediana, fra 0,6 e 0,95, da due giorni in su) |
 | **storico** | Senza meteo, o con meteo più vecchio di 9 ore: la media degli ultimi 5 giorni a quell'ora. Sui 47 giorni provati sbaglia in media del 31% sul totale del giorno ("uguale a ieri" sbaglia del 38%) |
 
 In tutti e due i casi le ore che restano di oggi si correggono con quello
@@ -550,7 +550,8 @@ servizio su internet.
 
 La pagina mostra il sole previsto ora per ora nella scheda Oggi. Ogni sera
 alle 20 la previsione per il giorno dopo viene messa da parte in
-`previsioni.jsonl`, e la pagina Statistiche (scheda "Il sole") la confronta
+`previsioni.jsonl` (con le nuvole previste e la resa di una giornata serena,
+che servono a imparare la perdita), e la pagina Statistiche (scheda "Il sole") la confronta
 con quello che il tetto ha prodotto davvero: è il modo per sapere quanto
 fidarsene.
 

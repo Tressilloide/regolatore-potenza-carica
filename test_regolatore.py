@@ -432,9 +432,18 @@ class TestPrevisione(unittest.TestCase):
         ore = [{'t': adesso - 60 + h * 3600, 'nuvole': 100} for h in range(48)]
         self.assertEqual(p.imposta_meteo(ore + [{'t': 'boh', 'nuvole': 5}, {'nuvole': 5}]), 48)
         self.assertEqual(p.fonte(), 'meteo')
-        self.assertAlmostEqual(fattore_nuvole(100), 0.25)
+        self.assertAlmostEqual(fattore_nuvole(100), 0.15)
+        self.assertAlmostEqual(fattore_nuvole(100, 0.75), 0.25)
         self.assertAlmostEqual(fattore_nuvole(0), 1.0)
-        self.assertEqual(p.riepilogo()['domani_kwh'], 6.0)   # un quarto del sereno
+        self.assertEqual(p.riepilogo()['domani_kwh'], 3.6)   # il 15% del sereno
+        self.assertEqual(p.nuvole_di_domani(), 100.0)
+        # la perdita si impara dai giorni nuvolosi gia' passati: qui hanno reso il 10% e il 12%
+        self.assertEqual(p.impara_perdita([(100, 7.2, 72)]), 0.85)             # un giorno solo non basta
+        self.assertAlmostEqual(p.impara_perdita([(100, 7.2, 72), (100, 8.64, 72), (20, 70, 72), ('x', 1, 1)]), 0.89)
+        self.assertEqual(p.giorni_imparati, 2)
+        self.assertAlmostEqual(p.riepilogo()['domani_kwh'], 2.6, places=1)
+        self.assertEqual(p.impara_perdita([(100, 60, 72), (100, 65, 72)]), 0.6)   # mai sotto 0,6
+        p.impara_perdita([])
         # data in formato ISO, come la manda Home Assistant
         self.assertEqual(p.imposta_meteo([{'t': '2026-06-21T10:00:00+00:00', 'nuvole': 0}]), 1)
         # un meteo vecchio non si usa piu'
@@ -943,7 +952,7 @@ class TestServizio(unittest.TestCase):
             sw.salva_previsione_di_domani()
             sw.salva_previsione_di_domani()
             salvate = sw.previsioni_salvate()
-            self.assertEqual([p['kwh'] for p in salvate.values()], [18.0])
+            self.assertEqual([(p['kwh'], p['nuvole'], p['sereno']) for p in salvate.values()], [(18.0, None, 18.0)])
             # e si confronta con il prodotto: ieri previsti 20, prodotti 18
             ieri = statistiche.giorno_di(inizio_oggi - 43200)
             with open(sw.FILE_PREVISIONI, 'a') as f:
@@ -955,13 +964,13 @@ class TestServizio(unittest.TestCase):
             # il meteo di Home Assistant: tutto coperto, un quarto del sereno
             sw.meteo_ricevuto({'ore': [{'t': adesso + h * 3600, 'nuvole': 100} for h in range(-2, 50)]})
             self.assertEqual(sw.aggiorna_previsione()['fonte'], 'meteo')
-            self.assertEqual(sw.aggiorna_previsione()['domani_kwh'], 4.5)
+            self.assertEqual(sw.aggiorna_previsione()['domani_kwh'], 2.7)
             sw.meteo_ricevuto('rotto')               # non deve sollevare eccezioni
 
             ha = sw.statistiche_per_ha(mock.Mock(solar_now=2500, total_grid_load=900))
             self.assertEqual(ha['potenza_libera_w'], 1600)
             self.assertEqual(ha['carico_fondo_w'], 1000)
-            self.assertEqual(ha['previsione_domani_kwh'], 4.5)
+            self.assertEqual(ha['previsione_domani_kwh'], 2.7)
             self.assertIn('autosufficienza_oggi', ha)
 
             testo = sw.rapporto_settimanale()
