@@ -16,6 +16,17 @@ Bilancio a ogni pacchetto del sensore:
 - non basta nemmeno il minimo: si resta al minimo per TIMER_SPEGNIMENTO, poi
   si spegne se si importano ancora piu' di 200 W.
 
+Regolazione calma (REGOLAZIONE_CALMA, spenta di serie): limita i cambi di
+potenza. Con il sole che va e viene il classico corregge a ogni pacchetto
+(l'11/11/2026: sette cambi in 100 secondi, su e giu' di 400 W), perche' la
+potenza misurata dell'auto insegue il comando con qualche secondo di ritardo
+e il consumo della casa arriva solo ogni 60 s. In calma un cambio si manda
+solo se vale almeno CALMA_SOGLIA_W e se dall'ultimo sono passati
+CALMA_INTERVALLO_S; fanno eccezione i cali grossi (due volte la soglia), che
+passano subito. Il prezzo: per qualche decina di secondi si puo' prelevare
+fino a una soglia in piu' del concesso, o lasciare in rete altrettanto sole.
+La protezione del contatore non passa di qui e resta immediata.
+
 Lavora su un oggetto wallbox con l'interfaccia di WallboxController:
 is_on, current_set_power, display_power, fase, pending_off_until,
 max_reached_start, max_notified, limiti_potenza(), potenza_reale(),
@@ -36,6 +47,8 @@ class RegolatoreClassico:
         self.avvisa = avvisa or (lambda messaggio, chiave=None, intervallo=0: None)
         self.log_raro = log_raro or (lambda chiave, messaggio, intervallo=60: None)
         self.ora = orologio
+        self.ultimo_cambio = 0.0        # quando e' cambiato l'ultima volta il setpoint
+        self.cambi_evitati = 0          # dalla regolazione calma, per il log
 
     def notifica_potenza_massima(self, wallbox, potenza_carica, potenza_massima):
         """Avvisa se la wallbox resta alla potenza massima per almeno 60 s."""
@@ -61,8 +74,22 @@ class RegolatoreClassico:
         filtrato (soglia di protezione, un comando ogni 5 s), cioe' 4 volte
         su 5 (sul Pi: 5960 "Aumento" e 1297 comandi davvero inviati in 72 h)."""
         prima = wallbox.current_set_power
+        adesso = self.ora()
+        cfg = self.config
+        if cfg.get('REGOLAZIONE_CALMA') and not bypass and wallbox.is_on:
+            soglia = cfg.get('CALMA_SOGLIA_W', 500)
+            variazione = potenza - prima
+            troppo_presto = adesso - self.ultimo_cambio < cfg.get('CALMA_INTERVALLO_S', 30)
+            if abs(variazione) < soglia or (troppo_presto and variazione > -2 * soglia):
+                self.cambi_evitati += 1
+                return
         wallbox.set_power(potenza, bypass=bypass)
         if wallbox.current_set_power != prima:
+            self.ultimo_cambio = adesso
+            # Il verbo dal confronto vero: "Diminuisco: 3113W -> 3588W" usciva
+            # quando il calo era rispetto alla potenza misurata, non al comando
+            if not bypass:
+                motivo = "Aumento" if wallbox.current_set_power > prima else "Diminuisco"
             self.log(f"[DECISIONE] {motivo}: {prima}W -> {wallbox.current_set_power}W "
                      f"(richiesti {potenza:.0f}W)")
 

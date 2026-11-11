@@ -139,6 +139,8 @@ File principali:
 |---|---|
 | `solar_webinterface.py` | Il servizio: lettura del sensore, colonnina, API della pagina web, bot Telegram, storico, sessioni |
 | `web/` | Le pagine web: il pannello (`index.html`, `app.css`, `app.js`, la scena 3D `scena3d.js`), le statistiche (`statistiche.html`, `.css`, `.js`) e le librerie in `web/vendor/` (4.10, 4.14) |
+| `previsione.py` | Previsione del sole dalle statistiche e dal meteo di Home Assistant (4.15). Senza dipendenze esterne |
+| `homeassistant/previsione_meteo.yaml` | Pacchetto per Home Assistant che manda al Pi le nuvole previste (4.15) |
 | `statistiche.py` | Statistiche di lungo periodo: dai campioni al minuto ai numeri della pagina Statistiche (4.14). Senza dipendenze esterne |
 | `regolatore_classico.py` | L'algoritmo classico. Senza dipendenze esterne, lo usa anche il simulatore |
 | `regolatore_pid.py` | L'algoritmo PID e lo stimatore dello scambio ogni 6 s. Senza dipendenze esterne, lo usa anche il simulatore |
@@ -224,7 +226,18 @@ contatore e la sua protezione (4.7) valgono in ogni caso.
 |---|---|
 | **Solo sole** (`sole`) | 0: solo il sole in più rispetto alla casa |
 | **Sole + rete** (`misto`) | `POTENZA_PRELEVABILE` (il comportamento di prima) |
-| **Veloce** (`veloce`) | Quanto il contatore permette: fino a 6300 W di prelievo in tutto, casa compresa |
+| **Preset** (`preset`) | Il prelevabile del preset scelto, e il suo limite di energia sulla colonnina |
+
+- **Preset:** coppie "tanti kW dalla rete, fermati a tanti kWh" (0 kWh =
+  senza limite), fino a 8, con un nome. Di serie: *Veloce* (6,6 kW, senza
+  limite), *Notte* (4 kW, 20 kWh), *Rabbocco* (3 kW, 10 kWh). Si scelgono e
+  si modificano dalla pagina (terzo pulsante della scheda Carica), si
+  scelgono anche da Telegram (`/preset`) e da Home Assistant. Scegliendone
+  uno il limite va subito alla colonnina; se è spenta resta in attesa e
+  parte appena torna. Il prelevabile della modalità Sole + rete non viene
+  toccato. Dall'11/11/2026 i preset hanno preso il posto della modalità
+  Veloce: `veloce` è ancora accettato come comando e sceglie il preset con
+  quel nome.
 
 - **Obiettivo:** "N kWh in auto entro le HH:MM". Si carica col sole
   finché basta. Quando la potenza media necessaria per finire in tempo
@@ -241,10 +254,26 @@ contatore e la sua protezione (4.7) valgono in ogni caso.
   - Esempio, trifase (minimo 4140 W), 10 kWh entro le 7:00 impostati alle
     23: fino alle 4:20 circa si aspetta, poi si carica a ~4,5 kW.
 
+- **Sole previsto:** con una previsione (4.15) dai kWh mancanti si toglie
+  prima il sole atteso entro la scadenza, contato al 70%: se domani c'è
+  sole, stanotte non si compra dalla rete. Si smette di aspettare quando la
+  potenza media che servirebbe senza sole supera il 60% di quanto la rete
+  può dare all'auto (contatore meno 1 kW di casa): la rete da sola deve
+  poter sempre finire in tempo.
+- **Programma settimanale:** regole "nei giorni tali, N kWh entro le
+  HH:MM" (fino a 10, dalla pagina; `/programma` su Telegram le mostra).
+  Senza un obiettivo attivo, la prossima scadenza diventa l'obiettivo da 24
+  ore prima. "Salta questa volta" annulla solo quel giorno. Se l'auto viene
+  staccata l'obiettivo del programma riparte da zero (anche se era già
+  raggiunto: i kWh se ne sono andati con l'auto), mentre uno messo a mano
+  si annulla come prima. Se alla scadenza l'auto non ha mai caricato non
+  arriva nessun avviso.
+
 Si comanda dalla pagina web (scheda Carica), da Telegram (`/modalita`,
-`/obiettivo`) e da Home Assistant (5.1). L'obiettivo è salvato in
-`pianificazione.json`. Il boost (Veloce a tempo), aggiunto la mattina del
-10/11/2026, è stato tolto lo stesso giorno.
+`/preset`, `/obiettivo`) e da Home Assistant (5.1). Obiettivo e programma
+sono salvati in `pianificazione.json`, i preset in `config_utente.json`. Il
+boost (Veloce a tempo), aggiunto la mattina del 10/11/2026, è stato tolto
+lo stesso giorno.
 
 ### 4.5 Algoritmo classico
 
@@ -263,6 +292,17 @@ Si comanda dalla pagina web (scheda Carica), da Telegram (`/modalita`,
   200 W. Dopo uno spegnimento aspetta 60 s prima di riaccendere.
 - **Filtri sui comandi:** non invia variazioni sotto `POTENZA_PROTEZIONE`
   (300 W), al massimo un comando ogni 5 s, e smorza le variazioni.
+- **Regolazione calma** (`REGOLAZIONE_CALMA`, spenta di serie; dalle
+  impostazioni della pagina, `/calma` su Telegram o l'interruttore in Home
+  Assistant): limita i cambi di potenza. Con il sole che va e viene il
+  classico corregge a ogni pacchetto (l'11/11/2026: sette cambi in 100 s,
+  su e giù di 400 W), perché la potenza misurata dell'auto segue il comando
+  con qualche secondo di ritardo. In calma un cambio parte solo se vale
+  almeno `CALMA_SOGLIA_W` (500 W) e se dall'ultimo sono passati
+  `CALMA_INTERVALLO_S` (30 s); i cali grossi (due volte la soglia) passano
+  subito, e la protezione del contatore non ne è toccata. Sul simulatore, 9
+  giorni: comandi da 9788 a 4567, sole in auto da 448,9 a 444,6 kWh (-1%),
+  prelievo in più invariato.
 
 Limite noto: fra un pacchetto `electricity` e l'altro il classico lavora su un
 consumo vecchio fino a 60 s. Durante i 60 s al minimo resta al minimo anche se
@@ -389,11 +429,14 @@ nulla da internet: three.js r160 e Chart.js 4.4.1 sono in `web/vendor/`.
 | `GET /api/data` | Stato attuale e configurazione, ogni 2 s. Con `storia=0` senza l'ultima ora di storico, con `log_da=N` solo le righe di registro dopo la numero N |
 | `GET /api/storico?range=1h\|6h\|24h\|7g` | Storico per i grafici |
 | `GET /api/giorni`, `GET /api/sessioni` | Storico giornaliero e sessioni |
+| `POST /api/preset` | Salva l'elenco dei preset: `{"preset": [{"nome", "prelevabile", "limite_kwh"}, ...]}` |
+| `POST /api/programma` | Salva il programma settimanale: `{"programma": [{"giorni": [0..6], "ora": "HH:MM", "kwh", "attivo"}, ...]}` (0 = lunedì) |
+| `GET /api/previsione` | Sole previsto ora per ora, oggi e domani (4.15) |
 | `GET /statistiche` | La pagina Statistiche (4.14) |
 | `GET /api/statistiche?periodo=...` | Tutti i numeri della pagina Statistiche per un periodo: `7g`, `30g`, `90g`, `365g`, `anno`, `tutto`, un mese `AAAA-MM`, oppure `da=AAAA-MM-GG&a=AAAA-MM-GG` |
 | `GET /api/statistiche.csv?periodo=...` | La tabella dei giorni del periodo, per il foglio di calcolo |
 | `POST /api/settings` | Salva le impostazioni (tutto o niente) |
-| `POST /api/comando` | `{"nome": "modalita"\|"prelevabile"\|"obiettivo", "valore": ...}`, come i comandi Telegram |
+| `POST /api/comando` | `{"nome": "modalita"\|"prelevabile"\|"obiettivo"\|"preset"\|"calma", "valore": ...}`, come i comandi Telegram |
 | `POST /api/limite_toggle` | Attiva/disattiva il limite kWh |
 | `POST /api/init_wallbox` | Re-inizializza la colonnina |
 | `GET /api/wallbox_raw` | JSON grezzo della colonnina, per diagnosi |
@@ -412,7 +455,12 @@ modifica, quindi il browser prende subito quelli nuovi).
 | `/fase` | Rilegge subito monofase/trifase |
 | `/accendi`, `/spegni` | Forza accensione/spegnimento. Dopo `/spegni` il regolatore non riaccende finché non arriva `/accendi` |
 | `/reset` | Re-inizializza la colonnina |
-| `/modalita [sole\|misto\|veloce]` | Modalità di carica (4.4) |
+| `/modalita [sole\|misto\|preset]` | Modalità di carica (4.4) |
+| `/preset [nome\|numero]` | Elenco dei preset, o ne sceglie uno |
+| `/programma` | Il programma settimanale degli obiettivi |
+| `/previsione` | Sole previsto per il resto di oggi e per domani (4.15) |
+| `/settimana` | La settimana da lunedì a oggi, contro i giorni prima |
+| `/calma [on\|off]` | Regolazione calma: limita i cambi di potenza (4.5) |
 | `/obiettivo <kWh> <HH:MM>`, `/obiettivo off` | Obiettivo di carica, per esempio `/obiettivo 15 7:30` |
 | `/prelevabile <W>`, `/protezione <W>` | Prelevabile per l'auto (modalità Sole + rete), soglia di protezione |
 | `/limite <kWh>` | Limite di energia |
@@ -420,7 +468,9 @@ modifica, quindi il browser prende subito quelli nuovi).
 
 Notifiche automatiche:
 
-- **Avvio e riepilogo:** avvio del sistema, riepilogo alle 23.
+- **Avvio e riepilogo:** avvio del sistema, riepilogo alle 23; la domenica
+  alla stessa ora anche il rapporto della settimana (si spegne dalle
+  impostazioni della pagina).
 - **Auto e colonnina:** auto collegata o scollegata, cambio fase, colonnina
   non raggiungibile o non in modalità `Man`.
 - **Potenza:** potenza massima raggiunta, carica spenta per poco sole,
@@ -437,6 +487,9 @@ modificabili dall'utente vengono salvate in `config_utente.json` e ricaricate
 all'avvio:
 
 - `POTENZA_PRELEVABILE`, `POTENZA_PROTEZIONE`, `LIMITE_KWH`, `MODALITA`;
+- `PRESET` (l'elenco), `PRESET_ATTIVO`;
+- `REGOLAZIONE_CALMA`, `CALMA_SOGLIA_W`, `CALMA_INTERVALLO_S`,
+  `RAPPORTO_SETTIMANALE`;
 - `PREZZO_ACQUISTO`, `PREZZO_VENDITA`;
 - `ALGORITMO`, `PID_KP`, `PID_KI`, `PID_KD`, `PID_MARGINE`.
 
@@ -471,6 +524,27 @@ Cartella `/home/tressilloide/solar/regolatore-potenza-carica`:
 | `pianificazione.json` | Obiettivo in corso |
 | `stato_energia.json` | Contatori di oggi, per ripartire dopo un riavvio |
 | `venv/` | L'ambiente Python del servizio |
+
+### 4.15 Previsione del sole
+
+`previsione.py` stima quanto produrrà il tetto nelle prossime ore e quanto
+ne resterà per l'auto (prima la casa). Serve all'obiettivo (4.4), e la
+pagina la mostra nella scheda Oggi ("Sole previsto").
+
+| Fonte | Come si calcola |
+|---|---|
+| **meteo** | La produzione di una giornata serena (la seconda ora migliore degli ultimi 14 giorni, dalle statistiche) per un fattore che scende con le nuvole: `1 - 0,75 × nuvole^3,4` |
+| **storico** | Senza meteo, o con meteo più vecchio di 9 ore: la media degli ultimi 5 giorni a quell'ora. Sui 47 giorni provati sbaglia in media del 31% sul totale del giorno ("uguale a ieri" sbaglia del 38%) |
+
+In tutti e due i casi le ore che restano di oggi si correggono con quello
+che il tetto ha reso finora rispetto al previsto (fra 0,35 e 1,6).
+
+Il meteo arriva da Home Assistant, che ha già le previsioni orarie di
+met.no (`weather.forecast_home`): il pacchetto
+`homeassistant/previsione_meteo.yaml` le pubblica ogni ora su
+`solare/previsione/meteo` (retained). Va copiato in `config/packages/` di
+Home Assistant; finché non c'è, la previsione resta quella dallo storico.
+Il Pi non interroga nessun servizio su internet.
 
 ### 4.14 Statistiche
 
@@ -542,7 +616,7 @@ Il Pi pubblica su Mosquitto del server (192.168.1.36:1883, utente
 | `solare/pi/stato` | Un JSON al minuto, subito dopo ogni `electricity` (retained) |
 | `solare/pi/sessione` | L'ultima sessione di ricarica chiusa (retained) |
 | `solare/pi/controlli` | Modalità, prelevabile e obiettivo (retained), a ogni cambio e ogni minuto |
-| `solare/pi/cmd/<comando>` | **Comandi** verso il Pi, non retained: `modalita` (`sole`/`misto`/`veloce`), `prelevabile` (W), `obiettivo` (`15 7:30` o `off`) |
+| `solare/pi/cmd/<comando>` | **Comandi** verso il Pi, non retained: `modalita` (`sole`/`misto`/`preset`), `preset` (nome), `calma` (`on`/`off`), `prelevabile` (W), `obiettivo` (`15 7:30` o `off`) |
 | `homeassistant/device/colonnina_pi/config` | Annuncio automatico per Home Assistant (MQTT Discovery) |
 
 Il JSON al minuto contiene:
@@ -571,7 +645,13 @@ In Home Assistant compare il dispositivo **Colonnina**:
 | `sensor.colonnina_in_auto_dal_sole_oggi` | kWh in auto dal sole oggi |
 | `sensor.colonnina_minuti_di_carica_oggi` | Minuti di carica oggi |
 | `sensor.colonnina_ultima_sessione` | kWh dell'ultima sessione, con i dettagli negli attributi |
-| `select.colonnina_modalita` | **Comando:** modalità di carica (`sole`, `misto`, `veloce`) |
+| `select.colonnina_modalita` | **Comando:** modalità di carica (`sole`, `misto`, `preset`) |
+| `select.colonnina_preset` | **Comando:** il preset (i nomi seguono quelli della pagina) |
+| `switch.colonnina_regolazione_calma` | **Comando:** regolazione calma |
+| `sensor.colonnina_autosufficienza_oggi`, `..._autoconsumo_oggi` | Percentuali della giornata in corso |
+| `sensor.colonnina_potenza_libera` | Quanto si può accendere adesso senza prelevare (produzione meno consumi, mai sotto zero): per le automazioni di boiler, lavatrice e simili |
+| `sensor.colonnina_carico_di_fondo` | Quel che resta sempre acceso in casa (ultimi 7 giorni) |
+| `sensor.colonnina_sole_previsto_oggi_resto`, `..._sole_previsto_domani` | kWh previsti (4.15) |
 | `number.colonnina_prelevabile_per_l_auto` | **Comando:** prelevabile per l'auto, 0-6600 W |
 | `sensor.colonnina_modalita_attiva` | Modalità in vigore, con l'obiettivo negli attributi |
 | `sensor.colonnina_obiettivo_caricato` | kWh caricati per l'obiettivo in corso |
@@ -579,7 +659,7 @@ In Home Assistant compare il dispositivo **Colonnina**:
 Senza aggiornamenti per 5 minuti i sensori diventano "non disponibili".
 
 Con i comandi Home Assistant può anche automatizzare: per esempio
-"modalità Veloce quando la tariffa è bassa", o un obiettivo pubblicando su
+"preset Veloce quando serve l'auto carica in fretta", o un obiettivo pubblicando su
 `solare/pi/cmd/obiettivo`. Il Pi valida ogni comando come quelli di
 Telegram, scrive nel log chi l'ha dato (`[HOME ASSISTANT]`) e ignora i
 messaggi retained. Mosquitto non ha ACL: qualunque utente del broker può

@@ -14,7 +14,9 @@ import time
 import unittest
 from unittest import mock
 
-from pianificatore import Pianificatore, interpreta_orario, prossima_scadenza
+from pianificatore import (Pianificatore, interpreta_orario, prossima_scadenza, valida_preset,
+                           valida_programma, preset_attivo, PRESET_BASE)
+from previsione import Previsione, fattore_nuvole
 from protezione_contatore import prelevabile_effettivo, ProtezioneContatore
 from regolatore_classico import RegolatoreClassico
 import statistiche
@@ -52,11 +54,29 @@ class TestPianificatore(unittest.TestCase):
         self.assertEqual(p.quota_auto(0), 1000)
         cfg['MODALITA'] = 'sole'
         self.assertEqual(p.quota_auto(0), 0)
-        cfg['MODALITA'] = 'veloce'
+        cfg['MODALITA'] = 'preset'                 # senza elenco valgono quelli di serie
         self.assertEqual(p.quota_auto(0), 6600)
+        cfg.update(PRESET=[{'nome': 'Notte', 'prelevabile': 4000, 'limite_kwh': 20},
+                           {'nome': 'Rabbocco', 'prelevabile': 3000, 'limite_kwh': 10}], PRESET_ATTIVO=1)
+        self.assertEqual(p.quota_auto(0), 3000)
+        self.assertEqual(p.stato()['nome_modalita'], 'Preset Rabbocco')
+        cfg['PRESET_ATTIVO'] = 7                    # indice rimasto da un elenco piu' lungo
+        self.assertEqual(preset_attivo(cfg)['nome'], 'Notte')
+        self.assertEqual(p.quota_auto(0), 4000)
 
-    def test_veloce_resta_entro_il_contatore(self):
-        cfg = config_base(MODALITA='veloce')
+    def test_preset_validi_e_no(self):
+        ok, puliti = valida_preset([{'nome': '  Notte   piena ', 'prelevabile': '4000', 'limite_kwh': 20.4}])
+        self.assertTrue(ok)
+        self.assertEqual(puliti, [{'nome': 'Notte piena', 'prelevabile': 4000, 'limite_kwh': 20}])
+        self.assertTrue(valida_preset(PRESET_BASE)[0])
+        for sbagliato in ([], 'x', [{'nome': '', 'prelevabile': 1000}], [{'nome': 'A', 'prelevabile': 'tanto'}],
+                          [{'nome': 'A', 'prelevabile': 30000}], [{'nome': 'A', 'prelevabile': 1000, 'limite_kwh': 200}],
+                          [{'nome': 'A', 'prelevabile': 1}, {'nome': 'a', 'prelevabile': 2}],
+                          [{'nome': str(n), 'prelevabile': 1000} for n in range(9)]):
+            self.assertFalse(valida_preset(sbagliato)[0], sbagliato)
+
+    def test_preset_veloce_resta_entro_il_contatore(self):
+        cfg = config_base(MODALITA='preset')
         cfg['PIANIFICATORE'], _ = nuovo_pianificatore(cfg)
         # Casa a 2 kW senza sole: in tutto non oltre 6600 - 300
         self.assertEqual(prelevabile_effettivo(cfg, 2000), 6300)
@@ -239,8 +259,124 @@ class TestClassicoConPianificatore(unittest.TestCase):
         self.assertFalse(self.passo_notte('misto', POTENZA_PRELEVABILE=1000)[0].is_on)
         self.assertTrue(self.passo_notte('misto', POTENZA_PRELEVABILE=2000)[0].is_on)
 
-    def test_veloce_accende(self):
-        self.assertTrue(self.passo_notte('veloce')[0].is_on)
+    def test_preset_accende(self):
+        self.assertTrue(self.passo_notte('preset')[0].is_on)
+        debole = [{'nome': 'Poco', 'prelevabile': 1000, 'limite_kwh': 0}]
+        self.assertFalse(self.passo_notte('preset', PRESET=debole)[0].is_on)
+
+    def regolatore_calmo(self, setpoint=3000, **altro):
+        orologio = Orologio()
+        cfg = config_base(**dict(dict(REGOLAZIONE_CALMA=True, CALMA_SOGLIA_W=500, CALMA_INTERVALLO_S=30), **altro))
+        wb = FintaWallbox(cfg, fase=0, setpoint=setpoint)
+        righe = []
+        return RegolatoreClassico(cfg, log=righe.append, orologio=orologio), wb, orologio, righe
+
+    def test_calma_salta_i_cambi_piccoli_e_ravvicinati(self):
+        reg, wb, orologio, righe = self.regolatore_calmo()
+        reg._imposta(wb, 3300, False, "Aumento")           # sotto la soglia
+        self.assertEqual(wb.current_set_power, 3000)
+        reg._imposta(wb, 3600, False, "Aumento")           # sopra: passa
+        self.assertEqual(wb.current_set_power, 3600)
+        orologio.t += 10
+        reg._imposta(wb, 4300, False, "Aumento")           # troppo presto
+        reg._imposta(wb, 3000, False, "Diminuisco")        # calo normale: troppo presto anche lui
+        self.assertEqual(wb.current_set_power, 3600)
+        reg._imposta(wb, 2500, False, "Diminuisco")        # calo grosso (due soglie): subito
+        self.assertEqual(wb.current_set_power, 2500)
+        orologio.t += 31
+        reg._imposta(wb, 3100, False, "Diminuisco")        # passato l'intervallo
+        self.assertEqual(wb.current_set_power, 3100)
+        self.assertEqual(reg.cambi_evitati, 3)
+        # il verbo del registro segue il verso vero del cambio
+        self.assertIn("Aumento: 2500W -> 3100W", righe[-1])
+        self.assertIn("Diminuisco: 3600W -> 2500W", righe[-2])
+
+    def test_senza_calma_passa_tutto(self):
+        reg, wb, _, _ = self.regolatore_calmo(REGOLAZIONE_CALMA=False)
+        reg._imposta(wb, 3100, False, "Aumento")
+        self.assertEqual(wb.current_set_power, 3100)
+        # i comandi forzati (minimo, massimo) passano anche in calma
+        reg, wb, _, _ = self.regolatore_calmo()
+        reg._imposta(wb, 3100, True, "Aumento al massimo")
+        self.assertEqual(wb.current_set_power, 3100)
+
+    def test_programma_settimanale(self):
+        # lunedi' 15 giugno 2026, ore 10
+        orologio = Orologio(mezzanotte() + 10 * 3600)
+        cfg = config_base(MODALITA='sole')
+        p, avvisi = nuovo_pianificatore(cfg, orologio=orologio)
+        ok, _ = p.imposta_programma([{'giorni': [0, 1, 2, 3, 4], 'ora': '7:00', 'kwh': 15, 'attivo': True},
+                                     {'giorni': [5], 'ora': '09:30', 'kwh': 30, 'attivo': False}])
+        self.assertTrue(ok)
+        # la prossima e' martedi' alle 7: fra 21 ore, quindi e' gia' l'obiettivo
+        self.assertEqual(p.obiettivo['kwh'], 15)
+        self.assertTrue(p.obiettivo['ricorrente'])
+        martedi = mezzanotte() + 86400 + 7 * 3600
+        self.assertEqual(p.obiettivo['entro'], martedi)
+        # annullarlo salta solo martedi': il prossimo e' mercoledi', che parte 24 ore prima
+        p.annulla_obiettivo()
+        p.controlla()
+        self.assertIsNone(p.obiettivo)
+        self.assertEqual(p.stato()['prossima_programma']['entro'], martedi + 86400)
+        orologio.t = martedi + 60
+        p.controlla()
+        self.assertEqual(p.obiettivo['entro'], martedi + 86400)
+        # auto mai vista: alla scadenza niente avviso, e riparte quello di giovedi'
+        orologio.t = martedi + 86400 + 1
+        p.controlla()
+        self.assertEqual(avvisi, [])
+        self.assertEqual(p.obiettivo['entro'], martedi + 2 * 86400)
+        # l'auto carica 6 kWh e poi viene staccata: l'obiettivo del programma resta e riparte da zero
+        p.aggiungi_energia(6)
+        self.assertFalse(p.auto_scollegata())
+        self.assertEqual((p.obiettivo['fatti'], p.obiettivo['ricorrente']), (0.0, True))
+        # un obiettivo messo a mano ha la precedenza, e lo scollegamento lo annulla
+        p.imposta_obiettivo(5, orologio.t + 3600)
+        p.controlla()
+        self.assertFalse(p.obiettivo['ricorrente'])
+        self.assertTrue(p.auto_scollegata())
+        self.assertIsNone(p.obiettivo)
+        p.controlla()
+        self.assertTrue(p.obiettivo['ricorrente'])     # e il programma riprende il suo posto
+        # raggiunto col sole, poi l'auto esce: al rientro va ricaricata, quindi torna attivo
+        p.aggiungi_energia(15)
+        self.assertIsNone(p.obiettivo)
+        self.assertFalse(p.auto_scollegata())
+        self.assertEqual((p.obiettivo['entro'], p.obiettivo['fatti']), (martedi + 2 * 86400, 0.0))
+        # persistenza
+        q, _ = nuovo_pianificatore(cfg, orologio=orologio)
+        q.importa(p.esporta())
+        self.assertEqual(len(q.programma), 2)
+        self.assertEqual(q.programma[0]['ora'], '07:00')
+        # regole sbagliate
+        for sbagliata in ([{'giorni': [], 'ora': '7:00', 'kwh': 10}], [{'giorni': [9], 'ora': '7:00', 'kwh': 10}],
+                          [{'giorni': [1], 'ora': '25:00', 'kwh': 10}], [{'giorni': [1], 'ora': '7:00', 'kwh': 0}], 'x'):
+            self.assertFalse(valida_programma(sbagliata)[0], sbagliata)
+        self.assertTrue(p.imposta_programma([])[0])
+
+    def test_obiettivo_aspetta_il_sole_previsto(self):
+        orologio = Orologio()
+        cfg = config_base(MODALITA='sole')
+        p, _ = nuovo_pianificatore(cfg, orologio=orologio)
+        p.imposta_obiettivo(20, orologio.t + 10 * 3600)
+        # senza previsione: 20 kWh in 10 ore sono 2222 W medi, sopra il minimo -> rete subito
+        self.assertGreater(p.quota_auto(500), 0)
+        self.assertTrue(p.in_recupero)
+        # con 20 kWh di sole previsti (se ne contano 14): dalla rete ne servono 6, cioe' 667 W: si aspetta
+        p.imposta_obiettivo(20, orologio.t + 10 * 3600)
+        p.sole_atteso = lambda da, a: 20.0
+        self.assertEqual(p.quota_auto(500), 0)
+        self.assertFalse(p.in_recupero)
+        self.assertEqual(p.stato()['obiettivo']['sole_previsto_kwh'], 20.0)
+        self.assertAlmostEqual(p.stato()['obiettivo']['potenza_necessaria'], 667, delta=1)
+        # il sole non e' arrivato e manca poco: la rete da sola farebbe fatica, si smette di aspettare
+        orologio.t += 5.5 * 3600
+        self.assertGreater(p.quota_auto(500), 3000)
+        self.assertTrue(p.in_recupero)
+        # una previsione che si rompe non ferma la carica
+        p.imposta_obiettivo(20, orologio.t + 10 * 3600)
+        p.sole_atteso = lambda da, a: 1 / 0
+        self.assertGreater(p.quota_auto(500), 0)
 
     def test_obiettivo_accende_di_notte(self):
         orologio = Orologio()
@@ -263,6 +399,61 @@ def mezzanotte(anno=2026, mese=6, giorno=15):
 def giornata(inizio, consumo=lambda ora: 1000, sole=lambda ora: 0, auto=lambda ora: 0, minuti=1440):
     """Un campione al minuto; le funzioni ricevono l'ora del giorno (decimale)."""
     return [(inizio + m * 60, consumo(m / 60), sole(m / 60), auto(m / 60), None) for m in range(minuti)]
+
+
+class TestPrevisione(unittest.TestCase):
+    def storia(self, giorni=6, sole=lambda h: 4000 if 10 <= h < 16 else 0, **altro):
+        campioni = []
+        for n in range(giorni):
+            campioni += giornata(mezzanotte() + n * 86400, sole=sole, **altro)
+        return statistiche.aggrega(campioni)
+
+    def test_senza_storia_non_si_prevede(self):
+        p = Previsione(orologio=lambda: mezzanotte())
+        self.assertIsNone(p.sole_per_auto(mezzanotte(), mezzanotte() + 86400))
+        self.assertEqual(p.riepilogo(), {'fonte': None})
+
+    def test_dallo_storico(self):
+        adesso = mezzanotte() + 6 * 86400 + 60          # il settimo giorno, appena dopo mezzanotte
+        p = Previsione(orologio=lambda: adesso)
+        p.aggiorna_storia(self.storia())
+        self.assertEqual(p.fonte(), 'storico')
+        r = p.riepilogo()
+        self.assertEqual(r['oggi_restante_kwh'], 24.0)      # sei ore a 4 kW
+        self.assertEqual(r['domani_kwh'], 24.0)
+        self.assertEqual(r['oggi_restante_auto_kwh'], 18.0) # la casa da 1 kW passa prima
+        # solo un pezzo della giornata, anche con ore a meta'
+        self.assertAlmostEqual(p.sole_per_auto(adesso + 10.5 * 3600 - 60, adesso + 12 * 3600 - 60), 4.5)
+
+    def test_col_meteo_e_con_le_nuvole(self):
+        adesso = mezzanotte() + 6 * 86400 + 60
+        p = Previsione(orologio=lambda: adesso)
+        p.aggiorna_storia(self.storia())
+        ore = [{'t': adesso - 60 + h * 3600, 'nuvole': 100} for h in range(48)]
+        self.assertEqual(p.imposta_meteo(ore + [{'t': 'boh', 'nuvole': 5}, {'nuvole': 5}]), 48)
+        self.assertEqual(p.fonte(), 'meteo')
+        self.assertAlmostEqual(fattore_nuvole(100), 0.25)
+        self.assertAlmostEqual(fattore_nuvole(0), 1.0)
+        self.assertEqual(p.riepilogo()['domani_kwh'], 6.0)   # un quarto del sereno
+        # data in formato ISO, come la manda Home Assistant
+        self.assertEqual(p.imposta_meteo([{'t': '2026-06-21T10:00:00+00:00', 'nuvole': 0}]), 1)
+        # un meteo vecchio non si usa piu'
+        p.meteo_del = adesso - 12 * 3600
+        self.assertEqual(p.fonte(), 'storico')
+
+    def test_correzione_con_la_mattina_di_oggi(self):
+        # oggi fino alle 13 il tetto ha reso la meta' del solito
+        giorni = self.storia()
+        oggi = statistiche.aggrega(giornata(mezzanotte() + 6 * 86400, minuti=13 * 60,
+                                            sole=lambda h: 2000 if 10 <= h < 16 else 0))
+        giorni.update(oggi)
+        adesso = mezzanotte() + 6 * 86400 + 13 * 3600
+        p = Previsione(orologio=lambda: adesso)
+        p.aggiorna_storia(giorni)
+        self.assertAlmostEqual(p.correzione_di_oggi(), 0.5)
+        r = p.riepilogo()
+        self.assertEqual(r['oggi_restante_kwh'], 6.0)        # tre ore a 2 kW invece di 4
+        self.assertEqual(r['domani_kwh'], 24.0)              # domani no
 
 
 class TestStatistiche(unittest.TestCase):
@@ -465,6 +656,7 @@ class TestServizio(unittest.TestCase):
             FILE_STATO_ENERGIA=os.path.join(d, 'energia.json'),
             FILE_PIANO=os.path.join(d, 'piano.json'),
             FILE_STORICO=os.path.join(d, 'storico.jsonl'),
+            salva_config=lambda: True,
             archivio_statistiche=statistiche.Archivio(os.path.join(d, 'statistiche.jsonl')),
             ponte_mqtt_instance=None, wallbox_instance=None,
             notifica=lambda *a, **k: None, log_msg=lambda m: None)
@@ -549,6 +741,9 @@ class TestServizio(unittest.TestCase):
         self.assertIsNone(r.get_json()['piano']['obiettivo'])
         r = client.post('/api/comando', json={'nome': 'boost', 'valore': '30'})     # tolto il 10/11/2026
         self.assertEqual(r.status_code, 400)
+        r = client.post('/api/comando', json={'nome': 'calma', 'valore': 'on'})
+        self.assertTrue(r.get_json()['piano']['calma'])
+        self.assertTrue(sw.CONFIG['REGOLAZIONE_CALMA'])
         r = client.post('/api/comando', json={'nome': 'prelevabile', 'valore': '2500'})
         self.assertEqual(r.get_json()['piano']['prelevabile_w'], 2500)
         r = client.post('/api/comando', json={'nome': 'prelevabile', 'valore': '-5'})
@@ -657,6 +852,98 @@ class TestServizio(unittest.TestCase):
             self.assertEqual(sw.potenza_auto_per_i_conteggi(3000), 3000)
             w.offline_dal = time.time() - 600
             self.assertEqual(sw.potenza_auto_per_i_conteggi(3000), 0)
+
+    def test_preset_dalla_pagina(self):
+        client = sw.app.test_client()
+        # colonnina che risponde: il limite del preset va subito sulla centralina
+        w = mock.Mock(sync_falliti=0, limite_in_attesa=None)
+        w.set_limite_kwh.return_value = (True, 'ok')
+        w.limiti_potenza.return_value = (1380, 7360)
+        with mock.patch.object(sw, 'wallbox_instance', w), \
+                mock.patch.dict(sw.CONFIG, {'CMD_LIMITE_TEMPLATE': 'L{valore}'}):
+            r = client.post('/api/comando', json={'nome': 'preset', 'valore': 1})
+            self.assertEqual(r.status_code, 200, r.get_json())
+            piano = r.get_json()['piano']
+            self.assertEqual((piano['modalita'], piano['preset_attivo'], piano['preset_nome']), ('preset', 1, 'Notte'))
+            w.set_limite_kwh.assert_called_with(20)
+            self.assertEqual(sw.CONFIG['LIMITE_KWH'], 20)
+            self.assertEqual(sw.pianificatore_instance.quota_auto(0), 4000)
+            # per nome, e "veloce" come si chiamava prima
+            self.assertEqual(client.post('/api/comando', json={'nome': 'preset', 'valore': 'rabbocco'})
+                             .get_json()['piano']['preset_attivo'], 2)
+            r = client.post('/api/comando', json={'nome': 'modalita', 'valore': 'veloce'})
+            self.assertEqual(r.get_json()['piano']['preset_nome'], 'Veloce')
+            w.set_limite_kwh.assert_called_with(0)
+            self.assertEqual(client.post('/api/comando', json={'nome': 'preset', 'valore': 'boh'}).status_code, 400)
+            # colonnina spenta: il limite resta in attesa
+            w.sync_falliti = 5
+            w.set_limite_kwh.reset_mock()
+            r = client.post('/api/comando', json={'nome': 'preset', 'valore': 'Notte'})
+            w.set_limite_kwh.assert_not_called()
+            self.assertEqual(w.limite_in_attesa, 20)
+            self.assertIn('appena la colonnina risponde', r.get_json()['messaggio'])
+            # modifica dell'elenco: il preset attivo cambia limite, che viene riapplicato
+            w.sync_falliti = 0
+            nuovi = [{'nome': 'Notte', 'prelevabile': 4500, 'limite_kwh': 25}]
+            r = client.post('/api/preset', json={'preset': nuovi})
+            self.assertEqual(r.status_code, 200, r.get_json())
+            self.assertEqual(r.get_json()['piano']['preset'], nuovi)
+            self.assertEqual(r.get_json()['piano']['preset_attivo'], 0)
+            w.set_limite_kwh.assert_called_with(25)
+            self.assertEqual(client.post('/api/preset', json={'preset': []}).status_code, 400)
+            self.assertEqual(client.post('/api/preset', data='x').status_code, 400)
+
+    def test_programma_previsione_e_rapporto(self):
+        client = sw.app.test_client()
+        regole = [{'giorni': [0, 2, 4], 'ora': '07:00', 'kwh': 12, 'attivo': True}]
+        r = client.post('/api/programma', json={'programma': regole})
+        self.assertEqual(r.status_code, 200, r.get_json())
+        piano = r.get_json()['piano']
+        self.assertEqual(piano['programma'], [dict(regole[0], kwh=12.0)])
+        self.assertIsNotNone(piano['prossima_programma'])
+        self.assertEqual(client.post('/api/programma', json={'programma': [{'giorni': []}]}).status_code, 400)
+
+        memoria = sw.SYSTEM_STATE['ULTIME_LETTURE_FASI']
+        prima = list(memoria)
+        memoria.clear()
+        sw._stat_oggi.update(t=0.0, record=None)
+        try:
+            adesso = time.time()
+            inizio_oggi = time.mktime(time.localtime(adesso)[:3] + (0, 0, 0, 0, 0, -1))
+            for giorno in (2, 1):                    # due giorni interi di storia: 3 kW di sole dalle 10 alle 16
+                for m in range(1440):
+                    sole = 3000 if 600 <= m < 960 else 0
+                    memoria.append((1000, sole, [0] * 6, inizio_oggi - giorno * 86400 + m * 60, 0))
+            memoria.append((1000, 0, [0] * 6, inizio_oggi + 30, 0))
+            sw.archivia_statistiche()
+            p = sw.aggiorna_previsione(forza=True)
+            self.assertEqual(p['fonte'], 'storico')
+            self.assertEqual(p['domani_kwh'], 18.0)
+            self.assertEqual(client.get('/api/previsione').get_json()['domani_kwh'], 18.0)
+            self.assertEqual(client.get('/api/data').get_json()['piano']['previsione']['fonte'], 'storico')
+            self.assertIn('Domani: 18.0 kWh', sw.testo_previsione())
+            # il meteo di Home Assistant: tutto coperto, un quarto del sereno
+            sw.meteo_ricevuto({'ore': [{'t': adesso + h * 3600, 'nuvole': 100} for h in range(-2, 50)]})
+            self.assertEqual(sw.aggiorna_previsione()['fonte'], 'meteo')
+            self.assertEqual(sw.aggiorna_previsione()['domani_kwh'], 4.5)
+            sw.meteo_ricevuto('rotto')               # non deve sollevare eccezioni
+
+            ha = sw.statistiche_per_ha(mock.Mock(solar_now=2500, total_grid_load=900))
+            self.assertEqual(ha['potenza_libera_w'], 1600)
+            self.assertEqual(ha['carico_fondo_w'], 1000)
+            self.assertEqual(ha['previsione_domani_kwh'], 4.5)
+            self.assertIn('autosufficienza_oggi', ha)
+
+            testo = sw.rapporto_settimanale()
+            self.assertIn('La settimana', testo)
+            self.assertIn('Prodotti', testo)
+        finally:
+            memoria.clear()
+            memoria.extend(prima)
+            sw._stat_oggi.update(t=0.0, record=None)
+            sw._previsione.update(t=0.0, riepilogo={'fonte': None})
+            sw._fondo.update(t=0.0, w=None)
+            sw.previsione_instance.meteo = {}
 
     def test_api_data_leggera(self):
         client = sw.app.test_client()

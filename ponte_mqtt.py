@@ -41,7 +41,13 @@ T_STATO = 'solare/pi/stato'
 T_SESSIONE = 'solare/pi/sessione'
 T_CONTROLLI = 'solare/pi/controlli'
 T_COMANDI = 'solare/pi/cmd/'
-COMANDI = ('modalita', 'prelevabile', 'obiettivo')
+COMANDI = ('modalita', 'prelevabile', 'obiettivo', 'preset', 'calma')
+# Statistiche e previsione: un argomento a parte, cosi' non finiscono nel
+# record al minuto che il server archivia per sempre
+T_STATISTICHE = 'solare/pi/statistiche'
+# Copertura nuvolosa ora per ora, pubblicata da Home Assistant (retained):
+# vedi homeassistant/previsione_meteo.yaml
+T_METEO = 'solare/previsione/meteo'
 T_DISCOVERY = f'homeassistant/device/{NODO}/config'
 CODA_MAX = 7 * 24 * 60
 # Senza un nuovo 'stato' per 5 minuti i sensori diventano "non disponibili":
@@ -59,6 +65,11 @@ def _sensore(chiave, nome, campo, **opzioni):
     return {'p': 'sensor', 'name': nome, 'unique_id': f'{NODO}_{chiave}',
             'value_template': f'{{{{ value_json.{campo} }}}}',
             'expire_after': SCADENZA_S, **opzioni}
+
+
+def _stat(chiave, nome, campo, **opzioni):
+    return dict(_sensore(chiave, nome, campo, **opzioni), state_topic=T_STATISTICHE,
+                value_template=f'{{{{ value_json.{campo} if value_json.{campo} is not none else none }}}}')
 
 
 # Gli entity_id vengono dal nome: sensor.colonnina_in_auto_oggi, ...
@@ -80,7 +91,7 @@ SENSORI = {
     # Lo stato viene da T_CONTROLLI, pubblicato subito dopo ogni comando:
     # quello al minuto farebbe tornare indietro il selettore per un minuto.
     'modalita': {'p': 'select', 'name': 'Modalità', 'unique_id': f'{NODO}_modalita',
-                 'icon': 'mdi:car-cog', 'options': ['sole', 'misto', 'veloce'],
+                 'icon': 'mdi:car-cog', 'options': ['sole', 'misto', 'preset'],
                  'command_topic': T_COMANDI + 'modalita', 'state_topic': T_CONTROLLI,
                  'value_template': '{{ value_json.modalita }}'},
     'prelevabile': {'p': 'number', 'name': 'Prelevabile per l\'auto',
@@ -89,12 +100,15 @@ SENSORI = {
                     'unit_of_measurement': 'W', 'device_class': 'power',
                     'command_topic': T_COMANDI + 'prelevabile', 'state_topic': T_CONTROLLI,
                     'value_template': '{{ value_json.prelevabile_w }}'},
-    # Il boost e' stato tolto il 10/11/2026. Un componente con la sola
-    # piattaforma dice a Home Assistant di eliminare i due pulsanti che aveva
-    # gia' creato; ometterli li lascerebbe li', orfani. Queste due righe si
-    # possono togliere quando HA li ha rimossi.
-    'boost': {'p': 'button'},
-    'boost_annulla': {'p': 'button'},
+    # Le opzioni (i nomi dei preset) le mette _discovery(): cambiano dalla pagina
+    'preset': {'p': 'select', 'name': 'Preset', 'unique_id': f'{NODO}_preset',
+               'icon': 'mdi:playlist-star', 'options': [],
+               'command_topic': T_COMANDI + 'preset', 'state_topic': T_CONTROLLI,
+               'value_template': '{{ value_json.preset_nome }}'},
+    'calma': {'p': 'switch', 'name': 'Regolazione calma', 'unique_id': f'{NODO}_calma',
+              'icon': 'mdi:sine-wave', 'command_topic': T_COMANDI + 'calma',
+              'payload_on': 'on', 'payload_off': 'off', 'state_topic': T_CONTROLLI,
+              'value_template': "{{ 'on' if value_json.calma else 'off' }}"},
     'modalita_attiva': {'p': 'sensor', 'name': 'Modalità attiva', 'unique_id': f'{NODO}_modalita_attiva',
                         'icon': 'mdi:car-clock', 'state_topic': T_CONTROLLI,
                         'value_template': '{{ value_json.modalita_effettiva }}',
@@ -102,6 +116,25 @@ SENSORI = {
     'obiettivo': {'p': 'sensor', 'name': 'Obiettivo caricato', 'unique_id': f'{NODO}_obiettivo',
                   'icon': 'mdi:target', 'state_topic': T_CONTROLLI, 'unit_of_measurement': 'kWh',
                   'value_template': '{{ value_json.obiettivo.fatti if value_json.obiettivo else 0 }}'},
+    # --- Statistiche e previsione (T_STATISTICHE, ogni minuto) ------------
+    'autosufficienza_oggi': _stat('autosufficienza_oggi', 'Autosufficienza oggi', 'autosufficienza_oggi',
+                                  icon='mdi:home-lightning-bolt', unit_of_measurement='%',
+                                  state_class='measurement', suggested_display_precision=0),
+    'autoconsumo_oggi': _stat('autoconsumo_oggi', 'Autoconsumo oggi', 'autoconsumo_oggi',
+                              icon='mdi:solar-power', unit_of_measurement='%',
+                              state_class='measurement', suggested_display_precision=0),
+    # quanto si potrebbe accendere adesso senza prelevare: per le automazioni
+    # di boiler, lavatrice e simili
+    'potenza_libera': _stat('potenza_libera', 'Potenza libera', 'potenza_libera_w',
+                            icon='mdi:transmission-tower-export', **POTENZA),
+    'carico_fondo': _stat('carico_fondo', 'Carico di fondo', 'carico_fondo_w',
+                          icon='mdi:power-sleep', **POTENZA),
+    'previsione_oggi': _stat('previsione_oggi', 'Sole previsto oggi (resto)', 'previsione_oggi_kwh',
+                             icon='mdi:weather-sunny-alert', unit_of_measurement='kWh',
+                             device_class='energy', suggested_display_precision=1),
+    'previsione_domani': _stat('previsione_domani', 'Sole previsto domani', 'previsione_domani_kwh',
+                               icon='mdi:weather-sunny-alert', unit_of_measurement='kWh',
+                               device_class='energy', suggested_display_precision=1),
     'ultima_sessione': {'p': 'sensor', 'name': 'Ultima sessione', 'unique_id': f'{NODO}_ultima_sessione',
                         'state_topic': T_SESSIONE, 'value_template': '{{ value_json.kwh }}',
                         'json_attributes_topic': T_SESSIONE, 'icon': 'mdi:ev-plug-type2',
@@ -119,6 +152,8 @@ class PonteMQTT:
         self._chiuso = False
         self._comandi = None         # funzione(nome, valore) -> (ok, messaggio)
         self._ultimi_controlli = None
+        self._meteo = None           # funzione(dati) per la previsione meteo
+        self._nomi_preset = []
         if not self.attivo:
             if host and mqtt is None:
                 log("[MQTT] paho-mqtt non installato: niente dati verso Home Assistant")
@@ -146,6 +181,18 @@ class PonteMQTT:
             return
         self._errore_segnalato = False
         self.log(f"[MQTT] Connesso a {self.host}")
+        self._discovery()
+        client.publish(T_ONLINE, 'online', qos=1, retain=True)
+        if self._ultimi_controlli is not None:
+            self._pubblica(T_CONTROLLI, self._ultimi_controlli)
+        # Ad ogni (ri)connessione: la sottoscrizione non sopravvive a una
+        # sessione pulita del broker
+        client.subscribe(T_COMANDI + '#', qos=1)
+        client.subscribe(T_METEO, qos=1)
+
+    def _discovery(self):
+        componenti = dict(SENSORI)
+        componenti['preset'] = dict(SENSORI['preset'], options=list(self._nomi_preset) or ['-'])
         configurazione = {
             'dev': {'ids': [NODO], 'name': 'Colonnina', 'mf': 'regolatore-potenza-carica',
                     'mdl': 'Raspberry Pi e colonnina EVR'},
@@ -153,15 +200,27 @@ class PonteMQTT:
             'state_topic': T_STATO,
             'availability_topic': T_ONLINE,
             'qos': 1,
-            'cmps': SENSORI,
+            'cmps': componenti,
         }
-        client.publish(T_DISCOVERY, json.dumps(configurazione), qos=1, retain=True)
-        client.publish(T_ONLINE, 'online', qos=1, retain=True)
-        if self._ultimi_controlli is not None:
-            self._pubblica(T_CONTROLLI, self._ultimi_controlli)
-        # Ad ogni (ri)connessione: la sottoscrizione non sopravvive a una
-        # sessione pulita del broker
-        client.subscribe(T_COMANDI + '#', qos=1)
+        try:
+            self.client.publish(T_DISCOVERY, json.dumps(configurazione), qos=1, retain=True)
+        except Exception as e:
+            self.log(f"[MQTT] Discovery non pubblicata: {e}")
+
+    def imposta_preset(self, nomi):
+        """I nomi dei preset, per il selettore di Home Assistant. Si
+        ripubblica la discovery solo se sono cambiati."""
+        nomi = list(nomi)
+        if nomi == self._nomi_preset:
+            return
+        self._nomi_preset = nomi
+        if self.attivo and self.client.is_connected():
+            self._discovery()
+
+    def imposta_meteo(self, funzione):
+        """`funzione(dati)` riceve la previsione meteo pubblicata da Home
+        Assistant (un dizionario con 'ore')."""
+        self._meteo = funzione
 
     def imposta_comandi(self, funzione):
         """`funzione(nome, valore)` esegue un comando arrivato da Home
@@ -172,6 +231,11 @@ class PonteMQTT:
         """Comandi da Home Assistant. Gira nel thread di paho: non deve mai
         sollevare eccezioni, ne' bloccarsi a lungo."""
         try:
+            if msg.topic == T_METEO:
+                # retained: e' un dato, non un comando, e all'avvio serve subito
+                if self._meteo is not None:
+                    self._meteo(json.loads(msg.payload.decode('utf-8', errors='replace')))
+                return
             nome = msg.topic[len(T_COMANDI):] if msg.topic.startswith(T_COMANDI) else None
             if msg.retain:
                 # Un comando retained verrebbe rieseguito a ogni riconnessione
@@ -222,6 +286,10 @@ class PonteMQTT:
             dati['produzione_min_w'] = round(min(soli))
             dati['produzione_max_w'] = round(max(soli))
         self._pubblica(T_STATO, dati)
+
+    def pubblica_statistiche(self, dati):
+        if self.attivo:
+            self._pubblica(T_STATISTICHE, dati)
 
     def pubblica_sessione(self, sessione):
         if self.attivo:

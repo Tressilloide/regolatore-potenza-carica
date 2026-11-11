@@ -1,0 +1,44 @@
+# Pacchetto per Home Assistant: manda al regolatore la copertura nuvolosa
+# prevista, ora per ora, per le prossime 48 ore.
+#
+# Il Raspberry la usa per prevedere il sole (previsione.py): con le nuvole
+# sa quanto rendera' il tetto domani, senza resta alla media degli ultimi
+# giorni. La fonte e' weather.forecast_home (met.no), che Home Assistant
+# interroga gia' per conto suo: non parte nessuna richiesta nuova verso
+# internet.
+#
+# Installazione: copiare questo file in config/packages/ e riavviare Home
+# Assistant (o ricaricare le automazioni). Nel registro del Pi compare
+# "[PREVISIONE] Meteo da Home Assistant: 48 ore" e la pagina, sotto "Sole
+# previsto", scrive "Dal meteo di Home Assistant".
+automation:
+  - id: solare_previsione_meteo
+    alias: "Solare: previsione meteo al regolatore"
+    description: "Ogni ora pubblica su MQTT le nuvole previste (weather.forecast_home)"
+    mode: single
+    triggers:
+      - trigger: time_pattern
+        minutes: 7
+      - trigger: homeassistant
+        event: start
+    actions:
+      - delay: "00:00:30"
+      - action: weather.get_forecasts
+        target:
+          entity_id: weather.forecast_home
+        data:
+          type: hourly
+        response_variable: previsioni
+      - action: mqtt.publish
+        data:
+          topic: solare/previsione/meteo
+          retain: true
+          qos: 1
+          payload: >-
+            {% set ns = namespace(ore=[]) %}
+            {% for f in previsioni['weather.forecast_home'].forecast[:48] %}
+              {% if f.cloud_coverage is defined and f.cloud_coverage is not none %}
+                {% set ns.ore = ns.ore + [{'t': f.datetime, 'nuvole': f.cloud_coverage}] %}
+              {% endif %}
+            {% endfor %}
+            {{ {'ts': now().timestamp() | int, 'ore': ns.ore} | tojson }}

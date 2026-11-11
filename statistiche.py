@@ -517,6 +517,9 @@ def _giornaliero(r):
     }
 
 
+giornaliero = _giornaliero      # i totali di un giorno, anche per chi sta fuori dal modulo
+
+
 def calcola(giorni, da, a, prezzi, limite_contatore=6600):
     """Tutti i numeri della pagina per il periodo [da, a] (giorni ISO, inclusi).
 

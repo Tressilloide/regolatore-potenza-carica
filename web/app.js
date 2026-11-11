@@ -123,7 +123,7 @@ function setCampo(id, valore) {
 function mostraSporchi() {
     $('non_salvate').hidden = ![...sporchi].some(id => id !== 'limite');
 }
-['protezione', 'prezzo_acquisto', 'prezzo_vendita', 'limite'].forEach(id => {
+['protezione', 'prezzo_acquisto', 'prezzo_vendita', 'limite', 'calma_soglia', 'calma_intervallo'].forEach(id => {
     $(id).addEventListener('input', () => { sporchi.add(id); mostraSporchi(); if (ultimo) mostraLimite(ultimo); });
 });
 
@@ -330,6 +330,8 @@ function mostraCarica(d, b) {
     if (!p) return;
 
     testo('seg_misto_w', '+ ' + watt(p.prelevabile_w));
+    const preset = (p.preset || [])[p.preset_attivo] || null;
+    testo('seg_preset_nome', preset ? preset.nome : '--');
     document.querySelectorAll('#seg_modalita button').forEach(el => {
         const attivo = el.dataset.m === p.modalita_effettiva;
         el.classList.toggle('attivo', attivo);
@@ -345,11 +347,20 @@ function mostraCarica(d, b) {
         nota = 'Oltre al sole, l’auto può prendere dalla rete fino al prelevabile, in aggiunta a quello che '
              + 'preleva la casa. In tutto si resta sotto ' + watt(tetto) + ' (limite del contatore).';
     } else {
-        nota = 'L’auto prende tutto quello che il contatore permette: fino a ' + watt(tetto)
-             + ' di prelievo, casa compresa. Il prelevabile qui sopra non conta.';
+        nota = preset
+            ? 'Oltre al sole, l’auto prende dalla rete fino a ' + watt(preset.prelevabile)
+              + (preset.limite_kwh ? ' e la colonnina si ferma a ' + preset.limite_kwh + ' kWh.' : ', senza limite di energia.')
+              + ' In tutto si resta sotto ' + watt(tetto) + ' (limite del contatore).'
+            : '';
+        if (!manca(p.limite_in_attesa)) {
+            nota += ' Il limite di energia verrà impostato appena la colonnina risponde.';
+        }
     }
     testo('nota_modalita', nota);
     mostraPrelevabile(c, p);
+    mostraPreset(p);
+    mostraProgramma(p);
+    mostraPrevisione(p.previsione);
 
     const ob = p.obiettivo;
     $('box_obiettivo').hidden = !ob;
@@ -357,15 +368,218 @@ function mostraCarica(d, b) {
     $('nota_obiettivo').hidden = !!ob;
     if (ob) {
         const perc = Math.min(100, ob.fatti / ob.kwh * 100);
-        testo('ob_testo', kwh(ob.fatti) + ' di ' + nf0.format(ob.kwh) + ' kWh');
+        testo('ob_testo', kwh(ob.fatti) + ' di ' + nf0.format(ob.kwh) + ' kWh' + (ob.ricorrente ? ' · dal programma' : ''));
         testo('ob_tempo', 'entro le ' + ora(ob.entro) + ' · ' + durata(ob.minuti_rimasti));
         $('ob_barra').style.width = perc + '%';
         $('ob_prog').setAttribute('aria-valuenow', Math.round(perc));
+        const previsto = ob.sole_previsto_kwh > 0
+            ? ' Il sole dovrebbe darne ancora ' + kwh(ob.sole_previsto_kwh) + ' kWh entro la scadenza.' : '';
         testo('ob_nota', ob.in_recupero
-            ? 'Il sole non basta: integro con la rete (servono ' + watt(ob.potenza_necessaria) + ' in media).'
+            ? 'Il sole non basta: integro con la rete (servono ' + watt(ob.potenza_necessaria) + ' in media).' + previsto
             : 'Per ora niente rete: servirebbero ' + watt(ob.potenza_necessaria)
-              + ' in media, si integra quando arrivano al minimo della colonnina (' + watt(c.potenza_minima) + ').');
+              + ' in media, si integra quando arrivano al minimo della colonnina (' + watt(c.potenza_minima) + ').' + previsto);
+        $('btn_ob_off').textContent = ob.ricorrente ? 'Salta questa volta' : 'Annulla obiettivo';
     }
+}
+
+/* ------------------------------------------------------------------
+   Preset: tanti kW dalla rete, fino a tanti kWh. La lista si vede al posto
+   del prelevabile quando la modalita' e' "preset"; "Modifica" apre le righe.
+   ------------------------------------------------------------------ */
+let presetInModifica = false;
+const descriviPreset = x => nf1.format(x.prelevabile / 1000) + ' kW dalla rete · '
+    + (x.limite_kwh ? 'fino a ' + x.limite_kwh + ' kWh' : 'senza limite');
+
+function mostraPreset(p) {
+    const inPreset = p.modalita === 'preset';
+    $('box_preset').hidden = !inPreset;
+    $('box_prelevabile').hidden = inPreset;
+    if (!inPreset) { presetInModifica = false; }
+    $('preset_lista').hidden = presetInModifica;
+    $('preset_editor').hidden = !presetInModifica;
+    $('btn_preset_modifica').hidden = presetInModifica;
+    if (!inPreset || presetInModifica) return;
+    const firma = JSON.stringify([p.preset, p.preset_attivo]);
+    const lista = $('preset_lista');
+    if (lista.dataset.firma === firma) return;         // niente da ridisegnare: non si perde il fuoco
+    lista.dataset.firma = firma;
+    lista.textContent = '';
+    (p.preset || []).forEach((x, i) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.setAttribute('role', 'radio');
+        b.setAttribute('aria-checked', i === p.preset_attivo);
+        b.classList.toggle('attivo', i === p.preset_attivo);
+        const nome = document.createElement('b'), dettagli = document.createElement('span');
+        nome.textContent = x.nome;
+        dettagli.textContent = descriviPreset(x);
+        b.append(nome, dettagli);
+        b.addEventListener('click', () => comando('preset', i));
+        lista.appendChild(b);
+    });
+}
+function rigaPreset(x) {
+    const riga = document.createElement('div');
+    riga.className = 'preset-riga';
+    const campo = (tipo, valore, etichetta, attributi = {}) => {
+        const i = document.createElement('input');
+        i.type = tipo;
+        i.value = valore;
+        i.setAttribute('aria-label', etichetta);
+        Object.entries(attributi).forEach(([k, v]) => i.setAttribute(k, v));
+        return i;
+    };
+    const togli = document.createElement('button');
+    togli.type = 'button';
+    togli.className = 'b-togli';
+    togli.textContent = '×';
+    togli.setAttribute('aria-label', 'Togli questo preset');
+    togli.addEventListener('click', () => riga.remove());
+    riga.append(
+        campo('text', x.nome, 'Nome', { maxlength: 24, required: '' }),
+        campo('number', x.prelevabile / 1000, 'kW dalla rete', { min: 0, max: 20, step: 0.1, inputmode: 'decimal', required: '' }),
+        campo('number', x.limite_kwh, 'Fino a kWh, 0 senza limite', { min: 0, max: 100, step: 1, inputmode: 'numeric', required: '' }),
+        togli);
+    return riga;
+}
+$('btn_preset_modifica').addEventListener('click', () => {
+    if (!ultimo?.piano) return;
+    presetInModifica = true;
+    const righe = $('preset_righe');
+    righe.textContent = '';
+    (ultimo.piano.preset || []).forEach(x => righe.appendChild(rigaPreset(x)));
+    mostraPreset(ultimo.piano);
+});
+$('btn_preset_nuovo').addEventListener('click', () => {
+    const righe = $('preset_righe');
+    if (righe.children.length >= 8) { esito('Al massimo 8 preset.', false, 'esito_carica'); return; }
+    righe.appendChild(rigaPreset({ nome: '', prelevabile: 3000, limite_kwh: 0 }));
+    righe.lastChild.querySelector('input').focus();
+});
+$('btn_preset_annulla').addEventListener('click', () => {
+    presetInModifica = false;
+    if (ultimo?.piano) mostraPreset(ultimo.piano);
+});
+$('preset_editor').addEventListener('submit', async e => {
+    e.preventDefault();
+    const elenco = [...$('preset_righe').children].map(riga => {
+        const [nome, kw, limite] = riga.querySelectorAll('input');
+        return { nome: nome.value.trim(), prelevabile: Math.round(Number(String(kw.value).replace(',', '.')) * 1000),
+                 limite_kwh: Math.round(Number(limite.value) || 0) };
+    });
+    const { ok, dati } = await invia('/api/preset', { preset: elenco });
+    esito(dati.messaggio || (ok ? 'Preset salvati.' : 'Salvataggio non riuscito.'), ok, 'esito_carica');
+    if (!ok) return;
+    presetInModifica = false;
+    $('preset_lista').dataset.firma = '';
+    aggiorna();
+});
+
+/* ------------------------------------------------------------------
+   Programma settimanale: obiettivi che si ripetono
+   ------------------------------------------------------------------ */
+const GIORNI_BREVI = ['L', 'M', 'M', 'G', 'V', 'S', 'D'];
+const GIORNI_NOMI = ['lunedì', 'martedì', 'mercoledì', 'giovedì', 'venerdì', 'sabato', 'domenica'];
+let programmaSporco = false;
+
+function rigaRegola(r) {
+    const riga = document.createElement('div');
+    riga.className = 'regola' + (r.attivo ? '' : ' spenta');
+    const giorni = document.createElement('div');
+    giorni.className = 'regola-giorni';
+    GIORNI_BREVI.forEach((lettera, g) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = lettera;
+        b.dataset.g = g;
+        b.setAttribute('aria-label', GIORNI_NOMI[g]);
+        b.setAttribute('aria-pressed', r.giorni.includes(g));
+        b.classList.toggle('attivo', r.giorni.includes(g));
+        b.addEventListener('click', () => {
+            b.classList.toggle('attivo');
+            b.setAttribute('aria-pressed', b.classList.contains('attivo'));
+            programmaSporco = true;
+        });
+        giorni.appendChild(b);
+    });
+    const valori = document.createElement('div');
+    valori.className = 'regola-valori';
+    const campo = (nome, tipo, valore, attributi) => {
+        const l = document.createElement('label'), s = document.createElement('span'), i = document.createElement('input');
+        s.textContent = nome;
+        i.type = tipo;
+        i.value = valore;
+        Object.entries(attributi).forEach(([k, v]) => i.setAttribute(k, v));
+        i.addEventListener('input', () => { programmaSporco = true; });
+        l.append(s, i);
+        return l;
+    };
+    const acceso = document.createElement('label');
+    acceso.className = 'acceso';
+    const spunta = document.createElement('input');
+    spunta.type = 'checkbox';
+    spunta.checked = r.attivo;
+    spunta.addEventListener('change', () => { riga.classList.toggle('spenta', !spunta.checked); programmaSporco = true; });
+    acceso.append(spunta, 'attiva');
+    const togli = document.createElement('button');
+    togli.type = 'button';
+    togli.className = 'b-togli';
+    togli.textContent = '×';
+    togli.setAttribute('aria-label', 'Togli questa regola');
+    togli.addEventListener('click', () => { riga.remove(); programmaSporco = true; });
+    valori.append(campo('kWh in auto', 'number', r.kwh, { min: 1, max: 100, step: 1, inputmode: 'decimal', required: '', 'data-c': 'kwh' }),
+                  campo('entro le', 'time', r.ora, { required: '', 'data-c': 'ora' }), acceso, togli);
+    riga.append(giorni, valori);
+    return riga;
+}
+function mostraProgramma(p) {
+    const regole = p.programma || [];
+    const attive = regole.filter(r => r.attivo).length;
+    const stato = $('programma_stato');
+    if (!attive) stato.textContent = regole.length ? 'in pausa' : 'nessuno';
+    else if (p.prossima_programma) {
+        stato.textContent = 'prossimo: ' + nf0.format(p.prossima_programma.kwh) + ' kWh '
+            + new Date(p.prossima_programma.entro * 1000).toLocaleString('it-IT', { weekday: 'short', hour: '2-digit', minute: '2-digit' });
+    } else stato.textContent = attive + (attive === 1 ? ' regola' : ' regole');
+    const firma = JSON.stringify(regole);
+    const righe = $('programma_righe');
+    if (programmaSporco || righe.dataset.firma === firma) return;
+    righe.dataset.firma = firma;
+    righe.textContent = '';
+    regole.forEach(r => righe.appendChild(rigaRegola(r)));
+}
+$('btn_regola_nuova').addEventListener('click', () => {
+    const righe = $('programma_righe');
+    if (righe.children.length >= 10) { esito('Al massimo 10 regole.', false, 'esito_carica'); return; }
+    righe.appendChild(rigaRegola({ giorni: [0, 1, 2, 3, 4], ora: '07:00', kwh: 15, attivo: true }));
+    programmaSporco = true;
+});
+$('form_programma').addEventListener('submit', async e => {
+    e.preventDefault();
+    const regole = [...$('programma_righe').children].map(riga => ({
+        giorni: [...riga.querySelectorAll('.regola-giorni button.attivo')].map(b => Number(b.dataset.g)),
+        kwh: Number(String(riga.querySelector('[data-c=kwh]').value).replace(',', '.')),
+        ora: riga.querySelector('[data-c=ora]').value,
+        attivo: riga.querySelector('input[type=checkbox]').checked,
+    }));
+    const { ok, dati } = await invia('/api/programma', { programma: regole });
+    esito(dati.messaggio || (ok ? 'Programma salvato.' : 'Salvataggio non riuscito.'), ok, 'esito_carica');
+    if (!ok) return;
+    programmaSporco = false;
+    $('programma_righe').dataset.firma = '';
+    aggiorna();
+});
+
+function mostraPrevisione(pv) {
+    const box = $('box_previsione');
+    box.hidden = !pv || !pv.fonte;
+    if (box.hidden) return;
+    testo('pv_oggi', kwh(pv.oggi_restante_kwh));
+    testo('pv_domani', kwh(pv.domani_kwh));
+    testo('pv_nota', (pv.fonte === 'meteo'
+        ? 'Dal meteo di Home Assistant e dalle giornate serene degli ultimi 14 giorni.'
+        : 'Senza meteo: è la media degli ultimi giorni, sbaglia in media del 30%.')
+        + ' All’auto ne resterebbero ' + kwh(pv.oggi_restante_auto_kwh) + ' oggi e ' + kwh(pv.domani_auto_kwh) + ' domani.');
 }
 
 /* Prelevabile: il cursore e il campo numerico mostrano lo stesso valore, e
@@ -489,7 +703,24 @@ function mostraImpostazioni(c) {
     setCampo('protezione', c.protezione);
     setCampo('prezzo_acquisto', c.prezzo_acquisto);
     setCampo('prezzo_vendita', c.prezzo_vendita);
+    setCampo('calma_soglia', c.calma_soglia);
+    setCampo('calma_intervallo', c.calma_intervallo);
+    if (document.activeElement !== $('calma')) $('calma').checked = !!c.calma;
+    if (document.activeElement !== $('rapporto_settimanale')) $('rapporto_settimanale').checked = !!c.rapporto_settimanale;
+    $('calma_dettagli').classList.toggle('spento', !c.calma);
 }
+/* I due interruttori valgono subito, senza "Salva impostazioni" */
+$('calma').addEventListener('change', async e => {
+    const { ok, dati } = await invia('/api/comando', { nome: 'calma', valore: e.target.checked ? 'on' : 'off' });
+    esito(dati.messaggio || (ok ? 'Fatto.' : 'Comando non riuscito.'), ok);
+    aggiorna();
+});
+$('rapporto_settimanale').addEventListener('change', async e => {
+    const { ok, dati } = await invia('/api/settings', { rapporto_settimanale: e.target.checked });
+    esito(ok ? (e.target.checked ? 'Rapporto della settimana attivo.' : 'Rapporto della settimana spento.')
+             : (dati.errori || ['Salvataggio non riuscito.']).join('\n'), ok);
+    aggiorna();
+});
 
 function mostraFasi(s) {
     const fasi = s.fasi || [];
@@ -530,10 +761,12 @@ async function salva() {
     leggi('protezione', 'Soglia di protezione', true);
     leggi('prezzo_acquisto', 'Prezzo di acquisto', false);
     leggi('prezzo_vendita', 'Prezzo di vendita', false);
+    leggi('calma_soglia', 'Cambio minimo', true);
+    leggi('calma_intervallo', 'Intervallo fra i cambi', true);
     if (errori.length) { esito('Correggi:\n' + errori.join('\n'), false); return; }
     const { ok, dati } = await invia('/api/settings', corpo);
     if (!ok) { esito('Salvataggio non riuscito:\n' + (dati.errori || [dati.messaggio || 'errore sconosciuto']).join('\n'), false); return; }
-    ['protezione', 'prezzo_acquisto', 'prezzo_vendita'].forEach(id => sporchi.delete(id));
+    ['protezione', 'prezzo_acquisto', 'prezzo_vendita', 'calma_soglia', 'calma_intervallo'].forEach(id => sporchi.delete(id));
     mostraSporchi();
     esito('Impostazioni salvate.', true);
     aggiorna();

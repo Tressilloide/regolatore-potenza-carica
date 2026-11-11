@@ -15,6 +15,7 @@ import io
 import datetime
 import itertools
 import gzip
+import copy
 from collections import deque
 import matplotlib
 
@@ -35,7 +36,9 @@ from regolatore_pid import RegolatorePID
 from regolatore_classico import RegolatoreClassico
 from protezione_contatore import ProtezioneContatore, limite_regolazione
 from pianificatore import (Pianificatore, MODALITA, NOMI_MODALITA, prossima_scadenza,
-                           interpreta_orario)
+                           interpreta_orario, PRESET_BASE, valida_preset, preset_attivo,
+                           descrivi_preset)
+from previsione import Previsione
 from ponte_mqtt import PonteMQTT
 import statistiche
 
@@ -57,6 +60,15 @@ CONFIG = {
     # sole in piu', 'misto' = sole + POTENZA_PRELEVABILE, 'veloce' = quanto il
     # contatore permette. L'obiettivo kWh sta in FILE_PIANO.
     'MODALITA': 'misto',
+    # Preset: "tanti W dalla rete, fermati a tanti kWh" (pianificatore.py).
+    # Si scelgono e si modificano dalla pagina; PRESET_ATTIVO e' l'indice.
+    'PRESET': copy.deepcopy(PRESET_BASE),
+    'PRESET_ATTIVO': 0,
+    # Regolazione calma: limita i cambi di potenza (regolatore_classico.py)
+    'REGOLAZIONE_CALMA': False,
+    'CALMA_SOGLIA_W': 500,
+    'CALMA_INTERVALLO_S': 30,
+    'RAPPORTO_SETTIMANALE': True,   # la domenica all'ora del riepilogo, su Telegram
     # --- Contatore di casa (protezione_contatore.py) ---
     # Oltre LIMITE_CONTATORE di prelievo (sole escluso, auto compresa) il
     # contatore stacca: 6 kW di contratto + 10%. I regolatori non puntano mai
@@ -241,6 +253,11 @@ CHIAVI_PERSISTENTI = {
     'POTENZA_PROTEZIONE':  (50, 5000, int),
     'MODALITA':            (None, None, MODALITA),
     'LIMITE_KWH':          (1, 100, int),
+    'PRESET_ATTIVO':       (0, 7, int),
+    'REGOLAZIONE_CALMA':   (None, None, bool),
+    'CALMA_SOGLIA_W':      (100, 3000, int),
+    'CALMA_INTERVALLO_S':  (5, 600, int),
+    'RAPPORTO_SETTIMANALE': (None, None, bool),
     'PREZZO_ACQUISTO':     (0, 5, float),
     'PREZZO_VENDITA':      (0, 5, float),
     # tupla di stringhe = scelta fra valori ammessi
@@ -329,6 +346,21 @@ def carica_config():
                 caricati.append(f"{chiave}={pulito}")
             else:
                 log_msg(f"[CONFIG] Valore ignorato: {errore}")
+        # I preset sono un elenco: validazione a parte
+        if 'PRESET' in dati:
+            ok, esito = valida_preset(dati['PRESET'])
+            if ok:
+                CONFIG['PRESET'] = esito
+                caricati.append(f"PRESET={len(esito)}")
+            else:
+                log_msg(f"[CONFIG] Preset ignorati: {esito}")
+        if CONFIG['PRESET_ATTIVO'] >= len(CONFIG['PRESET']):
+            CONFIG['PRESET_ATTIVO'] = 0
+        # "veloce" non esiste piu' (11/11/2026): vale il preset con quel nome
+        if str(dati.get('MODALITA', '')).lower() == 'veloce':
+            nomi = [p['nome'].lower() for p in CONFIG['PRESET']]
+            CONFIG['MODALITA'] = 'preset'
+            CONFIG['PRESET_ATTIVO'] = nomi.index('veloce') if 'veloce' in nomi else 0
 
     log_msg(f"[CONFIG] Caricati da disco: {', '.join(caricati) if caricati else 'nessun valore valido'}")
 
@@ -340,6 +372,7 @@ def salva_config():
     """
     with STATO_LOCK:
         dati = {chiave: CONFIG[chiave] for chiave in CHIAVI_PERSISTENTI}
+        dati['PRESET'] = CONFIG['PRESET']
 
     tmp = FILE_CONFIG + '.tmp'
     try:
@@ -448,6 +481,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/info - Stato attuale del sistema\n"
         "/energia - Riepilogo energetico di oggi\n"
         "/storico [giorni] - Riepilogo degli ultimi giorni\n"
+        "/settimana - La settimana contro quella prima\n"
+        "/previsione - Sole previsto oggi e domani\n"
         "/sessioni - Ultime sessioni di ricarica\n"
         "/grafici [15m|1h|6h|24h|7g] - Grafico dell'andamento\n"
         "/fase - Rileva subito monofase/trifase\n\n"
@@ -456,13 +491,16 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/spegni - Forza lo spegnimento della Wallbox\n"
         "/reset - Re-inizializza la centralina\n\n"
         "*Carica*\n"
-        "/modalita [sole|misto|veloce] - Solo sole, sole + rete, massima\n"
-        "/obiettivo <kWh> <HH:MM> - Pronta entro un orario (off per annullare)\n\n"
+        "/modalita [sole|misto|preset] - Solo sole, sole + rete, preset\n"
+        "/preset [nome] - Preset: tanti kW dalla rete, fino a tanti kWh\n"
+        "/obiettivo <kWh> <HH:MM> - Pronta entro un orario (off per annullare)\n"
+        "/programma - Obiettivi che si ripetono nella settimana\n\n"
         "*Impostazioni*\n"
         "/prelevabile <W> - Quanto l'auto può prendere dalla rete, oltre alla casa\n"
         "/protezione <W> - Soglia di protezione\n"
         "/limite <kWh> - Energia da caricare (1-100)\n"
         "/algoritmo [classico|pid] - Algoritmo di regolazione\n"
+        "/calma [on|off] - Limita i cambi di potenza\n"
         "/pid [kp|ki|kd|margine <valore>] - Stato e taratura del PID\n"
     )
     await update.message.reply_text(msg, parse_mode='Markdown')
@@ -580,12 +618,23 @@ def esegui_comando(nome, valore, origine):
     (MQTT): stessa validazione e stesso effetto da qualunque parte arrivino.
 
     nome: 'modalita' | 'prelevabile' | 'obiettivo' ('<kWh> <HH:MM>' oppure 'off')
+          | 'preset' (nome o indice da 0) | 'calma' (on/off)
     Ritorna (ok, messaggio).
     """
     valore = '' if valore is None else str(valore).strip()
-    if nome == 'modalita':
+    if nome == 'modalita' and valore.lower() == 'veloce':
+        esito = applica_preset('Veloce', origine)      # il nome di prima dell'11/11/2026
+    elif nome == 'modalita' and valore.lower() == 'preset':
+        esito = applica_preset(CONFIG['PRESET_ATTIVO'], origine)
+    elif nome == 'modalita':
         ok, errore = applica_impostazione('MODALITA', valore, origine)
         esito = (ok, f"Modalità: {NOMI_MODALITA[CONFIG['MODALITA']]}" if ok else errore)
+    elif nome == 'preset':
+        esito = applica_preset(valore, origine)
+    elif nome == 'calma':
+        ok, errore = applica_impostazione('REGOLAZIONE_CALMA', valore, origine)
+        esito = (ok, ("Regolazione calma attiva: meno cambi di potenza" if CONFIG['REGOLAZIONE_CALMA']
+                      else "Regolazione calma spenta") if ok else errore)
     elif nome == 'prelevabile':
         ok, errore = applica_impostazione('POTENZA_PRELEVABILE', valore, origine)
         esito = (ok, f"Prelevabile per l'auto: {CONFIG['POTENZA_PRELEVABILE']} W" if ok else errore)
@@ -600,6 +649,70 @@ def esegui_comando(nome, valore, origine):
     if esito[0] and ponte_mqtt_instance and pianificatore_instance:
         ponte_mqtt_instance.pubblica_controlli(stato_controlli())
     return esito
+
+def applica_limite(kwh):
+    """Manda il limite di energia alla colonnina (0 = nessuno). Se non
+    risponde lo tiene in attesa: lo applica il thread periodico appena torna.
+    Ritorna una frase per l'utente."""
+    testo = f"limite {kwh} kWh" if kwh else "nessun limite"
+    colonnina = wallbox_instance
+    if colonnina is None or not CONFIG.get('CMD_LIMITE_TEMPLATE'):
+        return testo
+    if kwh > 0:
+        with STATO_LOCK:
+            CONFIG['LIMITE_KWH'] = kwh
+        salva_config()
+    if colonnina.sync_falliti < 2:
+        inviato, _ = colonnina.set_limite_kwh(kwh)
+        if inviato:
+            colonnina.limite_in_attesa = None
+            return testo
+    colonnina.limite_in_attesa = kwh
+    return testo + " appena la colonnina risponde"
+
+def applica_preset(scelta, origine):
+    """Sceglie un preset (per nome, o per indice da 0): modalita' 'preset',
+    il suo prelevabile come quota di rete e il suo limite sulla colonnina."""
+    elenco = CONFIG['PRESET']
+    testo = str(scelta).strip()
+    nomi = [p['nome'].lower() for p in elenco]
+    if testo.lower() in nomi:
+        indice = nomi.index(testo.lower())
+    elif testo.isdigit() and int(testo) < len(elenco):
+        indice = int(testo)
+    else:
+        return False, f"Preset sconosciuto: {testo}. Ci sono: {', '.join(p['nome'] for p in elenco)}"
+    with STATO_LOCK:
+        CONFIG['PRESET_ATTIVO'] = indice
+        CONFIG['MODALITA'] = 'preset'
+    salva_config()
+    p = elenco[indice]
+    log_msg(f"[{origine}] Preset {p['nome']}: {descrivi_preset(p)}")
+    limite = applica_limite(p['limite_kwh'])
+    kw = f"{p['prelevabile'] / 1000:.1f}".replace('.', ',')
+    return True, f"Preset {p['nome']}: {kw} kW dalla rete, {limite}"
+
+def salva_preset(elenco, origine):
+    """Sostituisce l'elenco dei preset. Se e' attivo un preset e il suo
+    limite e' cambiato, lo aggiorna anche sulla colonnina."""
+    ok, esito = valida_preset(elenco)
+    if not ok:
+        return False, esito
+    prima = preset_attivo(CONFIG)
+    with STATO_LOCK:
+        CONFIG['PRESET'] = esito
+        if CONFIG['PRESET_ATTIVO'] >= len(esito):
+            CONFIG['PRESET_ATTIVO'] = 0
+    salva_config()
+    log_msg(f"[{origine}] Preset salvati: " + "; ".join(f"{p['nome']} ({descrivi_preset(p)})" for p in esito))
+    adesso = preset_attivo(CONFIG)
+    if CONFIG['MODALITA'] == 'preset' and adesso['limite_kwh'] != prima['limite_kwh']:
+        applica_limite(adesso['limite_kwh'])
+    if ponte_mqtt_instance:
+        ponte_mqtt_instance.imposta_preset([p['nome'] for p in esito])
+        if pianificatore_instance:
+            ponte_mqtt_instance.pubblica_controlli(stato_controlli())
+    return True, "Preset salvati"
 
 def imposta_obiettivo_da_testo(testo):
     """'15 7:30' -> 15 kWh entro le 7:30 (oggi, o domani se gia' passate).
@@ -622,20 +735,203 @@ def stato_controlli():
     """Modalita', prelevabile e obiettivo: per pagina web e Home Assistant."""
     stato = pianificatore_instance.stato() if pianificatore_instance else {}
     stato['prelevabile_w'] = CONFIG['POTENZA_PRELEVABILE']
+    attivo = preset_attivo(CONFIG)
+    stato['preset'] = CONFIG['PRESET']
+    stato['preset_attivo'] = CONFIG['PRESET'].index(attivo) if attivo in CONFIG['PRESET'] else 0
+    stato['preset_nome'] = attivo['nome']
+    stato['calma'] = CONFIG['REGOLAZIONE_CALMA']
+    stato['limite_in_attesa'] = wallbox_instance.limite_in_attesa if wallbox_instance else None
     return stato
 
+# --- Previsione del sole (previsione.py) --------------------------------------
+previsione_instance = Previsione()
+_previsione = {'t': 0.0, 'riepilogo': {'fonte': None}}
+
+def aggiorna_previsione(forza=False):
+    """Passa alla previsione la storia (giorni chiusi e giornata in corso),
+    al massimo ogni 5 minuti. Ritorna il riepilogo."""
+    adesso = time.time()
+    if forza or adesso - _previsione['t'] >= 300:
+        _previsione['t'] = adesso
+        giorni, oggi = giorni_statistiche()
+        if wallbox_instance:
+            # l'auto non prende piu' di 11 kW nemmeno in trifase (colonnina da 22)
+            previsione_instance.potenza_massima_auto = min(11000, wallbox_instance.limiti_potenza()[1])
+        previsione_instance.aggiorna_storia(giorni, oggi)
+        _previsione['riepilogo'] = previsione_instance.riepilogo()
+    return _previsione['riepilogo']
+
+def sole_atteso(da, a):
+    """Per il pianificatore: kWh di sole attesi per l'auto fra due istanti."""
+    aggiorna_previsione()
+    return previsione_instance.sole_per_auto(da, a)
+
+def meteo_ricevuto(dati):
+    """Previsione meteo arrivata da Home Assistant (thread MQTT)."""
+    ore = dati.get('ore') if isinstance(dati, dict) else None
+    capite = previsione_instance.imposta_meteo(ore)
+    if capite:
+        _previsione['t'] = 0.0      # al prossimo giro si ricalcola
+        log_throttled('meteo_ricevuto', f"[PREVISIONE] Meteo da Home Assistant: {capite} ore", 6 * 3600)
+
+def testo_previsione():
+    p = aggiorna_previsione()
+    if not p.get('fonte'):
+        return "🌤️ Nessuna previsione: serve almeno un giorno di storico."
+    fonte = ("dal meteo di Home Assistant" if p['fonte'] == 'meteo'
+             else "dalla media degli ultimi giorni (senza meteo)")
+    return (f"🌤️ *Sole previsto* ({fonte})\n\n"
+            f"Oggi, da adesso: {p['oggi_restante_kwh']} kWh, di cui {p['oggi_restante_auto_kwh']} per l'auto\n"
+            f"Domani: {p['domani_kwh']} kWh, di cui {p['domani_auto_kwh']} per l'auto\n"
+            f"_Una giornata serena ne dà circa {p['sereno_kwh']}._")
+
+# --- Statistiche per Home Assistant e rapporto settimanale ---------------------
+_fondo = {'t': 0.0, 'w': None}
+
+def prezzi_attuali():
+    return {'acquisto': CONFIG['PREZZO_ACQUISTO'], 'vendita': CONFIG['PREZZO_VENDITA']}
+
+def statistiche_per_ha(monitor):
+    """I numeri pubblicati ogni minuto su solare/pi/statistiche."""
+    giorni, oggi = giorni_statistiche()
+    dati = {'autosufficienza_oggi': None, 'autoconsumo_oggi': None}
+    if oggi in giorni:
+        g = statistiche.giornaliero(giorni[oggi])
+        dati.update(autosufficienza_oggi=g['autosufficienza'], autoconsumo_oggi=g['autoconsumo'])
+    # quanto si puo' accendere adesso senza prelevare dalla rete
+    dati['potenza_libera_w'] = max(0, round(monitor.solar_now - monitor.total_grid_load))
+    adesso = time.time()
+    if adesso - _fondo['t'] > 3600:
+        _fondo['t'] = adesso
+        da = (statistiche.data(oggi) - datetime.timedelta(days=7)).isoformat()
+        s = statistiche.calcola(giorni, da, oggi, prezzi_attuali())
+        _fondo['w'] = (s.get('casa') or {}).get('fondo_w')
+    dati['carico_fondo_w'] = _fondo['w']
+    p = aggiorna_previsione()
+    dati['previsione_oggi_kwh'] = p.get('oggi_restante_kwh')
+    dati['previsione_domani_kwh'] = p.get('domani_kwh')
+    dati['previsione_fonte'] = p.get('fonte')
+    return dati
+
+def rapporto_settimanale():
+    """La settimana da lunedi' a oggi, contro i giorni subito prima. Testo
+    Markdown per Telegram, oppure None se non c'e' niente da dire."""
+    giorni, oggi = giorni_statistiche()
+    lunedi = statistiche.data(oggi) - datetime.timedelta(days=statistiche.data(oggi).weekday())
+    s = statistiche.calcola(giorni, lunedi.isoformat(), oggi, prezzi_attuali(), CONFIG['LIMITE_CONTATORE'])
+    t = s.get('totali')
+    if not t:
+        return None
+    prima = s.get('precedente')
+    kwh = lambda v: f"{v:.0f}" if v >= 100 else f"{v:.1f}".replace('.', ',')
+
+    def confronto(chiave, punti=False):
+        if not prima or prima.get(chiave) is None or t.get(chiave) is None:
+            return ""
+        if punti:
+            diff = t[chiave] - prima[chiave]
+            return f" ({'+' if diff >= 0 else '−'}{abs(diff):.0f} punti)"
+        if abs(prima[chiave]) < 0.05:
+            return ""
+        diff = (t[chiave] - prima[chiave]) / prima[chiave] * 100
+        return f" ({'+' if diff >= 0 else '−'}{abs(diff):.0f}%)"
+
+    p = s['periodo']
+    giorno = lambda iso: f"{int(iso[8:])}/{int(iso[5:7])}"
+    righe = [f"📊 *La settimana* ({giorno(p['da'])} – {giorno(p['a'])})", "",
+             f"☀️ Prodotti: {kwh(t['sole'])} kWh{confronto('sole')}",
+             f"🏠 Casa: {kwh(t['casa'])} kWh{confronto('casa')}"]
+    if t['auto'] > 0.05:
+        righe.append(f"🚗 Auto: {kwh(t['auto'])} kWh{confronto('auto')}, "
+                     f"{t['auto_sole_pct']:.0f}% dal sole")
+    righe += [f"🔌 Prelevati: {kwh(t['prelievo'])} kWh{confronto('prelievo')}",
+              f"↗️ Immessi: {kwh(t['immessa'])} kWh{confronto('immessa')}"]
+    if t['autosufficienza_pct'] is not None:
+        righe.append(f"🌱 Autosufficienza: {t['autosufficienza_pct']:.0f}%{confronto('autosufficienza_pct', True)}")
+    ric = s['ricariche']
+    if ric.get('n'):
+        righe.append(f"🔋 Ricariche: {ric['n']}, in media {kwh(ric['media_kwh'])} kWh")
+    e = t['euro']
+    righe.append(f"💶 Resa dell'impianto: {e['beneficio']:.2f} €".replace('.', ','))
+    primati = {r['chiave']: r for r in s['record']}
+    if 'giorno_sole_max' in primati:
+        r = primati['giorno_sole_max']
+        righe.append(f"🏆 Giorno migliore: {giorno(r['giorno'])} con {kwh(r['valore'])} kWh")
+    if 'picco_prelievo' in primati:
+        righe.append(f"⚡ Prelievo più alto: {primati['picco_prelievo']['valore'] / 1000:.1f} kW".replace('.', ','))
+    if prima:
+        righe += ["", "_Fra parentesi il confronto con i giorni subito prima._"]
+    return "\n".join(righe)
+
 async def cmd_modalita(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/modalita [sole|misto|veloce]"""
+    """/modalita [sole|misto|preset]"""
     if not check_auth(update): return
     if not context.args:
         await update.message.reply_text(
             f"⚙️ *Modalità:* {pianificatore_instance.descrizione() if pianificatore_instance else '?'}\n\n"
             "`/modalita sole` - solo il sole in più rispetto alla casa\n"
             f"`/modalita misto` - sole + {CONFIG['POTENZA_PRELEVABILE']} W dalla rete\n"
-            "`/modalita veloce` - quanto il contatore permette", parse_mode='Markdown')
+            "`/modalita preset` - il preset scelto (vedi /preset)", parse_mode='Markdown')
         return
-    ok, messaggio = esegui_comando('modalita', context.args[0], 'TELEGRAM')
+    ok, messaggio = await asyncio.to_thread(esegui_comando, 'modalita', context.args[0], 'TELEGRAM')
     await update.message.reply_text(f"{'✅' if ok else '⚠️'} {messaggio}")
+
+async def cmd_preset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/preset [nome | numero]"""
+    if not check_auth(update): return
+    elenco = CONFIG['PRESET']
+    if not context.args:
+        attivo = preset_attivo(CONFIG) if CONFIG['MODALITA'] == 'preset' else None
+        righe = [f"{'▶️' if p is attivo else '▫️'} {n}. *{p['nome']}*: {descrivi_preset(p)}"
+                 for n, p in enumerate(elenco, 1)]
+        await update.message.reply_text(
+            "🎛️ *Preset*\n\n" + "\n".join(righe) +
+            "\n\nPer sceglierne uno: `/preset 2` oppure `/preset " + elenco[0]['nome'] +
+            "`.\nSi modificano dalla pagina web.", parse_mode='Markdown')
+        return
+    scelta = " ".join(context.args)
+    if scelta.isdigit() and 1 <= int(scelta) <= len(elenco):
+        scelta = str(int(scelta) - 1)           # su Telegram si conta da 1
+    ok, messaggio = await asyncio.to_thread(esegui_comando, 'preset', scelta, 'TELEGRAM')
+    await update.message.reply_text(f"{'✅' if ok else '⚠️'} {messaggio}")
+
+async def cmd_programma(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/programma: il programma settimanale degli obiettivi."""
+    if not check_auth(update): return
+    regole = pianificatore_instance.programma if pianificatore_instance else []
+    if not regole:
+        await update.message.reply_text("🗓️ Nessun programma settimanale. Si imposta dalla pagina web.")
+        return
+    nomi = ['lun', 'mar', 'mer', 'gio', 'ven', 'sab', 'dom']
+    righe = [f"{'✅' if r['attivo'] else '⏸️'} {' '.join(nomi[g] for g in r['giorni'])}: "
+             f"{r['kwh']:g} kWh entro le {r['ora']}" for r in regole]
+    prossima = pianificatore_instance.prossima_del_programma()
+    coda = (f"\n\nProssima: {prossima[1]['kwh']:g} kWh entro "
+            f"{time.strftime('%d/%m %H:%M', time.localtime(prossima[0]))}" if prossima else "")
+    await update.message.reply_text("🗓️ *Programma settimanale*\n\n" + "\n".join(righe) + coda +
+                                    "\n\n_Si modifica dalla pagina web._", parse_mode='Markdown')
+
+async def cmd_calma(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/calma [on|off]"""
+    if not check_auth(update): return
+    if not context.args:
+        await update.message.reply_text(
+            f"🌊 *Regolazione calma:* {'attiva' if CONFIG['REGOLAZIONE_CALMA'] else 'spenta'}\n"
+            f"Un cambio di potenza solo se vale almeno {CONFIG['CALMA_SOGLIA_W']} W e ogni "
+            f"{CONFIG['CALMA_INTERVALLO_S']} s.\n`/calma on` oppure `/calma off`", parse_mode='Markdown')
+        return
+    ok, messaggio = esegui_comando('calma', context.args[0], 'TELEGRAM')
+    await update.message.reply_text(f"{'✅' if ok else '⚠️'} {messaggio}")
+
+async def cmd_previsione(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not check_auth(update): return
+    await update.message.reply_text(await asyncio.to_thread(testo_previsione), parse_mode='Markdown')
+
+async def cmd_settimana(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not check_auth(update): return
+    testo = await asyncio.to_thread(rapporto_settimanale)
+    await update.message.reply_text(testo or "⏳ Non ci sono ancora dati per questa settimana.",
+                                    parse_mode='Markdown')
 
 async def cmd_obiettivo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/obiettivo <kWh> <HH:MM> | off"""
@@ -660,7 +956,7 @@ async def cmd_set_prelevabile(update: Update, context: ContextTypes.DEFAULT_TYPE
     ok, errore = esegui_comando('prelevabile', context.args[0], 'TELEGRAM')
     if ok:
         nota = ("" if CONFIG['MODALITA'] == 'misto' else
-                f"\n_Vale nella modalità Sole + rete (ora: {NOMI_MODALITA[CONFIG['MODALITA']]})._")
+                f"\n_Vale nella modalità Sole + rete (ora: {pianificatore_instance.nome_modalita() if pianificatore_instance else CONFIG['MODALITA']})._")
         await update.message.reply_text(
             f"✅ *Potenza Prelevabile* impostata a {CONFIG['POTENZA_PRELEVABILE']} W{nota}", parse_mode='Markdown')
     else:
@@ -994,6 +1290,11 @@ def _registra_comandi(app):
         (["algoritmo"], cmd_algoritmo),
         (["modalita"], cmd_modalita),
         (["obiettivo"], cmd_obiettivo),
+        (["preset"], cmd_preset),
+        (["programma"], cmd_programma),
+        (["calma"], cmd_calma),
+        (["previsione"], cmd_previsione),
+        (["settimana"], cmd_settimana),
         (["pid"], cmd_pid),
         (["fase"], cmd_fase),
         (["energia"], cmd_energia),
@@ -1095,6 +1396,10 @@ CAMPI_WEB = {
     'prezzo_acquisto': 'PREZZO_ACQUISTO',
     'prezzo_vendita':  'PREZZO_VENDITA',
     'algoritmo':       'ALGORITMO',
+    'calma':           'REGOLAZIONE_CALMA',
+    'calma_soglia':    'CALMA_SOGLIA_W',
+    'calma_intervallo': 'CALMA_INTERVALLO_S',
+    'rapporto_settimanale': 'RAPPORTO_SETTIMANALE',
     'pid_kp':          'PID_KP',
     'pid_ki':          'PID_KI',
     'pid_kd':          'PID_KD',
@@ -1169,11 +1474,19 @@ def get_data():
             'prezzo_acquisto': CONFIG['PREZZO_ACQUISTO'],
             'prezzo_vendita': CONFIG['PREZZO_VENDITA'],
             'algoritmo': CONFIG['ALGORITMO'],
+            'calma': CONFIG['REGOLAZIONE_CALMA'],
+            'calma_soglia': CONFIG['CALMA_SOGLIA_W'],
+            'calma_intervallo': CONFIG['CALMA_INTERVALLO_S'],
+            'rapporto_settimanale': CONFIG['RAPPORTO_SETTIMANALE'],
             'potenza_minima': minimo,
             'potenza_massima': massimo,
         }
         stato['stima_pid'] = regolatore_pid_instance.ultima_stima if regolatore_pid_instance else None
     piano = stato_controlli() if pianificatore_instance else None
+    if piano is not None:
+        previsione = dict(_previsione['riepilogo'])
+        previsione.pop('ore', None)         # ora per ora solo su /api/previsione
+        piano['previsione'] = previsione
 
     # Log: tutte le righe, oppure solo quelle dopo log_da. Se la pagina e'
     # piu' avanti di noi (servizio riavviato) o troppo indietro, si rimanda
@@ -1260,6 +1573,35 @@ def api_comando():
     ok, messaggio = esegui_comando(dati['nome'], dati.get('valore'), 'WEB')
     return jsonify({'success': ok, 'messaggio': messaggio,
                     'piano': stato_controlli()}), (200 if ok else 400)
+
+@app.route('/api/preset', methods=['POST'])
+def api_preset():
+    """Salva l'elenco dei preset: {preset: [{nome, prelevabile, limite_kwh}, ...]}"""
+    dati = request.get_json(silent=True)
+    if not isinstance(dati, dict):
+        return jsonify({'success': False, 'messaggio': 'Corpo della richiesta non valido'}), 400
+    ok, messaggio = salva_preset(dati.get('preset'), 'WEB')
+    return jsonify({'success': ok, 'messaggio': messaggio,
+                    'piano': stato_controlli()}), (200 if ok else 400)
+
+@app.route('/api/programma', methods=['POST'])
+def api_programma():
+    """Salva il programma settimanale: {programma: [{giorni, ora, kwh, attivo}, ...]}"""
+    dati = request.get_json(silent=True)
+    if not isinstance(dati, dict) or pianificatore_instance is None:
+        return jsonify({'success': False, 'messaggio': 'Richiesta non valida'}), 400
+    ok, messaggio = pianificatore_instance.imposta_programma(dati.get('programma'))
+    if ok:
+        log_msg(f"[WEB] {messaggio}")
+        if ponte_mqtt_instance:
+            ponte_mqtt_instance.pubblica_controlli(stato_controlli())
+    return jsonify({'success': ok, 'messaggio': messaggio,
+                    'piano': stato_controlli()}), (200 if ok else 400)
+
+@app.route('/api/previsione')
+def api_previsione():
+    """Sole previsto per il resto di oggi e per domani, ora per ora."""
+    return jsonify(aggiorna_previsione())
 
 @app.route('/api/limite_toggle', methods=['POST'])
 def toggle_limite():
@@ -1490,6 +1832,9 @@ class WallboxController:
         self.last_off_attempt_time = None
         # letture di 'tfase' fallite consecutive (per backoff e allarme)
         self.sync_falliti = 0
+        # Limite kWh scelto mentre la colonnina non rispondeva: lo applica il
+        # thread periodico quando torna (None = niente in attesa)
+        self.limite_in_attesa = None
         # anti-spam del log di override manuale
         self.ultimo_log_manual_off = 0
         # l'auto e' fisicamente collegata? (da status/desc della centralina)
@@ -1659,9 +2004,9 @@ class WallboxController:
             notifica(f"🔌 Wallbox: {desc}", dedup_key='stato_connessione', min_intervallo=120)
             # Auto staccata: l'obiettivo era per quella carica. Solo sulla
             # transizione, cosi' lo si puo' impostare anche prima di attaccarla.
+            # Uno del programma settimanale invece riparte da zero (pianificatore.py).
             if era_collegata and not collegata and pianificatore_instance \
-                    and pianificatore_instance.obiettivo is not None:
-                pianificatore_instance.annulla_obiettivo("annullato: auto scollegata")
+                    and pianificatore_instance.auto_scollegata():
                 notifica("🎯 Auto scollegata: obiettivo di carica annullato.")
 
         # --- Confini della sessione di ricarica ---------------------------
@@ -2743,6 +3088,7 @@ class EnergyMonitor:
                         try:
                             ponte_mqtt_instance.pubblica_minuto(dati_minuto(self, wb_conteggio))
                             ponte_mqtt_instance.pubblica_controlli(stato_controlli())
+                            ponte_mqtt_instance.pubblica_statistiche(statistiche_per_ha(self))
                         except Exception as e:
                             log_throttled('mqtt_minuto', f"[MQTT] Record del minuto non pubblicato: {e}", 600)
 
@@ -2935,6 +3281,7 @@ def thread_periodico(wallbox):
     prossimo_watchdog = 0
     prossima_rotazione = time.time() + 3600
     riepilogo_inviato_il = None
+    rapporto_inviato_il = None
     giorno_statistiche = statistiche.giorno_di(time.time())
 
     while True:
@@ -2985,6 +3332,19 @@ def thread_periodico(wallbox):
                 log_msg(f"[ERRORE] watchdog: {e}")
             prossimo_watchdog = adesso + 60
 
+        # --- Limite kWh rimasto in attesa: la colonnina e' tornata ---
+        try:
+            if (wallbox.limite_in_attesa is not None and wallbox.sync_falliti == 0
+                    and SYSTEM_STATE['CENTRALINA_ONLINE']):
+                kwh, wallbox.limite_in_attesa = wallbox.limite_in_attesa, None
+                inviato, messaggio = wallbox.set_limite_kwh(kwh)
+                if not inviato and not SYSTEM_STATE['CENTRALINA_ONLINE']:
+                    wallbox.limite_in_attesa = kwh      # sparita di nuovo: si riprova
+                else:
+                    log_msg(f"[LIMITE] In attesa dalla scelta del preset: {messaggio}")
+        except Exception as e:
+            log_msg(f"[ERRORE] limite in attesa: {e}")
+
         # --- Scadenza dell'obiettivo (anche senza pacchetti) ---
         try:
             if pianificatore_instance:
@@ -3017,6 +3377,13 @@ def thread_periodico(wallbox):
                 riepilogo_inviato_il = oggi
                 if contatori_instance.wallbox_wh > 0 or contatori_instance.solare_wh > 0:
                     notifica("📅 *Riepilogo giornaliero*\n\n" + contatori_instance.riepilogo_markdown())
+            # La domenica, alla stessa ora, anche la settimana
+            if (ora_locale.tm_wday == 6 and ora_locale.tm_hour == CONFIG['ORA_RIEPILOGO']
+                    and rapporto_inviato_il != oggi and CONFIG['RAPPORTO_SETTIMANALE']):
+                rapporto_inviato_il = oggi
+                testo = rapporto_settimanale()
+                if testo:
+                    notifica(testo)
         except Exception as e:
             log_msg(f"[ERRORE] riepilogo giornaliero: {e}")
 
@@ -3068,6 +3435,14 @@ def main():
     log_msg(f"[PIANO] Carica: {pianificatore_instance.descrizione()}")
     ponte_mqtt_instance.imposta_comandi(
         lambda nome, valore: esegui_comando(nome, valore, 'HOME ASSISTANT'))
+    ponte_mqtt_instance.imposta_preset([p['nome'] for p in CONFIG['PRESET']])
+    # Il sole previsto entra nell'obiettivo; il meteo arriva da Home Assistant
+    ponte_mqtt_instance.imposta_meteo(meteo_ricevuto)
+    pianificatore_instance.sole_atteso = sole_atteso
+    try:
+        aggiorna_previsione(forza=True)
+    except Exception as e:
+        log_msg(f"[ERRORE] previsione: {e}")
 
     # 0. AVVIO WORKER NOTIFICHE (prima di tutto: cosi' anche gli errori
     #    di avvio degli altri thread possono essere notificati)
@@ -3112,9 +3487,11 @@ def main():
     log_msg(f">>> LETTURA CENTRALINA E CONTROLLO FASE ATTIVI (ogni {CONFIG['INTERVALLO_SYNC_FASE']}s) <<<")
 
     errori_consecutivi = 0
+    ultimo_pacchetto = time.time()
     while True:
         try:
             data, _ = sock.recvfrom(65535)
+            ultimo_pacchetto = time.time()
             evt = monitor.parse_packet(data)
             errori_consecutivi = 0
 
@@ -3122,8 +3499,12 @@ def main():
                 run_logic(monitor, wallbox)
 
         except socket.timeout:
-            log_throttled('nessun_pacchetto',
-                          "[AVVISO] Nessun pacchetto multicast negli ultimi 30s.", 300)
+            # Di notte i pacchetti 'solar' non arrivano e resta un 'electricity'
+            # al minuto: 30 s di silenzio sono normali (prima: 300 righe a notte)
+            silenzio = time.time() - ultimo_pacchetto
+            if silenzio > 150:
+                log_throttled('nessun_pacchetto',
+                              f"[AVVISO] Nessun pacchetto dal sensore da {silenzio:.0f}s.", 300)
         except KeyboardInterrupt:
             log_msg("Interruzione richiesta: salvo lo stato...")
             salva_tutto()
